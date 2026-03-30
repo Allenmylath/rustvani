@@ -4,6 +4,7 @@ pub mod frames;
 pub mod metrics;
 pub mod observer;
 pub mod pipeline;
+pub mod transport;
 
 pub use clock::{BaseClock, SystemClock, system_clock};
 pub use error::{PipecatError, Result};
@@ -14,3 +15,4 @@ pub use frames::{
     StartFrameData, SystemFrame,
 };
 pub use pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask};
+pub use transport::{BaseTransport, BaseInputTransport, BaseOutputTransport, TransportParams};
