@@ -48,19 +48,14 @@ pub struct TransportParams {
     /// Output audio bitrate in bits per second.
     pub audio_out_bitrate: u32,
 
-    // ---- Video output ----
+    // ---- VAD ----
 
-    /// Enable video output streaming.
-    pub video_out_enabled: bool,
-
-    /// Video output width in pixels.
-    pub video_out_width: u32,
-
-    /// Video output height in pixels.
-    pub video_out_height: u32,
-
-    /// Video output frame rate in FPS.
-    pub video_out_framerate: u32,
+    /// Enable Voice Activity Detection.
+    ///
+    /// When `true`, `BaseTransport` inserts a `VadProcessor` between
+    /// `input()` and the rest of the pipeline automatically.
+    /// Only effective when `audio_in_enabled` is also `true`.
+    pub vad_enabled: bool,
 }
 
 impl Default for TransportParams {
@@ -80,6 +75,7 @@ impl Default for TransportParams {
             video_out_width:          1024,
             video_out_height:         768,
             video_out_framerate:      30,
+            vad_enabled:              false,
         }
     }
 }
