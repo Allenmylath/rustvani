@@ -2,88 +2,127 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
-// Global frame ID counter
+// Frame ID counter
 // ---------------------------------------------------------------------------
 
 static FRAME_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_frame_id() -> u64 {
-    FRAME_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+    FRAME_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
-// Frame data payloads
+// Flat FrameKind — for filter sets (HashSet<FrameKind>), no nesting tax
 // ---------------------------------------------------------------------------
 
-/// Payload for StartFrame — carries pipeline-wide configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameKind {
+    // System
+    Start, Cancel, Error, Interruption, Stop,
+    EndTask, CancelTask, StopTask, InterruptionTask,
+    BotSpeaking, UserSpeaking,
+    PauseProcessor, PauseProcessorUrgent,
+    ResumeProcessor, ResumeProcessorUrgent,
+    Heartbeat,
+    // Control
+    End,
+    // Data
+    Data,
+}
+
+// ---------------------------------------------------------------------------
+// Payloads
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Default)]
 pub struct StartFrameData {
-    pub allow_interruptions: bool,
-    pub enable_metrics: bool,
-    pub enable_usage_metrics: bool,
-    pub report_only_initial_ttfb: bool,
-    /// Arbitrary key/value metadata (e.g. "deprecated_openaillmcontext").
+    pub allow_interruptions:       bool,
+    pub enable_metrics:            bool,
+    pub enable_usage_metrics:      bool,
+    pub report_only_initial_ttfb:  bool,
     pub metadata: HashMap<String, String>,
-    pub broadcast_sibling_id: Option<u64>,
 }
 
-/// Payload for ErrorFrame.
 #[derive(Debug, Clone)]
 pub struct ErrorFrameData {
-    pub error: String,
-    pub fatal: bool,
-    /// Name of the processor that raised the error.
+    pub error:          String,
+    pub fatal:          bool,
     pub processor_name: Option<String>,
-    pub broadcast_sibling_id: Option<u64>,
 }
 
-/// Payload for Pause/Resume frames — targets a specific processor by name.
-#[derive(Debug, Clone)]
-pub struct PauseResumeFrameData {
-    pub processor_name: String,
-    pub broadcast_sibling_id: Option<u64>,
-}
-
-/// Generic data frame payload.
 #[derive(Debug, Clone, Default)]
 pub struct DataFrameData {
-    pub content: Vec<u8>,
+    pub content:  Vec<u8>,
     pub metadata: HashMap<String, String>,
-    pub broadcast_sibling_id: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
-// The Frame enum
+// Nested enums
 // ---------------------------------------------------------------------------
 
-/// All frame types in the pipeline.
-///
-/// **System frames** (high-priority, processed before any non-system frame):
-/// - `Start`, `Cancel`, `Error`, `Interruption`, `End`
-/// - `PauseProcessing`, `PauseProcessingUrgent`
-/// - `ResumeProcessing`, `ResumeProcessingUrgent`
-///
-/// **Non-system frames**:
-/// - `Data` — generic data frame
-/// - `Uninterruptible(id, Box<Frame>)` — wraps any frame, immune to interruption draining
+/// High-priority frames — bypass the non-system queue and are processed immediately.
 #[derive(Debug, Clone)]
-pub enum Frame {
-    // ---- System frames ----
-    Start(u64, StartFrameData),
-    Cancel(u64, Option<u64>),                    // (id, broadcast_sibling_id)
-    Error(u64, ErrorFrameData),
-    Interruption(u64, Option<u64>),              // (id, broadcast_sibling_id)
-    End(u64, Option<u64>),                       // (id, broadcast_sibling_id)
-    PauseProcessing(u64, PauseResumeFrameData),
-    PauseProcessingUrgent(u64, PauseResumeFrameData),
-    ResumeProcessing(u64, PauseResumeFrameData),
-    ResumeProcessingUrgent(u64, PauseResumeFrameData),
+pub enum SystemFrame {
+    Start(StartFrameData),
+    Cancel    { reason: Option<String> },
+    Error(ErrorFrameData),
+    Interruption,
+    Stop      { reason: Option<String> },
 
-    // ---- Non-system frames ----
-    Data(u64, DataFrameData),
+    // Task-control: pushed upstream, converted by PipelineTask
+    EndTask   { reason: Option<String> },
+    CancelTask { reason: Option<String> },
+    StopTask,
+    InterruptionTask,
 
-    /// Wraps any frame to make it immune to interruption-queue draining.
-    Uninterruptible(u64, Box<Frame>),
+    // Speaking signals (also reset idle timer)
+    BotSpeaking,
+    UserSpeaking,
+
+    // Pause / resume a named processor
+    PauseProcessor        { name: String },
+    PauseProcessorUrgent  { name: String },
+    ResumeProcessor       { name: String },
+    ResumeProcessorUrgent { name: String },
+
+    // Pipeline health probe
+    Heartbeat(f64),
+}
+
+/// Ordered frames that survive interruption drains.
+#[derive(Debug, Clone)]
+pub enum ControlFrame {
+    End { reason: Option<String> },
+}
+
+/// Ordered frames that are cancelled by interruptions.
+#[derive(Debug, Clone)]
+pub enum DataFrame {
+    Data(DataFrameData),
+}
+
+/// Discriminant over System / Control / Data.
+#[derive(Debug, Clone)]
+pub enum FrameInner {
+    System(SystemFrame),
+    Control(ControlFrame),
+    Data(DataFrame),
+}
+
+// ---------------------------------------------------------------------------
+// Frame — the public type
+// ---------------------------------------------------------------------------
+
+/// Every frame in the pipeline.
+///
+/// `id` and `sibling_id` are universal fields on the struct so they're
+/// always accessible without matching on the variant.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub id:         u64,
+    /// Set by `broadcast_frame()` to link the two copies.
+    pub sibling_id: Option<u64>,
+    pub inner:      FrameInner,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,226 +130,213 @@ pub enum Frame {
 // ---------------------------------------------------------------------------
 
 impl Frame {
-    pub fn id(&self) -> u64 {
-        match self {
-            Frame::Start(id, _)
-            | Frame::Cancel(id, _)
-            | Frame::Error(id, _)
-            | Frame::Interruption(id, _)
-            | Frame::End(id, _)
-            | Frame::PauseProcessing(id, _)
-            | Frame::PauseProcessingUrgent(id, _)
-            | Frame::ResumeProcessing(id, _)
-            | Frame::ResumeProcessingUrgent(id, _)
-            | Frame::Data(id, _)
-            | Frame::Uninterruptible(id, _) => *id,
-        }
-    }
-
     pub fn name(&self) -> &'static str {
-        match self {
-            Frame::Start(_, _) => "StartFrame",
-            Frame::Cancel(_, _) => "CancelFrame",
-            Frame::Error(_, _) => "ErrorFrame",
-            Frame::Interruption(_, _) => "InterruptionFrame",
-            Frame::End(_, _) => "EndFrame",
-            Frame::PauseProcessing(_, _) => "FrameProcessorPauseFrame",
-            Frame::PauseProcessingUrgent(_, _) => "FrameProcessorPauseUrgentFrame",
-            Frame::ResumeProcessing(_, _) => "FrameProcessorResumeFrame",
-            Frame::ResumeProcessingUrgent(_, _) => "FrameProcessorResumeUrgentFrame",
-            Frame::Data(_, _) => "DataFrame",
-            Frame::Uninterruptible(_, _) => "UninterruptibleFrame",
+        match &self.inner {
+            FrameInner::System(s) => match s {
+                SystemFrame::Start(_)                  => "StartFrame",
+                SystemFrame::Cancel { .. }             => "CancelFrame",
+                SystemFrame::Error(_)                  => "ErrorFrame",
+                SystemFrame::Interruption              => "InterruptionFrame",
+                SystemFrame::Stop { .. }               => "StopFrame",
+                SystemFrame::EndTask { .. }            => "EndTaskFrame",
+                SystemFrame::CancelTask { .. }         => "CancelTaskFrame",
+                SystemFrame::StopTask                  => "StopTaskFrame",
+                SystemFrame::InterruptionTask          => "InterruptionTaskFrame",
+                SystemFrame::BotSpeaking               => "BotSpeakingFrame",
+                SystemFrame::UserSpeaking              => "UserSpeakingFrame",
+                SystemFrame::PauseProcessor { .. }     => "PauseProcessorFrame",
+                SystemFrame::PauseProcessorUrgent{..}  => "PauseProcessorUrgentFrame",
+                SystemFrame::ResumeProcessor { .. }    => "ResumeProcessorFrame",
+                SystemFrame::ResumeProcessorUrgent{..} => "ResumeProcessorUrgentFrame",
+                SystemFrame::Heartbeat(_)              => "HeartbeatFrame",
+            },
+            FrameInner::Control(c) => match c {
+                ControlFrame::End { .. } => "EndFrame",
+            },
+            FrameInner::Data(d) => match d {
+                DataFrame::Data(_) => "DataFrame",
+            },
         }
     }
 
-    /// Returns `true` for frames that receive high-priority queue processing.
+    pub fn kind(&self) -> FrameKind {
+        match &self.inner {
+            FrameInner::System(s) => match s {
+                SystemFrame::Start(_)                  => FrameKind::Start,
+                SystemFrame::Cancel { .. }             => FrameKind::Cancel,
+                SystemFrame::Error(_)                  => FrameKind::Error,
+                SystemFrame::Interruption              => FrameKind::Interruption,
+                SystemFrame::Stop { .. }               => FrameKind::Stop,
+                SystemFrame::EndTask { .. }            => FrameKind::EndTask,
+                SystemFrame::CancelTask { .. }         => FrameKind::CancelTask,
+                SystemFrame::StopTask                  => FrameKind::StopTask,
+                SystemFrame::InterruptionTask          => FrameKind::InterruptionTask,
+                SystemFrame::BotSpeaking               => FrameKind::BotSpeaking,
+                SystemFrame::UserSpeaking              => FrameKind::UserSpeaking,
+                SystemFrame::PauseProcessor { .. }     => FrameKind::PauseProcessor,
+                SystemFrame::PauseProcessorUrgent{..}  => FrameKind::PauseProcessorUrgent,
+                SystemFrame::ResumeProcessor { .. }    => FrameKind::ResumeProcessor,
+                SystemFrame::ResumeProcessorUrgent{..} => FrameKind::ResumeProcessorUrgent,
+                SystemFrame::Heartbeat(_)              => FrameKind::Heartbeat,
+            },
+            FrameInner::Control(c) => match c {
+                ControlFrame::End { .. } => FrameKind::End,
+            },
+            FrameInner::Data(d) => match d {
+                DataFrame::Data(_) => FrameKind::Data,
+            },
+        }
+    }
+
+    /// System frames bypass the non-system queue.
     pub fn is_system(&self) -> bool {
-        matches!(
-            self,
-            Frame::Start(_, _)
-                | Frame::Cancel(_, _)
-                | Frame::Error(_, _)
-                | Frame::Interruption(_, _)
-                | Frame::End(_, _)
-                | Frame::PauseProcessing(_, _)
-                | Frame::PauseProcessingUrgent(_, _)
-                | Frame::ResumeProcessing(_, _)
-                | Frame::ResumeProcessingUrgent(_, _)
-        )
+        matches!(self.inner, FrameInner::System(_))
     }
 
-    /// Returns `true` if this frame must not be discarded during an interruption drain.
+    /// Uninterruptible frames survive interruption queue drains.
+    /// Mirrors Python's `UninterruptibleFrame` mixin on specific types.
     pub fn is_uninterruptible(&self) -> bool {
-        matches!(self, Frame::Uninterruptible(_, _))
-    }
-
-    pub fn broadcast_sibling_id(&self) -> Option<u64> {
-        match self {
-            Frame::Start(_, d) => d.broadcast_sibling_id,
-            Frame::Cancel(_, s) => *s,
-            Frame::Error(_, d) => d.broadcast_sibling_id,
-            Frame::Interruption(_, s) => *s,
-            Frame::End(_, s) => *s,
-            Frame::PauseProcessing(_, d) => d.broadcast_sibling_id,
-            Frame::PauseProcessingUrgent(_, d) => d.broadcast_sibling_id,
-            Frame::ResumeProcessing(_, d) => d.broadcast_sibling_id,
-            Frame::ResumeProcessingUrgent(_, d) => d.broadcast_sibling_id,
-            Frame::Data(_, d) => d.broadcast_sibling_id,
-            Frame::Uninterruptible(_, _) => None,
-        }
+        matches!(
+            &self.inner,
+            FrameInner::Control(ControlFrame::End { .. })
+                | FrameInner::System(SystemFrame::EndTask { .. })
+                | FrameInner::System(SystemFrame::StopTask)
+                | FrameInner::System(SystemFrame::CancelTask { .. })
+        )
     }
 }
 
 // ---------------------------------------------------------------------------
-// Mutation helpers (for broadcast)
+// Mutation helpers — one-liners thanks to struct layout
 // ---------------------------------------------------------------------------
 
 impl Frame {
-    /// Return this frame with a fresh ID (all other data preserved).
     pub fn with_new_id(self) -> Self {
-        let new_id = next_frame_id();
-        match self {
-            Frame::Start(_, d) => Frame::Start(new_id, d),
-            Frame::Cancel(_, s) => Frame::Cancel(new_id, s),
-            Frame::Error(_, d) => Frame::Error(new_id, d),
-            Frame::Interruption(_, s) => Frame::Interruption(new_id, s),
-            Frame::End(_, s) => Frame::End(new_id, s),
-            Frame::PauseProcessing(_, d) => Frame::PauseProcessing(new_id, d),
-            Frame::PauseProcessingUrgent(_, d) => Frame::PauseProcessingUrgent(new_id, d),
-            Frame::ResumeProcessing(_, d) => Frame::ResumeProcessing(new_id, d),
-            Frame::ResumeProcessingUrgent(_, d) => Frame::ResumeProcessingUrgent(new_id, d),
-            Frame::Data(_, d) => Frame::Data(new_id, d),
-            Frame::Uninterruptible(_, inner) => Frame::Uninterruptible(new_id, inner),
-        }
+        Self { id: next_frame_id(), ..self }
     }
 
-    /// Return this frame with `broadcast_sibling_id` set.
     pub fn with_sibling(self, sibling_id: u64) -> Self {
-        match self {
-            Frame::Start(id, mut d) => {
-                d.broadcast_sibling_id = Some(sibling_id);
-                Frame::Start(id, d)
-            }
-            Frame::Cancel(id, _) => Frame::Cancel(id, Some(sibling_id)),
-            Frame::Error(id, mut d) => {
-                d.broadcast_sibling_id = Some(sibling_id);
-                Frame::Error(id, d)
-            }
-            Frame::Interruption(id, _) => Frame::Interruption(id, Some(sibling_id)),
-            Frame::End(id, _) => Frame::End(id, Some(sibling_id)),
-            Frame::PauseProcessing(id, mut d) => {
-                d.broadcast_sibling_id = Some(sibling_id);
-                Frame::PauseProcessing(id, d)
-            }
-            Frame::PauseProcessingUrgent(id, mut d) => {
-                d.broadcast_sibling_id = Some(sibling_id);
-                Frame::PauseProcessingUrgent(id, d)
-            }
-            Frame::ResumeProcessing(id, mut d) => {
-                d.broadcast_sibling_id = Some(sibling_id);
-                Frame::ResumeProcessing(id, d)
-            }
-            Frame::ResumeProcessingUrgent(id, mut d) => {
-                d.broadcast_sibling_id = Some(sibling_id);
-                Frame::ResumeProcessingUrgent(id, d)
-            }
-            Frame::Data(id, mut d) => {
-                d.broadcast_sibling_id = Some(sibling_id);
-                Frame::Data(id, d)
-            }
-            other => other, // Uninterruptible has no sibling field
-        }
+        Self { sibling_id: Some(sibling_id), ..self }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Constructors
+// Internal constructors
 // ---------------------------------------------------------------------------
 
 impl Frame {
-    pub fn new_start(data: StartFrameData) -> Self {
-        Frame::Start(next_frame_id(), data)
+    fn make(inner: FrameInner) -> Self {
+        Self { id: next_frame_id(), sibling_id: None, inner }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public constructors — no `new_` prefix
+// ---------------------------------------------------------------------------
+
+impl Frame {
+    pub fn start(data: StartFrameData) -> Self {
+        Self::make(FrameInner::System(SystemFrame::Start(data)))
     }
 
-    pub fn new_cancel() -> Self {
-        Frame::Cancel(next_frame_id(), None)
+    pub fn cancel() -> Self {
+        Self::make(FrameInner::System(SystemFrame::Cancel { reason: None }))
     }
 
-    pub fn new_error(
-        error: impl Into<String>,
-        fatal: bool,
-        processor_name: Option<String>,
-    ) -> Self {
-        Frame::Error(
-            next_frame_id(),
-            ErrorFrameData {
-                error: error.into(),
-                fatal,
-                processor_name,
-                broadcast_sibling_id: None,
-            },
-        )
+    pub fn cancel_with(reason: impl Into<String>) -> Self {
+        Self::make(FrameInner::System(SystemFrame::Cancel {
+            reason: Some(reason.into()),
+        }))
     }
 
-    pub fn new_interruption() -> Self {
-        Frame::Interruption(next_frame_id(), None)
+    pub fn error(msg: impl Into<String>, fatal: bool, processor: Option<String>) -> Self {
+        Self::make(FrameInner::System(SystemFrame::Error(ErrorFrameData {
+            error: msg.into(),
+            fatal,
+            processor_name: processor,
+        })))
     }
 
-    pub fn new_end() -> Self {
-        Frame::End(next_frame_id(), None)
+    pub fn interruption() -> Self {
+        Self::make(FrameInner::System(SystemFrame::Interruption))
     }
 
-    pub fn new_data(content: Vec<u8>) -> Self {
-        Frame::Data(
-            next_frame_id(),
-            DataFrameData {
-                content,
-                ..Default::default()
-            },
-        )
+    pub fn stop() -> Self {
+        Self::make(FrameInner::System(SystemFrame::Stop { reason: None }))
     }
 
-    pub fn new_pause(processor_name: impl Into<String>) -> Self {
-        Frame::PauseProcessing(
-            next_frame_id(),
-            PauseResumeFrameData {
-                processor_name: processor_name.into(),
-                broadcast_sibling_id: None,
-            },
-        )
+    pub fn stop_with(reason: impl Into<String>) -> Self {
+        Self::make(FrameInner::System(SystemFrame::Stop {
+            reason: Some(reason.into()),
+        }))
     }
 
-    pub fn new_pause_urgent(processor_name: impl Into<String>) -> Self {
-        Frame::PauseProcessingUrgent(
-            next_frame_id(),
-            PauseResumeFrameData {
-                processor_name: processor_name.into(),
-                broadcast_sibling_id: None,
-            },
-        )
+    pub fn end_task() -> Self {
+        Self::make(FrameInner::System(SystemFrame::EndTask { reason: None }))
     }
 
-    pub fn new_resume(processor_name: impl Into<String>) -> Self {
-        Frame::ResumeProcessing(
-            next_frame_id(),
-            PauseResumeFrameData {
-                processor_name: processor_name.into(),
-                broadcast_sibling_id: None,
-            },
-        )
+    pub fn cancel_task() -> Self {
+        Self::make(FrameInner::System(SystemFrame::CancelTask { reason: None }))
     }
 
-    pub fn new_resume_urgent(processor_name: impl Into<String>) -> Self {
-        Frame::ResumeProcessingUrgent(
-            next_frame_id(),
-            PauseResumeFrameData {
-                processor_name: processor_name.into(),
-                broadcast_sibling_id: None,
-            },
-        )
+    pub fn stop_task() -> Self {
+        Self::make(FrameInner::System(SystemFrame::StopTask))
     }
 
-    pub fn new_uninterruptible(inner: Frame) -> Self {
-        Frame::Uninterruptible(next_frame_id(), Box::new(inner))
+    pub fn interruption_task() -> Self {
+        Self::make(FrameInner::System(SystemFrame::InterruptionTask))
+    }
+
+    pub fn bot_speaking() -> Self {
+        Self::make(FrameInner::System(SystemFrame::BotSpeaking))
+    }
+
+    pub fn user_speaking() -> Self {
+        Self::make(FrameInner::System(SystemFrame::UserSpeaking))
+    }
+
+    pub fn pause_processor(name: impl Into<String>) -> Self {
+        Self::make(FrameInner::System(SystemFrame::PauseProcessor {
+            name: name.into(),
+        }))
+    }
+
+    pub fn pause_processor_urgent(name: impl Into<String>) -> Self {
+        Self::make(FrameInner::System(SystemFrame::PauseProcessorUrgent {
+            name: name.into(),
+        }))
+    }
+
+    pub fn resume_processor(name: impl Into<String>) -> Self {
+        Self::make(FrameInner::System(SystemFrame::ResumeProcessor {
+            name: name.into(),
+        }))
+    }
+
+    pub fn resume_processor_urgent(name: impl Into<String>) -> Self {
+        Self::make(FrameInner::System(SystemFrame::ResumeProcessorUrgent {
+            name: name.into(),
+        }))
+    }
+
+    pub fn heartbeat(ts: f64) -> Self {
+        Self::make(FrameInner::System(SystemFrame::Heartbeat(ts)))
+    }
+
+    pub fn end() -> Self {
+        Self::make(FrameInner::Control(ControlFrame::End { reason: None }))
+    }
+
+    pub fn end_with(reason: impl Into<String>) -> Self {
+        Self::make(FrameInner::Control(ControlFrame::End {
+            reason: Some(reason.into()),
+        }))
+    }
+
+    pub fn data(content: Vec<u8>) -> Self {
+        Self::make(FrameInner::Data(DataFrame::Data(DataFrameData {
+            content,
+            ..Default::default()
+        })))
     }
 }
