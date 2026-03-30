@@ -23,10 +23,10 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 
-use crate::direction::FrameDirection;
+use crate::frames::FrameDirection;
 use crate::error::Result;
 use crate::frames::Frame;
-use crate::processor::{FrameHandler, FrameProcessor, WeakFrameProcessor};
+use crate::frames::{FrameHandler, FrameProcessor, WeakFrameProcessor};
 
 // ---------------------------------------------------------------------------
 // PipelineSourceHandler

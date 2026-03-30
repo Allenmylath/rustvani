@@ -4,8 +4,8 @@ use futures::future::BoxFuture;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
-use crate::direction::FrameDirection;
-use crate::frames::Frame;
+use super::direction::FrameDirection;
+use super::Frame;
 
 pub type QueueCallback = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
 pub type QueueItem = (Frame, FrameDirection, Option<QueueCallback>);

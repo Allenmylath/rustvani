@@ -42,11 +42,11 @@ use futures::future::BoxFuture;
 use tokio::sync::{mpsc, watch, Notify};
 
 use crate::clock::BaseClock;
-use crate::direction::FrameDirection;
+
 use crate::error::{PipecatError, Result};
-use crate::frames::{ControlFrame, ErrorFrameData, Frame, FrameInner, FrameKind, StartFrameData, SystemFrame};
+use crate::frames::{ControlFrame, ErrorFrameData, Frame, FrameDirection, FrameHandler, FrameInner, FrameKind, FrameProcessor, FrameProcessorSetup, StartFrameData, SystemFrame};
 use crate::observer::BaseObserver;
-use crate::processor::{FrameHandler, FrameProcessor, FrameProcessorSetup};
+
 
 use super::pipeline::Pipeline;
 

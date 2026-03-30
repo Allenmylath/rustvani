@@ -18,10 +18,10 @@ use tokio::sync::mpsc;
 
 use pipecat_core::{
     clock::system_clock,
-    direction::FrameDirection,
+    frames::FrameDirection,
     frames::{ControlFrame, DataFrame, DataFrameData, Frame, FrameInner, FrameKind, SystemFrame, StartFrameData},
     pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask},
-    processor::{FrameHandler, FrameProcessor, FrameProcessorSetup, PassthroughHandler},
+    frames::{FrameHandler, FrameProcessor, FrameProcessorSetup, PassthroughHandler},
     error::Result,
 };
 

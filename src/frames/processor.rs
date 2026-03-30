@@ -8,13 +8,13 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::clock::BaseClock;
-use crate::direction::FrameDirection;
+use super::direction::FrameDirection;
 use crate::error::Result;
 use async_recursion::async_recursion;
-use crate::frames::{ControlFrame, DataFrame, ErrorFrameData, Frame, FrameInner, StartFrameData, SystemFrame, next_frame_id};
+use super::{ControlFrame, DataFrame, ErrorFrameData, Frame, FrameInner, StartFrameData, SystemFrame, next_frame_id};
 use crate::metrics::{FrameProcessorMetrics, LLMTokenUsage};
 use crate::observer::{BaseObserver, FrameProcessed, FramePushed};
-use crate::queue::{FrameProcessorQueue, ProcessQueue, QueueCallback};
+use super::queue::{FrameProcessorQueue, ProcessQueue, QueueCallback};
 
 // ---------------------------------------------------------------------------
 // Public callback type (user-facing API to queue_frame)

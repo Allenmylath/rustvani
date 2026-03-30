@@ -1,3 +1,13 @@
+pub mod direction;
+pub mod processor;
+pub mod queue;
+
+pub use direction::FrameDirection;
+pub use processor::{
+    FrameCallback, FrameHandler, FrameProcessor, FrameProcessorSetup, PassthroughHandler,
+    WeakFrameProcessor,
+};
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 

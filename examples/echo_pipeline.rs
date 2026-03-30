@@ -15,11 +15,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use pipecat_core::{
     clock::system_clock,
-    direction::FrameDirection,
+    frames::FrameDirection,
     error::Result,
     frames::{DataFrame, DataFrameData, Frame, FrameInner, FrameKind, StartFrameData, SystemFrame},
     pipeline::{FinishReason, PipelineParams, PipelineTask},
-    processor::{FrameHandler, FrameProcessor},
+    frames::{FrameHandler, FrameProcessor},
 };
 
 // ---------------------------------------------------------------------------

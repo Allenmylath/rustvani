@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use crate::direction::FrameDirection;
+use crate::frames::FrameDirection;
 use crate::frames::Frame;
 
 pub struct FrameProcessed {
