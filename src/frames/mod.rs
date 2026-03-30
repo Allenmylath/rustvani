@@ -27,10 +27,17 @@ pub fn next_frame_id() -> u64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameKind {
-    // System
+    // System — lifecycle
     Start, Cancel, Error, Interruption, Stop,
     EndTask, CancelTask, StopTask, InterruptionTask,
+    // System — speaking signals
     BotSpeaking, UserSpeaking,
+    BotStartedSpeaking, BotStoppedSpeaking,
+    UserStartedSpeaking, UserStoppedSpeaking,
+    VADUserStartedSpeaking, VADUserStoppedSpeaking,
+    // System — audio/video input (high-priority, bypass non-system queue)
+    InputAudioRaw,
+    // System — processor control
     PauseProcessor, PauseProcessorUrgent,
     ResumeProcessor, ResumeProcessorUrgent,
     Heartbeat,
@@ -38,6 +45,49 @@ pub enum FrameKind {
     End,
     // Data
     Data,
+    // Data — audio output (ordered, cancellable)
+    OutputAudioRaw,
+}
+
+// ---------------------------------------------------------------------------
+// Audio payload — shared by input and output audio frames
+// ---------------------------------------------------------------------------
+
+/// Raw PCM audio payload.
+///
+/// `audio` is interleaved 16-bit little-endian PCM.
+/// `num_frames` = len(audio) / (num_channels * 2)
+#[derive(Debug, Clone)]
+pub struct AudioRawData {
+    pub audio:            Vec<u8>,
+    pub sample_rate:      u32,
+    pub num_channels:     u16,
+    /// Derived: number of PCM frames in `audio`.
+    pub num_frames:       usize,
+    /// Which transport track this came from / is going to.
+    pub transport_source: Option<String>,
+}
+
+impl AudioRawData {
+    pub fn new(audio: Vec<u8>, sample_rate: u32, num_channels: u16) -> Self {
+        let num_frames = if num_channels > 0 {
+            audio.len() / (num_channels as usize * 2)
+        } else {
+            0
+        };
+        Self {
+            audio,
+            sample_rate,
+            num_channels,
+            num_frames,
+            transport_source: None,
+        }
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.transport_source = Some(source.into());
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +123,7 @@ pub struct DataFrameData {
 /// High-priority frames — bypass the non-system queue and are processed immediately.
 #[derive(Debug, Clone)]
 pub enum SystemFrame {
+    // ---- Lifecycle ----
     Start(StartFrameData),
     Cancel    { reason: Option<String> },
     Error(ErrorFrameData),
@@ -85,17 +136,42 @@ pub enum SystemFrame {
     StopTask,
     InterruptionTask,
 
-    // Speaking signals (also reset idle timer)
+    // ---- Speaking signals ----
+
+    /// Emitted periodically while the bot is speaking (keeps idle timer alive).
     BotSpeaking,
+    /// Emitted periodically while the user is speaking (keeps idle timer alive).
     UserSpeaking,
 
-    // Pause / resume a named processor
+    /// Emitted once when the bot starts producing audio output.
+    BotStartedSpeaking,
+    /// Emitted once when the bot stops producing audio output.
+    BotStoppedSpeaking,
+
+    /// Emitted when the user turn starts (VAD confirmed start).
+    UserStartedSpeaking { emulated: bool },
+    /// Emitted when the user turn ends (VAD confirmed stop).
+    UserStoppedSpeaking  { emulated: bool },
+
+    /// Emitted by the VAD layer when it definitively detects speech onset.
+    /// `start_secs`: VAD start_secs threshold that triggered this event.
+    VADUserStartedSpeaking { start_secs: f32, timestamp: f64 },
+    /// Emitted by the VAD layer when it definitively detects speech end.
+    /// `stop_secs`: VAD stop_secs silence threshold that triggered this event.
+    VADUserStoppedSpeaking { stop_secs: f32, timestamp: f64 },
+
+    // ---- Audio input (high-priority for fast VAD / STT path) ----
+    /// Raw PCM audio arriving from an input transport.
+    /// SystemFrame so it bypasses the non-system queue — VAD runs immediately.
+    InputAudioRaw(AudioRawData),
+
+    // ---- Processor control ----
     PauseProcessor        { name: String },
     PauseProcessorUrgent  { name: String },
     ResumeProcessor       { name: String },
     ResumeProcessorUrgent { name: String },
 
-    // Pipeline health probe
+    // ---- Pipeline health probe ----
     Heartbeat(f64),
 }
 
@@ -109,6 +185,10 @@ pub enum ControlFrame {
 #[derive(Debug, Clone)]
 pub enum DataFrame {
     Data(DataFrameData),
+    /// Raw PCM audio heading to the output transport.
+    /// DataFrame so it participates in the ordered queue and is cancelled
+    /// cleanly on interruption (bot stops speaking when user interrupts).
+    OutputAudioRaw(AudioRawData),
 }
 
 /// Discriminant over System / Control / Data.
@@ -143,28 +223,36 @@ impl Frame {
     pub fn name(&self) -> &'static str {
         match &self.inner {
             FrameInner::System(s) => match s {
-                SystemFrame::Start(_)                  => "StartFrame",
-                SystemFrame::Cancel { .. }             => "CancelFrame",
-                SystemFrame::Error(_)                  => "ErrorFrame",
-                SystemFrame::Interruption              => "InterruptionFrame",
-                SystemFrame::Stop { .. }               => "StopFrame",
-                SystemFrame::EndTask { .. }            => "EndTaskFrame",
-                SystemFrame::CancelTask { .. }         => "CancelTaskFrame",
-                SystemFrame::StopTask                  => "StopTaskFrame",
-                SystemFrame::InterruptionTask          => "InterruptionTaskFrame",
-                SystemFrame::BotSpeaking               => "BotSpeakingFrame",
-                SystemFrame::UserSpeaking              => "UserSpeakingFrame",
-                SystemFrame::PauseProcessor { .. }     => "PauseProcessorFrame",
-                SystemFrame::PauseProcessorUrgent{..}  => "PauseProcessorUrgentFrame",
-                SystemFrame::ResumeProcessor { .. }    => "ResumeProcessorFrame",
-                SystemFrame::ResumeProcessorUrgent{..} => "ResumeProcessorUrgentFrame",
-                SystemFrame::Heartbeat(_)              => "HeartbeatFrame",
+                SystemFrame::Start(_)                      => "StartFrame",
+                SystemFrame::Cancel { .. }                 => "CancelFrame",
+                SystemFrame::Error(_)                      => "ErrorFrame",
+                SystemFrame::Interruption                  => "InterruptionFrame",
+                SystemFrame::Stop { .. }                   => "StopFrame",
+                SystemFrame::EndTask { .. }                => "EndTaskFrame",
+                SystemFrame::CancelTask { .. }             => "CancelTaskFrame",
+                SystemFrame::StopTask                      => "StopTaskFrame",
+                SystemFrame::InterruptionTask              => "InterruptionTaskFrame",
+                SystemFrame::BotSpeaking                   => "BotSpeakingFrame",
+                SystemFrame::UserSpeaking                  => "UserSpeakingFrame",
+                SystemFrame::BotStartedSpeaking            => "BotStartedSpeakingFrame",
+                SystemFrame::BotStoppedSpeaking            => "BotStoppedSpeakingFrame",
+                SystemFrame::UserStartedSpeaking { .. }    => "UserStartedSpeakingFrame",
+                SystemFrame::UserStoppedSpeaking { .. }    => "UserStoppedSpeakingFrame",
+                SystemFrame::VADUserStartedSpeaking { .. } => "VADUserStartedSpeakingFrame",
+                SystemFrame::VADUserStoppedSpeaking { .. } => "VADUserStoppedSpeakingFrame",
+                SystemFrame::InputAudioRaw(_)              => "InputAudioRawFrame",
+                SystemFrame::PauseProcessor { .. }         => "PauseProcessorFrame",
+                SystemFrame::PauseProcessorUrgent { .. }   => "PauseProcessorUrgentFrame",
+                SystemFrame::ResumeProcessor { .. }        => "ResumeProcessorFrame",
+                SystemFrame::ResumeProcessorUrgent { .. }  => "ResumeProcessorUrgentFrame",
+                SystemFrame::Heartbeat(_)                  => "HeartbeatFrame",
             },
             FrameInner::Control(c) => match c {
                 ControlFrame::End { .. } => "EndFrame",
             },
             FrameInner::Data(d) => match d {
-                DataFrame::Data(_) => "DataFrame",
+                DataFrame::Data(_)         => "DataFrame",
+                DataFrame::OutputAudioRaw(_) => "OutputAudioRawFrame",
             },
         }
     }
@@ -172,28 +260,36 @@ impl Frame {
     pub fn kind(&self) -> FrameKind {
         match &self.inner {
             FrameInner::System(s) => match s {
-                SystemFrame::Start(_)                  => FrameKind::Start,
-                SystemFrame::Cancel { .. }             => FrameKind::Cancel,
-                SystemFrame::Error(_)                  => FrameKind::Error,
-                SystemFrame::Interruption              => FrameKind::Interruption,
-                SystemFrame::Stop { .. }               => FrameKind::Stop,
-                SystemFrame::EndTask { .. }            => FrameKind::EndTask,
-                SystemFrame::CancelTask { .. }         => FrameKind::CancelTask,
-                SystemFrame::StopTask                  => FrameKind::StopTask,
-                SystemFrame::InterruptionTask          => FrameKind::InterruptionTask,
-                SystemFrame::BotSpeaking               => FrameKind::BotSpeaking,
-                SystemFrame::UserSpeaking              => FrameKind::UserSpeaking,
-                SystemFrame::PauseProcessor { .. }     => FrameKind::PauseProcessor,
-                SystemFrame::PauseProcessorUrgent{..}  => FrameKind::PauseProcessorUrgent,
-                SystemFrame::ResumeProcessor { .. }    => FrameKind::ResumeProcessor,
-                SystemFrame::ResumeProcessorUrgent{..} => FrameKind::ResumeProcessorUrgent,
-                SystemFrame::Heartbeat(_)              => FrameKind::Heartbeat,
+                SystemFrame::Start(_)                      => FrameKind::Start,
+                SystemFrame::Cancel { .. }                 => FrameKind::Cancel,
+                SystemFrame::Error(_)                      => FrameKind::Error,
+                SystemFrame::Interruption                  => FrameKind::Interruption,
+                SystemFrame::Stop { .. }                   => FrameKind::Stop,
+                SystemFrame::EndTask { .. }                => FrameKind::EndTask,
+                SystemFrame::CancelTask { .. }             => FrameKind::CancelTask,
+                SystemFrame::StopTask                      => FrameKind::StopTask,
+                SystemFrame::InterruptionTask              => FrameKind::InterruptionTask,
+                SystemFrame::BotSpeaking                   => FrameKind::BotSpeaking,
+                SystemFrame::UserSpeaking                  => FrameKind::UserSpeaking,
+                SystemFrame::BotStartedSpeaking            => FrameKind::BotStartedSpeaking,
+                SystemFrame::BotStoppedSpeaking            => FrameKind::BotStoppedSpeaking,
+                SystemFrame::UserStartedSpeaking { .. }    => FrameKind::UserStartedSpeaking,
+                SystemFrame::UserStoppedSpeaking { .. }    => FrameKind::UserStoppedSpeaking,
+                SystemFrame::VADUserStartedSpeaking { .. } => FrameKind::VADUserStartedSpeaking,
+                SystemFrame::VADUserStoppedSpeaking { .. } => FrameKind::VADUserStoppedSpeaking,
+                SystemFrame::InputAudioRaw(_)              => FrameKind::InputAudioRaw,
+                SystemFrame::PauseProcessor { .. }         => FrameKind::PauseProcessor,
+                SystemFrame::PauseProcessorUrgent { .. }   => FrameKind::PauseProcessorUrgent,
+                SystemFrame::ResumeProcessor { .. }        => FrameKind::ResumeProcessor,
+                SystemFrame::ResumeProcessorUrgent { .. }  => FrameKind::ResumeProcessorUrgent,
+                SystemFrame::Heartbeat(_)                  => FrameKind::Heartbeat,
             },
             FrameInner::Control(c) => match c {
                 ControlFrame::End { .. } => FrameKind::End,
             },
             FrameInner::Data(d) => match d {
-                DataFrame::Data(_) => FrameKind::Data,
+                DataFrame::Data(_)           => FrameKind::Data,
+                DataFrame::OutputAudioRaw(_) => FrameKind::OutputAudioRaw,
             },
         }
     }
@@ -204,7 +300,6 @@ impl Frame {
     }
 
     /// Uninterruptible frames survive interruption queue drains.
-    /// Mirrors Python's `UninterruptibleFrame` mixin on specific types.
     pub fn is_uninterruptible(&self) -> bool {
         matches!(
             &self.inner,
@@ -217,7 +312,7 @@ impl Frame {
 }
 
 // ---------------------------------------------------------------------------
-// Mutation helpers — one-liners thanks to struct layout
+// Mutation helpers
 // ---------------------------------------------------------------------------
 
 impl Frame {
@@ -231,7 +326,7 @@ impl Frame {
 }
 
 // ---------------------------------------------------------------------------
-// Internal constructors
+// Internal constructor
 // ---------------------------------------------------------------------------
 
 impl Frame {
@@ -241,10 +336,12 @@ impl Frame {
 }
 
 // ---------------------------------------------------------------------------
-// Public constructors — no `new_` prefix
+// Public constructors
 // ---------------------------------------------------------------------------
 
 impl Frame {
+    // ---- Lifecycle ----
+
     pub fn start(data: StartFrameData) -> Self {
         Self::make(FrameInner::System(SystemFrame::Start(data)))
     }
@@ -297,6 +394,8 @@ impl Frame {
         Self::make(FrameInner::System(SystemFrame::InterruptionTask))
     }
 
+    // ---- Speaking signals ----
+
     pub fn bot_speaking() -> Self {
         Self::make(FrameInner::System(SystemFrame::BotSpeaking))
     }
@@ -304,6 +403,76 @@ impl Frame {
     pub fn user_speaking() -> Self {
         Self::make(FrameInner::System(SystemFrame::UserSpeaking))
     }
+
+    pub fn bot_started_speaking() -> Self {
+        Self::make(FrameInner::System(SystemFrame::BotStartedSpeaking))
+    }
+
+    pub fn bot_stopped_speaking() -> Self {
+        Self::make(FrameInner::System(SystemFrame::BotStoppedSpeaking))
+    }
+
+    pub fn user_started_speaking() -> Self {
+        Self::make(FrameInner::System(SystemFrame::UserStartedSpeaking { emulated: false }))
+    }
+
+    pub fn user_started_speaking_emulated() -> Self {
+        Self::make(FrameInner::System(SystemFrame::UserStartedSpeaking { emulated: true }))
+    }
+
+    pub fn user_stopped_speaking() -> Self {
+        Self::make(FrameInner::System(SystemFrame::UserStoppedSpeaking { emulated: false }))
+    }
+
+    pub fn user_stopped_speaking_emulated() -> Self {
+        Self::make(FrameInner::System(SystemFrame::UserStoppedSpeaking { emulated: true }))
+    }
+
+    pub fn vad_user_started_speaking(start_secs: f32, timestamp: f64) -> Self {
+        Self::make(FrameInner::System(SystemFrame::VADUserStartedSpeaking {
+            start_secs,
+            timestamp,
+        }))
+    }
+
+    pub fn vad_user_stopped_speaking(stop_secs: f32, timestamp: f64) -> Self {
+        Self::make(FrameInner::System(SystemFrame::VADUserStoppedSpeaking {
+            stop_secs,
+            timestamp,
+        }))
+    }
+
+    // ---- Audio ----
+
+    /// Construct an input audio frame. High-priority (SystemFrame).
+    pub fn input_audio_raw(data: AudioRawData) -> Self {
+        Self::make(FrameInner::System(SystemFrame::InputAudioRaw(data)))
+    }
+
+    /// Convenience: build input audio from raw bytes.
+    pub fn input_audio(
+        audio: Vec<u8>,
+        sample_rate: u32,
+        num_channels: u16,
+    ) -> Self {
+        Self::input_audio_raw(AudioRawData::new(audio, sample_rate, num_channels))
+    }
+
+    /// Construct an output audio frame. Ordered + cancellable (DataFrame).
+    pub fn output_audio_raw(data: AudioRawData) -> Self {
+        Self::make(FrameInner::Data(DataFrame::OutputAudioRaw(data)))
+    }
+
+    /// Convenience: build output audio from raw bytes.
+    pub fn output_audio(
+        audio: Vec<u8>,
+        sample_rate: u32,
+        num_channels: u16,
+    ) -> Self {
+        Self::output_audio_raw(AudioRawData::new(audio, sample_rate, num_channels))
+    }
+
+    // ---- Processor control ----
 
     pub fn pause_processor(name: impl Into<String>) -> Self {
         Self::make(FrameInner::System(SystemFrame::PauseProcessor {
@@ -333,6 +502,8 @@ impl Frame {
         Self::make(FrameInner::System(SystemFrame::Heartbeat(ts)))
     }
 
+    // ---- Control ----
+
     pub fn end() -> Self {
         Self::make(FrameInner::Control(ControlFrame::End { reason: None }))
     }
@@ -342,6 +513,8 @@ impl Frame {
             reason: Some(reason.into()),
         }))
     }
+
+    // ---- Generic data ----
 
     pub fn data(content: Vec<u8>) -> Self {
         Self::make(FrameInner::Data(DataFrame::Data(DataFrameData {
