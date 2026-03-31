@@ -12,7 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::time::sleep;
 
-use pipecat_core::{
+use rustvani::{
     error::Result,
     frames::{
         AudioRawData, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,

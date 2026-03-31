@@ -15,4 +15,5 @@ pub use frames::{
     StartFrameData, SystemFrame,
 };
 pub use pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask};
-pub use transport::{BaseTransport, BaseInputTransport, BaseOutputTransport, TransportParams};
+pub use transport::{BaseTransport, BaseInputTransport, BaseOutputTransport, TransportParams};pub mod vad;
+pub use vad::{VadParams, VadProcessor, VadState};
