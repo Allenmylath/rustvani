@@ -88,7 +88,7 @@ impl FrameHandler for BaseOutputTransport {
                     log::debug!("BaseOutputTransport: bot started speaking");
                     let started = Frame::bot_started_speaking();
                     processor
-                        .push_frame(started, FrameDirection::Downstream)
+                        .broadcast_frame(started)
                         .await?;
                 }
 

@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use pipecat_core::{
+use rustvani::{
     clock::system_clock,
     frames::FrameDirection,
     frames::{ControlFrame, DataFrame, DataFrameData, Frame, FrameInner, FrameKind, SystemFrame, StartFrameData},
@@ -148,12 +148,10 @@ fn frame_kind_correct() {
 
 #[test]
 fn frame_is_uninterruptible() {
-    // EndFrame and task frames are uninterruptible
     assert!(Frame::end().is_uninterruptible());
     assert!(Frame::end_task().is_uninterruptible());
     assert!(Frame::stop_task().is_uninterruptible());
     assert!(Frame::cancel_task().is_uninterruptible());
-    // Regular frames are not
     assert!(!Frame::cancel().is_uninterruptible());
     assert!(!Frame::data(vec![1]).is_uninterruptible());
     assert!(!Frame::heartbeat(1.0).is_uninterruptible());
@@ -178,7 +176,7 @@ fn start_frame_data_fields() {
         ..Default::default()
     });
     match &f.inner {
-        pipecat_core::frames::FrameInner::System(SystemFrame::Start(d)) => {
+        rustvani::frames::FrameInner::System(SystemFrame::Start(d)) => {
             assert!(d.allow_interruptions);
             assert!(d.enable_metrics);
         }
@@ -200,14 +198,12 @@ async fn passthrough_processor_forwards_frame() {
 
     a.setup(setup()).await.unwrap();
 
-    // Send StartFrame first to initialise
     a.queue_frame(
         Frame::start(StartFrameData::default()),
         FrameDirection::Downstream,
         None,
     ).await.unwrap();
 
-    // Give tasks time to process
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let seen = seen.lock().unwrap();
@@ -216,7 +212,6 @@ async fn passthrough_processor_forwards_frame() {
 
 #[tokio::test]
 async fn processor_link_chain() {
-    // Verify that link() sets next/prev correctly
     let a = FrameProcessor::new("A", Box::new(PassthroughHandler), false);
     let b = FrameProcessor::new("B", Box::new(PassthroughHandler), false);
     let c = FrameProcessor::new("C", Box::new(SinkHandler), false);
@@ -234,22 +229,16 @@ async fn processor_link_chain() {
 
 #[tokio::test]
 async fn processor_setup_propagates_to_sub_processors() {
-    // Pipeline sets sub_processors — verify setup propagates
     let inner = FrameProcessor::new("Inner", Box::new(SinkHandler), false);
     let outer = FrameProcessor::new("Outer", Box::new(SinkHandler), false);
     outer.set_sub_processors(vec![inner.clone()]);
 
-    // setup() should not panic and should reach inner
     outer.setup(setup()).await.unwrap();
     outer.cleanup().await.unwrap();
 }
 
 #[tokio::test]
 async fn system_frames_processed_before_data() {
-    // The priority queue processes system frames before non-system frames.
-    // Strategy: queue several Data frames, then a Heartbeat (system, non-destructive).
-    // Heartbeat should appear before any Data in the handler because system frames
-    // jump ahead in the input queue.
     let order: Arc<Mutex<Vec<FrameKind>>> = Arc::new(Mutex::new(Vec::new()));
     let order_clone = order.clone();
 
@@ -273,22 +262,17 @@ async fn system_frames_processed_before_data() {
     a.link(&b);
     a.setup(setup()).await.unwrap();
 
-    // Initialise
     a.queue_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream, None)
         .await.unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
 
-    // Pause the process task so Data frames stack up without being consumed
     a.pause_processing_frames().await;
 
-    // Queue several Data frames — they sit in process_queue
     for _ in 0..3 {
         a.queue_frame(Frame::data(vec![0]), FrameDirection::Downstream, None).await.unwrap();
     }
-    // Queue a Heartbeat (system) — goes directly through input task, bypasses process_queue
     a.queue_frame(Frame::heartbeat(0.0), FrameDirection::Downstream, None).await.unwrap();
 
-    // Resume so both queues drain
     a.resume_processing_frames().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -296,10 +280,9 @@ async fn system_frames_processed_before_data() {
     let hb_pos   = seen.iter().position(|k| *k == FrameKind::Heartbeat);
     let data_pos = seen.iter().position(|k| *k == FrameKind::Data);
 
-    // Heartbeat should have been processed before any Data frame
     match (hb_pos, data_pos) {
         (Some(h), Some(d)) => assert!(h < d, "Heartbeat should precede Data: {:?}", *seen),
-        (Some(_), None)    => { /* Data may have been dropped — priority still proved */ }
+        (Some(_), None)    => {}
         (None, _)          => panic!("Heartbeat was never processed: {:?}", *seen),
     }
 }
@@ -314,7 +297,6 @@ fn pipeline_registers_sub_processors() {
     let b = FrameProcessor::new("B", Box::new(PassthroughHandler), false);
     let pipeline = Pipeline::new(vec![a, b]);
 
-    // sub_processors should include source + A + B + sink = 4
     let subs = pipeline.processors();
     assert_eq!(subs.len(), 4, "Expected [source, A, B, sink], got {}", subs.len());
 }
@@ -338,7 +320,6 @@ async fn pipeline_routes_frame_downstream() {
     let pipeline = Pipeline::new(vec![a, b]);
     pipeline.setup(setup()).await.unwrap();
 
-    // Send StartFrame to initialise processors
     pipeline.queue_frame(
         Frame::start(StartFrameData::default()),
         FrameDirection::Downstream,
@@ -347,7 +328,6 @@ async fn pipeline_routes_frame_downstream() {
 
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    // Collect everything seen
     let mut names = Vec::new();
     while let Ok((name, kind, dir)) = rx.try_recv() {
         if kind == FrameKind::Start && dir == FrameDirection::Downstream {
@@ -355,7 +335,6 @@ async fn pipeline_routes_frame_downstream() {
         }
     }
 
-    // Both A and B should have seen the StartFrame going downstream
     assert!(names.contains(&"A".to_string()), "A did not see StartFrame downstream: {:?}", names);
     assert!(names.contains(&"B".to_string()), "B did not see StartFrame downstream: {:?}", names);
 
@@ -372,7 +351,6 @@ async fn pipeline_routes_frame_upstream() {
     let pipeline = Pipeline::new(vec![a, b]);
     pipeline.setup(setup()).await.unwrap();
 
-    // Initialise first
     pipeline.queue_frame(
         Frame::start(StartFrameData::default()),
         FrameDirection::Downstream,
@@ -380,7 +358,6 @@ async fn pipeline_routes_frame_upstream() {
     ).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Push a frame upstream from the sink side
     pipeline.queue_frame(Frame::data(vec![42]), FrameDirection::Upstream, None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -391,7 +368,6 @@ async fn pipeline_routes_frame_upstream() {
         }
     }
 
-    // B should see it upstream before A (reverse order)
     assert!(upstream_names.contains(&"B".to_string()), "B did not see data upstream: {:?}", upstream_names);
     assert!(upstream_names.contains(&"A".to_string()), "A did not see data upstream: {:?}", upstream_names);
 
@@ -431,7 +407,6 @@ async fn nested_pipeline_routes_frames() {
         }
     }
 
-    // OuterA, InnerA, InnerB should all see StartFrame
     assert!(seen.contains(&"OuterA".to_string()),  "OuterA missing: {:?}", seen);
     assert!(seen.contains(&"InnerA".to_string()),  "InnerA missing: {:?}", seen);
     assert!(seen.contains(&"InnerB".to_string()),  "InnerB missing: {:?}", seen);
@@ -473,7 +448,6 @@ async fn task_lifecycle_start_to_end() {
 
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        // Send EndTask to trigger graceful shutdown
         tx.send((Frame::end_task(), FrameDirection::Upstream)).await.ok();
     });
 
@@ -535,7 +509,6 @@ async fn task_cancel_task_frame_triggers_cancel() {
     tokio::time::timeout(Duration::from_secs(2), task.run(system_clock(), None))
         .await.unwrap().unwrap();
 
-    // CancelTask should produce Cancel finish reason
     assert!(
         matches!(*reason.lock().unwrap(), Some(FinishReason::Cancel(_))),
         "Expected Cancel reason, got {:?}", *reason.lock().unwrap()
@@ -605,7 +578,6 @@ async fn task_push_frame_reaches_processor() {
     tokio::time::timeout(Duration::from_secs(2), task.run(system_clock(), None))
         .await.unwrap().unwrap();
 
-    // Should have received our data payload
     let mut received = false;
     while let Ok(content) = rx_seen.try_recv() {
         if content == vec![1, 2, 3] {
@@ -634,7 +606,6 @@ async fn task_idle_timeout_fires() {
         Box::pin(async move { *t.lock().unwrap() = true; })
     });
 
-    // Don't inject any frames — should idle-timeout on its own
     tokio::time::timeout(Duration::from_secs(2), task.run(system_clock(), None))
         .await.unwrap().unwrap();
 
@@ -645,7 +616,7 @@ async fn task_idle_timeout_fires() {
 async fn task_idle_timeout_reset_by_activity() {
     let mut params = PipelineParams::default();
     params.idle_timeout = Some(Duration::from_millis(200));
-    params.cancel_on_idle_timeout = false; // don't auto-cancel so we can control shutdown
+    params.cancel_on_idle_timeout = false;
 
     let task = PipelineTask::new(
         vec![FrameProcessor::new("P", Box::new(PassthroughHandler), false)],
@@ -663,12 +634,10 @@ async fn task_idle_timeout_reset_by_activity() {
     let tx = task.push_sender();
 
     tokio::spawn(async move {
-        // Keep resetting idle timer with BotSpeaking frames
         for _ in 0..3 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             tx.send((Frame::bot_speaking(), FrameDirection::Downstream)).await.ok();
         }
-        // Then stop and let it idle-timeout once
         tokio::time::sleep(Duration::from_millis(300)).await;
         tx.send((Frame::end_task(), FrameDirection::Upstream)).await.ok();
     });
@@ -676,7 +645,6 @@ async fn task_idle_timeout_reset_by_activity() {
     tokio::time::timeout(Duration::from_secs(3), task.run(system_clock(), None))
         .await.unwrap().unwrap();
 
-    // Should have idled at most once (not on every 100ms interval since we reset it)
     let count = *timeout_count.lock().unwrap();
     assert!(count <= 1, "Idle timeout fired too many times: {}", count);
 }
@@ -685,7 +653,7 @@ async fn task_idle_timeout_reset_by_activity() {
 async fn task_heartbeat_reaches_pipeline() {
     let mut params = PipelineParams::default();
     params.enable_heartbeats = true;
-    params.heartbeat_seconds = 0.05; // fast for testing
+    params.heartbeat_seconds = 0.05;
 
     let (tx_seen, mut rx_seen) = mpsc::unbounded_channel::<FrameKind>();
 
@@ -730,7 +698,6 @@ async fn task_error_callback_fires_on_fatal_error() {
     let error_msg: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let em = error_msg.clone();
 
-    // A handler that pushes a fatal error upstream
     struct FatalErrorHandler;
 
     #[async_trait]
@@ -742,7 +709,6 @@ async fn task_error_callback_fires_on_fatal_error() {
             direction: FrameDirection,
         ) -> Result<()> {
             if let FrameInner::System(SystemFrame::Start(_)) = &frame.inner {
-                // Push a fatal error upstream after start
                 processor.push_frame(
                     Frame::error("test fatal", true, Some(processor.name().to_string())),
                     FrameDirection::Upstream,
@@ -810,7 +776,6 @@ async fn task_run_twice_fails() {
     tokio::time::timeout(Duration::from_secs(2), task.run(system_clock(), None))
         .await.unwrap().unwrap();
 
-    // Second call must return an error
     let result = task.run(system_clock(), None).await;
     assert!(result.is_err(), "Expected error on second run() call");
 }

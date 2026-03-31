@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use pipecat_core::{
+use rustvani::{
     clock::system_clock,
     frames::FrameDirection,
     error::Result,
@@ -217,10 +217,10 @@ async fn main() {
             data.metadata.insert("audio".to_string(), "true".to_string());
 
             let audio_frame = Frame {
-                id: pipecat_core::frames::next_frame_id(),
+                id: rustvani::frames::next_frame_id(),
                 sibling_id: None,
-                inner: pipecat_core::frames::FrameInner::Data(
-                    pipecat_core::frames::DataFrame::Data(data)
+                inner: rustvani::frames::FrameInner::Data(
+                    rustvani::frames::DataFrame::Data(data)
                 ),
             };
 
