@@ -64,7 +64,7 @@ pub fn exp_smoothing(current: f32, prev: f32, factor: f32) -> f32 {
 // StateMachine
 // ---------------------------------------------------------------------------
 
-const SMOOTHING_FACTOR: f32 = 0.2;
+const SMOOTHING_FACTOR: f32 = 1.0;
 
 /// Stateful VAD state machine.
 ///

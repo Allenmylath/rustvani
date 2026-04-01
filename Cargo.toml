@@ -3,6 +3,10 @@ name = "rustvani"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "vad_test"
+path = "src/bin/vad_test.rs"
+
 [dependencies]
 tokio           = { version = "1", features = ["full"] }
 async-trait     = "0.1"
@@ -10,9 +14,9 @@ thiserror       = "1"
 futures         = "0.3"
 log             = "0.4"
 env_logger      = "0.11"
-ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
-ndarray         = "0.17"
+ort             = { version = "2.0.0-rc.12", features = ["download-binaries"] }
 async-recursion = "1"
+hound           = "3"
 
 [dev-dependencies]
 tokio      = { version = "1", features = ["full", "test-util"] }

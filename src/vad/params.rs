@@ -6,10 +6,10 @@
 // Defaults — exact values from Python
 // ---------------------------------------------------------------------------
 
-pub const VAD_CONFIDENCE: f32 = 0.7;
-pub const VAD_START_SECS: f32 = 0.2;
-pub const VAD_STOP_SECS:  f32 = 0.2;
-pub const VAD_MIN_VOLUME: f32 = 0.6;
+pub const VAD_CONFIDENCE: f32 = 0.1;
+pub const VAD_START_SECS: f32 = 0.4;
+pub const VAD_STOP_SECS:  f32 = 0.4;
+pub const VAD_MIN_VOLUME: f32 = 0.01;
 
 /// Configuration parameters for Voice Activity Detection.
 ///
