@@ -2,6 +2,19 @@
 //!
 //! `VadState` and `StateMachine` are a direct port of the state transitions
 //! in Python's `VADAnalyzer._run_analyzer()`. No logic changed, only language.
+//!
+//! # Volume calculation
+//!
+//! Python's `calculate_audio_volume` uses EBU R128 loudness (pyloudnorm),
+//! normalised from -20..80 LUFS → 0.0..1.0. We approximate this with dBFS:
+//!
+//!   rms_linear = RMS(samples) / 32768          # 0.0–1.0
+//!   db = 20 * log10(rms_linear).clamp(-60, 0)  # -60..0 dBFS
+//!   volume = (db + 60) / 60                    # 0.0..1.0
+//!
+//! This maps silence (~-60 dBFS) → 0.0 and full-scale → 1.0.
+//! Normal conversational speech (RMS ~500–3000 / 32768) maps to roughly
+//! 0.3–0.6 on this scale, which is compatible with VAD_MIN_VOLUME = 0.6.
 
 use super::params::VadParams;
 
@@ -31,12 +44,18 @@ impl Default for VadState {
 }
 
 // ---------------------------------------------------------------------------
-// Audio helpers — ported from Python's audio_utils.py
+// Audio helpers
 // ---------------------------------------------------------------------------
 
-/// Calculate RMS volume of raw 16-bit PCM audio, normalised to 0–1.
+/// Calculate audio volume as a normalised 0.0–1.0 value using dBFS.
 ///
-/// Equivalent to Python's `calculate_audio_volume()`.
+/// Approximates Python's EBU R128-based `calculate_audio_volume`:
+///   - Silence (~-60 dBFS or below) → ~0.0
+///   - Full-scale → 1.0
+///   - Normal conversational speech → ~0.3–0.6
+///
+/// This makes `VAD_MIN_VOLUME = 0.6` semantically compatible with the
+/// Python implementation without the cost of a full loudness meter.
 pub fn calculate_audio_volume(audio: &[u8]) -> f32 {
     let samples: Vec<i16> = audio
         .chunks_exact(2)
@@ -47,14 +66,24 @@ pub fn calculate_audio_volume(audio: &[u8]) -> f32 {
         return 0.0;
     }
 
+    // Compute RMS normalised to 0.0–1.0
     let sum_sq: f64 = samples.iter().map(|&s| (s as f64).powi(2)).sum();
-    let rms = (sum_sq / samples.len() as f64).sqrt() as f32;
-    rms / 32768.0
+    let rms = (sum_sq / samples.len() as f64).sqrt() as f32 / 32768.0;
+
+    if rms < 1e-9 {
+        return 0.0;
+    }
+
+    // Convert to dBFS, clamp to -60..0, then normalise to 0.0..1.0
+    let db = (20.0 * rms.log10()).clamp(-60.0, 0.0);
+    (db + 60.0) / 60.0
 }
 
 /// Exponential smoothing.
 ///
-/// Equivalent to Python's `exp_smoothing(value, prev, factor)`.
+/// Equivalent to Python's `exp_smoothing(value, prev, factor)`:
+///   return prev + factor * (value - prev)
+/// which is algebraically identical to our original form.
 #[inline]
 pub fn exp_smoothing(current: f32, prev: f32, factor: f32) -> f32 {
     current * factor + prev * (1.0 - factor)
@@ -64,14 +93,12 @@ pub fn exp_smoothing(current: f32, prev: f32, factor: f32) -> f32 {
 // StateMachine
 // ---------------------------------------------------------------------------
 
-const SMOOTHING_FACTOR: f32 = 1.0;
+const SMOOTHING_FACTOR: f32 = 0.2;
 
 /// Stateful VAD state machine.
 ///
 /// One instance per audio stream. Holds the accumulated audio buffer,
 /// frame counts, volume history, and current state.
-///
-/// Call `process_chunk()` with each raw PCM chunk; it returns the new state.
 pub struct StateMachine {
     params: VadParams,
 
@@ -80,7 +107,6 @@ pub struct StateMachine {
     frames_required: usize,
 
     /// Byte length of one inference window.
-    /// `frames_required * num_channels * 2`
     bytes_required: usize,
 
     /// Frames needed to confirm STARTING → SPEAKING.
@@ -96,7 +122,7 @@ pub struct StateMachine {
     // Volume smoothing
     prev_volume: f32,
 
-    // Accumulation buffer — collects bytes until a full window is ready.
+    // Accumulation buffer
     buffer: Vec<u8>,
 
     pub state: VadState,
@@ -104,8 +130,6 @@ pub struct StateMachine {
 
 impl StateMachine {
     /// Create a new state machine for the given sample rate and params.
-    ///
-    /// `sample_rate` must be 8000 or 16000.
     pub fn new(sample_rate: u32, params: VadParams) -> Self {
         let frames_required: usize = if sample_rate == 16000 { 512 } else { 256 };
         let bytes_required = frames_required * 2; // mono, 16-bit
@@ -128,12 +152,10 @@ impl StateMachine {
         }
     }
 
-    /// Feed a PCM chunk and a confidence score (from the Silero model).
+    /// Feed a PCM chunk into the buffer.
     ///
-    /// Returns `(new_state, Option<window_bytes>)`.
-    /// `window_bytes` is `Some` when a full inference window is available
-    /// and should be passed to `SileroVad::infer()`.
-    /// When `None`, the chunk was buffered and no inference is needed yet.
+    /// Returns `Some(window)` when a full inference window is ready,
+    /// `None` if more data is needed.
     pub fn next_window(&mut self, chunk: &[u8]) -> Option<Vec<u8>> {
         self.buffer.extend_from_slice(chunk);
         if self.buffer.len() >= self.bytes_required {
@@ -149,7 +171,6 @@ impl StateMachine {
     /// Mirrors Python's `_run_analyzer()` state transition logic exactly.
     /// Returns the new `VadState`.
     pub fn advance(&mut self, confidence: f32, audio_window: &[u8]) -> VadState {
-        // Volume check — same as Python
         let volume = exp_smoothing(
             calculate_audio_volume(audio_window),
             self.prev_volume,
