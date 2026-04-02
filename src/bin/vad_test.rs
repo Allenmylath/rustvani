@@ -8,10 +8,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ort::session::builder::SessionBuilder;
 use rustvani::{
-    system_clock, AudioRawData, Frame, FrameDirection, FrameHandler, FrameKind, FrameProcessor,
-    PipelineParams, PipelineTask, Result, VadParams, VadProcessor,
+    system_clock, AudioRawData, Frame, FrameDirection, FrameHandler, FrameKind,
+    FrameProcessor, PipelineParams, PipelineTask, Result, VadParams, SileroVad,
 };
-use rustvani::vad::SileroVad;
+use rustvani::transport::{BaseTransport, TransportParams};
+use rustvani::vad::SileroVad as SileroVadDirect;
 
 const CHUNK_BYTES: usize = 512 * 2;
 const MODEL_PATH: &str = "/app/silero_vad.onnx";
@@ -70,7 +71,7 @@ fn rms_norm(chunk: &[u8]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Step 0: Model introspection — print input/output names and shapes
+// Step 0: Model introspection
 // ---------------------------------------------------------------------------
 
 fn inspect_model() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -81,17 +82,15 @@ fn inspect_model() -> std::result::Result<(), Box<dyn std::error::Error>> {
     for input in session.inputs().iter() {
         println!("    input name: {:?}", input.name());
     }
-
     println!("  Outputs:");
     for output in session.outputs().iter() {
         println!("    output name: {:?}", output.name());
     }
-
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Step 1: Sample chunks from across the full file, not just the start
+// Step 1: Sample confidence across file — stateless, no pipeline needed
 // ---------------------------------------------------------------------------
 
 async fn sample_confidence_across_file(
@@ -105,9 +104,7 @@ async fn sample_confidence_across_file(
         .collect();
 
     let total = chunks.len();
-    // Sample 10 evenly spaced chunks across the full file
     let indices: Vec<usize> = (0..10).map(|i| i * total / 10).collect();
-
     let mut max_conf = 0.0f32;
 
     for &idx in &indices {
@@ -115,7 +112,7 @@ async fn sample_confidence_across_file(
         let time_s = idx as f32 * 512.0 / 16000.0;
 
         // Fresh model per chunk — stateless baseline
-        let model = SileroVad::from_path(16_000, MODEL_PATH)
+        let model = SileroVadDirect::from_path(16_000, MODEL_PATH)
             .map_err(|e| format!("Model load failed: {}", e))?;
         let conf = model.infer_async(chunk.to_vec()).await
             .map_err(|e| format!("infer error at chunk {}: {}", idx, e))?;
@@ -129,7 +126,7 @@ async fn sample_confidence_across_file(
 }
 
 // ---------------------------------------------------------------------------
-// Full pipeline run
+// Full pipeline run — VAD configured on transport
 // ---------------------------------------------------------------------------
 
 async fn run_pipeline(
@@ -140,29 +137,49 @@ async fn run_pipeline(
     println!("\n--- {} ---", label);
     println!("    confidence={:.4} min_volume={:.4}", params.confidence, params.min_volume);
 
+    let vad_analyzer = Arc::new(
+        SileroVad::from_path(16_000, MODEL_PATH)
+            .map_err(|e| format!("VAD init failed: {}", e))?
+    );
+
+    let transport = Arc::new(BaseTransport::new("VadTest", TransportParams {
+        audio_in_enabled:         true,
+        audio_in_sample_rate:     Some(16_000),
+        audio_in_channels:        1,
+        audio_in_passthrough:     false, // no downstream STT — just VAD events
+        audio_in_stream_on_start: true,
+        vad_analyzer:             Some(vad_analyzer),
+        vad_params:               params,
+        ..TransportParams::default()
+    }));
+
     let observed = Arc::new(Mutex::new(Vec::<FrameKind>::new()));
     let observer_proc = FrameProcessor::new(
         "Observer",
         Box::new(ObserverHandler { frames: observed.clone() }),
         false,
     );
-    let vad = VadProcessor::new(16_000, params)
-        .map_err(|e| format!("VadProcessor init failed: {}", e))?
-        .into_processor();
 
-    let task = PipelineTask::new(vec![vad, observer_proc], PipelineParams::default());
-    let tx = task.push_sender();
+    let task = PipelineTask::new(
+        vec![transport.input(), observer_proc, transport.output()],
+        PipelineParams::default(),
+    );
 
+    let push_tx = task.push_sender();
+    let transport_for_feeder = transport.clone();
     let feeder_bytes = pcm_bytes.clone();
+
     let audio_feeder = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
+
         for chunk in feeder_bytes.chunks(CHUNK_BYTES) {
             if chunk.len() < CHUNK_BYTES { break; }
-            let frame = Frame::input_audio_raw(AudioRawData::new(chunk.to_vec(), 16_000, 1));
-            if tx.send((frame, FrameDirection::Downstream)).await.is_err() { break; }
+            let data = AudioRawData::new(chunk.to_vec(), 16_000, 1);
+            transport_for_feeder.push_audio_frame(data).await;
         }
+
         tokio::time::sleep(Duration::from_millis(800)).await;
-        let _ = tx.send((Frame::end(), FrameDirection::Downstream)).await;
+        let _ = push_tx.send((Frame::end(), FrameDirection::Downstream)).await;
     });
 
     task.run(system_clock(), None).await?;
@@ -187,22 +204,15 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("[0] Reading WAV: {}", wav_path);
     let pcm_bytes = read_wav_pcm(&wav_path)?;
 
-    // Print model input/output names — tells us immediately if it's v5 with different API
     inspect_model()?;
 
-    // Sample confidence from across the full 60-second file
     let max_conf = sample_confidence_across_file(&pcm_bytes).await?;
 
     if max_conf < 0.01 {
         println!("\n  ✗ Max confidence {:.6} is near zero across the entire file.", max_conf);
-        println!("  → The model input/output names above will confirm if this is a v5 model.");
-        println!("  → If input name is not 'input'/'state'/'sr', update silero.rs accordingly.");
-        println!("  → If names match but confidence is still zero, the model file may be corrupt.");
-        println!("  → Try pinning the model to a specific release tag in the Dockerfile.");
         panic!("Model not producing meaningful confidence values.");
     }
 
-    // Pipeline runs
     let frames_open = run_pipeline(
         pcm_bytes.clone(),
         VadParams { confidence: max_conf * 0.5, min_volume: 0.0, ..VadParams::default() },
@@ -215,7 +225,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "Run B: default params",
     ).await?;
 
-    // Final assertions
     println!("\n[Assertions]");
     assert!(
         frames_open.contains(&FrameKind::VADUserStartedSpeaking),
@@ -225,14 +234,33 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         frames_open.contains(&FrameKind::VADUserStoppedSpeaking),
         "Missing VADUserStoppedSpeaking. Got: {:?}", frames_open
     );
+
+    // Verify no duplicates — Started must always alternate with Stopped
+    let mut speaking = false;
+    for kind in &frames_open {
+        match kind {
+            FrameKind::VADUserStartedSpeaking => {
+                assert!(!speaking, "Duplicate VADUserStartedSpeaking");
+                speaking = true;
+            }
+            FrameKind::VADUserStoppedSpeaking => {
+                assert!(speaking, "VADUserStoppedSpeaking without preceding Started");
+                speaking = false;
+            }
+            _ => {}
+        }
+    }
+
     println!("  ✓ VADUserStartedSpeaking");
     println!("  ✓ VADUserStoppedSpeaking");
+    println!("  ✓ No duplicate events — Started/Stopped alternate correctly");
+
     if !frames_default.is_empty() {
         println!("  ✓ Default params also work");
     } else {
-        println!("  ⚠ Default params need tuning — see recommended values above");
+        println!("  ⚠ Default params need tuning");
     }
-    println!("\n=== All checks passed. ===");
 
+    println!("\n=== All checks passed. ===");
     Ok(())
 }

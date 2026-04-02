@@ -2,7 +2,9 @@
 //!
 //! Listens on ws://localhost:8080/ws
 //! Each connection gets a fully isolated pipeline:
-//!   WebSocketTransport.input() → VadProcessor → VadPrintProcessor → WebSocketTransport.output()
+//!   WebSocketTransport.input() → VadPrintProcessor → WebSocketTransport.output()
+//!
+//! VAD runs inside the transport's audio task — configure via WebSocketParams.
 //!
 //! Wire protocol (client → server):
 //!   Binary WebSocket messages — raw i16 LE PCM, 16kHz mono, 512-sample chunks
@@ -23,9 +25,10 @@ use tower_http::cors::CorsLayer;
 
 use rustvani::{
     system_clock, Frame, FrameDirection, FrameHandler, FrameKind,
-    FrameProcessor, PipelineParams, PipelineTask, Result, VadParams, VadProcessor,
+    FrameProcessor, PipelineParams, PipelineTask, Result, VadParams, SileroVad,
 };
 use rustvani::transport::websocket::{WebSocketParams, WebSocketTransport};
+use rustvani::transport::TransportParams;
 
 // ---------------------------------------------------------------------------
 // Connection ID counter
@@ -84,19 +87,30 @@ async fn handle_connection(socket: WebSocket) {
     let conn_id = next_conn_id();
     println!("[conn={}] connected", conn_id);
 
-    // Fresh isolated transport + pipeline per connection.
-    let transport = WebSocketTransport::new(
-        &format!("WsTransport-{}", conn_id),
-        WebSocketParams::default(),
-    );
-
-    let vad = match VadProcessor::new(16_000, VadParams::default()) {
-        Ok(v) => v.into_processor(),
+    // Build a fresh Silero VAD instance per connection — isolated LSTM state.
+    let vad_analyzer = match SileroVad::new(16_000) {
+        Ok(v) => Arc::new(v),
         Err(e) => {
             println!("[conn={}] VAD init failed: {}", conn_id, e);
             return;
         }
     };
+
+    let transport = WebSocketTransport::new(
+        &format!("WsTransport-{}", conn_id),
+        WebSocketParams {
+            transport: TransportParams {
+                audio_in_enabled:         true,
+                audio_in_sample_rate:     Some(16_000),
+                audio_in_channels:        1,
+                audio_in_passthrough:     true,
+                audio_in_stream_on_start: true,
+                vad_analyzer:             Some(vad_analyzer),
+                vad_params:               VadParams::default(),
+                ..TransportParams::default()
+            },
+        },
+    );
 
     let printer = FrameProcessor::new(
         format!("VadPrint-{}", conn_id),
@@ -104,16 +118,14 @@ async fn handle_connection(socket: WebSocket) {
         false,
     );
 
+    // Pipeline: VAD now runs inside transport.input() — no VadProcessor stage needed.
     let task = PipelineTask::new(
-        vec![transport.input(), vad, printer, transport.output()],
+        vec![transport.input(), printer, transport.output()],
         PipelineParams::default(),
     );
 
     let push_tx = task.push_sender();
 
-    // run_socket feeds audio into the pipeline and sends Frame::end() on close.
-    // task.run() blocks until Frame::end() reaches TaskSink.
-    // Both complete together.
     tokio::join!(
         async { task.run(system_clock(), None).await.ok(); },
         transport.run_socket(socket, push_tx),

@@ -1,9 +1,9 @@
 //! Transport configuration parameters.
-//!
-//! Mirrors Python's `TransportParams` with deprecated fields removed.
 
-/// Configuration parameters for transport implementations.
-#[derive(Debug, Clone)]
+use std::sync::Arc;
+use crate::vad::{VadAnalyzer, VadParams};
+
+#[derive(Clone)]
 pub struct TransportParams {
     pub audio_in_enabled:         bool,
     pub audio_in_sample_rate:     Option<u32>,
@@ -15,7 +15,29 @@ pub struct TransportParams {
     pub audio_out_sample_rate:    Option<u32>,
     pub audio_out_channels:       u16,
     pub audio_out_bitrate:        u32,
-    pub vad_enabled:              bool,
+    /// VAD backend. `None` disables VAD entirely.
+    pub vad_analyzer:             Option<Arc<dyn VadAnalyzer>>,
+    /// VAD tuning parameters. Only used when `vad_analyzer` is `Some`.
+    pub vad_params:               VadParams,
+}
+
+impl std::fmt::Debug for TransportParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportParams")
+            .field("audio_in_enabled",         &self.audio_in_enabled)
+            .field("audio_in_sample_rate",      &self.audio_in_sample_rate)
+            .field("audio_in_channels",         &self.audio_in_channels)
+            .field("audio_in_passthrough",      &self.audio_in_passthrough)
+            .field("audio_in_stream_on_start",  &self.audio_in_stream_on_start)
+            .field("video_in_enabled",          &self.video_in_enabled)
+            .field("audio_out_enabled",         &self.audio_out_enabled)
+            .field("audio_out_sample_rate",     &self.audio_out_sample_rate)
+            .field("audio_out_channels",        &self.audio_out_channels)
+            .field("audio_out_bitrate",         &self.audio_out_bitrate)
+            .field("vad_analyzer",              &self.vad_analyzer.as_ref().map(|_| "Some(...)"))
+            .field("vad_params",                &self.vad_params)
+            .finish()
+    }
 }
 
 impl Default for TransportParams {
@@ -31,7 +53,8 @@ impl Default for TransportParams {
             audio_out_sample_rate:    None,
             audio_out_channels:       1,
             audio_out_bitrate:        96_000,
-            vad_enabled:              false,
+            vad_analyzer:             None,
+            vad_params:               VadParams::default(),
         }
     }
 }

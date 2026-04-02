@@ -1,29 +1,26 @@
 //! Base input transport.
 //!
-//! `BaseInputTransport` is a [`FrameHandler`] that handles the common input
-//! logic shared by all concrete transports (WebRTC, WebSocket, etc.):
+//! Owns the audio ingestion pipeline including VAD when configured.
 //!
-//! - A dedicated audio queue + task, **separate** from the pipeline queues.
-//!   This ensures VAD / STT latency is never affected by pipeline backpressure.
-//! - Lifecycle management (start / pause / stop / cancel).
-//! - Bot and user speaking state tracking.
-//! - A clearly marked VAD stub, wired in when `pipecat-audio` is ready.
+//! The audio task is intentionally separate from the pipeline queue loop
+//! so VAD latency is never affected by backpressure downstream.
 //!
-//! # Usage by concrete transports
+//! # VAD integration
 //!
-//! ```text
-//! let base = Arc::new(BaseInputTransport::new(params));
+//! Configure a VAD backend on `TransportParams::vad_analyzer`.
+//! The audio task owns the state machine and the `emitted_speaking` flag,
+//! mirroring Python's transport-level responsibility for event emission.
 //!
-//! // Install as the handler of a FrameProcessor.
-//! let processor = FrameProcessor::new("WebRtcInput", Box::new(base.clone()), false);
+//! Only two events are emitted, gated by `emitted_speaking`:
+//!   - `VADUserStartedSpeaking` — on `* → Speaking` when not already speaking
+//!   - `VADUserStoppedSpeaking` — on `* → Quiet` when currently speaking
 //!
-//! // Inject audio from the network thread / callback.
-//! base.push_audio_frame(AudioRawData::new(pcm_bytes, 16_000, 1)).await;
-//! ```
+//! `Starting` and `Stopping` are internal state machine states and never
+//! trigger events — exactly matching Python's behaviour.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use log;
@@ -35,6 +32,7 @@ use crate::frames::{
     AudioRawData, ControlFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,
     SystemFrame,
 };
+use crate::vad::{StateMachine, VadState};
 
 use super::params::TransportParams;
 
@@ -42,85 +40,64 @@ use super::params::TransportParams;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// How long the audio task waits for the next frame before checking state.
-/// Mirrors Python's `AUDIO_INPUT_TIMEOUT_SECS = 0.5`.
 const AUDIO_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Internal audio channel capacity (frames buffered before back-pressure).
 const AUDIO_CHANNEL_CAP: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Shared inner state
 // ---------------------------------------------------------------------------
 
-/// State shared between `BaseInputTransport` and its audio task.
 struct InputTransportState {
     params: TransportParams,
 
-    /// Resolved sample rate — set when `StartFrame` is processed.
-    sample_rate: AtomicU32,
-
-    /// Set by `StopFrame`; cleared by the next `StartFrame`.
-    paused: AtomicBool,
-
-    /// Tracks whether the bot is currently producing audio.
-    /// Set by `BotStartedSpeaking` / `BotStoppedSpeaking` frames.
+    sample_rate:  AtomicU32,
+    paused:       AtomicBool,
     bot_speaking: AtomicBool,
 
-    /// Tracks whether the user is currently speaking.
-    /// Set by VAD events; also used for timeout recovery.
+    /// True while user is considered to be in a speaking turn.
+    /// Used by the audio timeout recovery path.
     user_speaking: AtomicBool,
 
-    /// Sender half of the audio channel.
-    /// Concrete transports call `push_audio_frame()` which uses this.
-    audio_tx: mpsc::Sender<AudioRawData>,
+    /// True after we have emitted VADUserStartedSpeaking but before
+    /// we emit the matching VADUserStoppedSpeaking.
+    /// Guards against duplicate events when the state machine oscillates.
+    emitted_speaking: AtomicBool,
 
-    /// Receiver half of the audio channel.
-    /// Taken once by the audio task on `StartFrame`; `None` after that.
-    audio_rx: std::sync::Mutex<Option<mpsc::Receiver<AudioRawData>>>,
-
-    /// Handle for the running audio task; `None` before start / after stop.
+    audio_tx:   mpsc::Sender<AudioRawData>,
+    audio_rx:   std::sync::Mutex<Option<mpsc::Receiver<AudioRawData>>>,
     audio_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+
+    /// VAD state machine — initialised at StartFrame time when vad_analyzer is Some.
+    vad_machine: std::sync::Mutex<Option<StateMachine>>,
 }
 
 // ---------------------------------------------------------------------------
 // BaseInputTransport
 // ---------------------------------------------------------------------------
 
-/// Base input transport — shared logic for all concrete input transports.
-///
-/// Implement [`FrameHandler`] on your concrete transport and delegate to
-/// `BaseInputTransport` for the frames you don't need to customise, or use
-/// it directly as the handler if no custom behaviour is needed.
 pub struct BaseInputTransport {
     state: Arc<InputTransportState>,
 }
 
 impl BaseInputTransport {
-    /// Create a new base input transport with the given parameters.
     pub fn new(params: TransportParams) -> Self {
         let (audio_tx, audio_rx) = mpsc::channel(AUDIO_CHANNEL_CAP);
         Self {
             state: Arc::new(InputTransportState {
                 params,
-                sample_rate:  AtomicU32::new(0),
-                paused:       AtomicBool::new(false),
-                bot_speaking: AtomicBool::new(false),
-                user_speaking: AtomicBool::new(false),
+                sample_rate:      AtomicU32::new(0),
+                paused:           AtomicBool::new(false),
+                bot_speaking:     AtomicBool::new(false),
+                user_speaking:    AtomicBool::new(false),
+                emitted_speaking: AtomicBool::new(false),
                 audio_tx,
-                audio_rx: std::sync::Mutex::new(Some(audio_rx)),
-                audio_task: std::sync::Mutex::new(None),
+                audio_rx:    std::sync::Mutex::new(Some(audio_rx)),
+                audio_task:  std::sync::Mutex::new(None),
+                vad_machine: std::sync::Mutex::new(None),
             }),
         }
     }
 
-    // ---- Public API for concrete transports ----
-
-    /// Push a raw audio chunk into the audio queue.
-    ///
-    /// Called by concrete transports from their network callbacks.
-    /// Returns `true` if the frame was queued, `false` if it was dropped
-    /// (audio input disabled, transport paused, or channel full).
     pub async fn push_audio_frame(&self, data: AudioRawData) -> bool {
         if !self.state.params.audio_in_enabled {
             return false;
@@ -131,40 +108,40 @@ impl BaseInputTransport {
         self.state.audio_tx.send(data).await.is_ok()
     }
 
-    /// Clone the audio sender for concrete transports that need to own it
-    /// (e.g. to move it into a network callback closure).
     pub fn audio_sender(&self) -> mpsc::Sender<AudioRawData> {
         self.state.audio_tx.clone()
     }
 
-    /// Current resolved sample rate (0 before `StartFrame`).
     pub fn sample_rate(&self) -> u32 {
         self.state.sample_rate.load(Ordering::Relaxed)
     }
 
-    /// Whether the transport is currently paused.
     pub fn is_paused(&self) -> bool {
         self.state.paused.load(Ordering::Relaxed)
     }
 
-    // ---- Internal lifecycle helpers ----
+    // ---- Lifecycle ----
 
     fn on_start(&self, processor: &FrameProcessor) {
         self.state.paused.store(false, Ordering::Relaxed);
         self.state.user_speaking.store(false, Ordering::Relaxed);
+        self.state.emitted_speaking.store(false, Ordering::Relaxed);
 
-        // Resolve sample rate: params take priority, then fall back to 16 kHz.
         let sr = self.state.params.audio_in_sample_rate.unwrap_or(16_000);
         self.state.sample_rate.store(sr, Ordering::Relaxed);
 
+        // Initialise VAD state machine if an analyzer is configured.
+        if self.state.params.vad_analyzer.is_some() {
+            let machine = StateMachine::new(sr, self.state.params.vad_params.clone());
+            *self.state.vad_machine.lock().unwrap() = Some(machine);
+        }
+
         if self.state.params.audio_in_stream_on_start {
-            self.spawn_audio_task(processor.clone(), sr);
+            self.spawn_audio_task(processor.clone());
         }
     }
 
     fn on_stop(&self) {
-        // Pause: new audio arriving via push_audio_frame() will be dropped.
-        // The audio task keeps running but will drain to empty then timeout.
         self.state.paused.store(true, Ordering::Relaxed);
     }
 
@@ -172,12 +149,11 @@ impl BaseInputTransport {
         self.abort_audio_task();
     }
 
-    fn spawn_audio_task(&self, processor: FrameProcessor, sample_rate: u32) {
+    fn spawn_audio_task(&self, processor: FrameProcessor) {
         if !self.state.params.audio_in_enabled {
             return;
         }
 
-        // Take the receiver — can only happen once.
         let rx = match self.state.audio_rx.lock().unwrap().take() {
             Some(rx) => rx,
             None => {
@@ -187,7 +163,7 @@ impl BaseInputTransport {
         };
 
         let state = self.state.clone();
-        let handle = tokio::spawn(run_audio_task(state, rx, processor, sample_rate));
+        let handle = tokio::spawn(run_audio_task(state, rx, processor));
         *self.state.audio_task.lock().unwrap() = Some(handle);
     }
 
@@ -212,60 +188,44 @@ impl FrameHandler for BaseInputTransport {
         direction: FrameDirection,
     ) -> Result<()> {
         match &frame.inner {
-            // ---- Lifecycle ----
-
             FrameInner::System(SystemFrame::Start(_)) => {
-                // Push Start first so all downstream processors initialise
-                // before we potentially push audio frames.
                 processor.push_frame(frame, direction).await?;
                 self.on_start(processor);
             }
-
             FrameInner::System(SystemFrame::Stop { .. }) => {
                 self.on_stop();
                 processor.push_frame(frame, direction).await?;
             }
-
             FrameInner::Control(ControlFrame::End { .. }) => {
                 self.on_cancel_or_end();
                 processor.push_frame(frame, direction).await?;
             }
-
             FrameInner::System(SystemFrame::Cancel { .. }) => {
                 self.on_cancel_or_end();
                 processor.push_frame(frame, direction).await?;
             }
-
-            // ---- Speaking state tracking ----
-
             FrameInner::System(SystemFrame::BotStartedSpeaking) => {
                 self.state.bot_speaking.store(true, Ordering::Relaxed);
                 processor.push_frame(frame, direction).await?;
             }
-
             FrameInner::System(SystemFrame::BotStoppedSpeaking) => {
                 self.state.bot_speaking.store(false, Ordering::Relaxed);
                 processor.push_frame(frame, direction).await?;
             }
-
-            // Update user_speaking when VAD events arrive so the timeout
-            // recovery path in the audio task has accurate state.
+            // Keep user_speaking in sync with what VAD events we emit,
+            // so the audio timeout recovery path stays accurate.
             FrameInner::System(SystemFrame::VADUserStartedSpeaking { .. }) => {
                 self.state.user_speaking.store(true, Ordering::Relaxed);
                 processor.push_frame(frame, direction).await?;
             }
-
             FrameInner::System(SystemFrame::VADUserStoppedSpeaking { .. }) => {
                 self.state.user_speaking.store(false, Ordering::Relaxed);
                 processor.push_frame(frame, direction).await?;
             }
-
-            // ---- Everything else: pass through ----
             _ => {
                 processor.push_frame(frame, direction).await?;
             }
         }
-
         Ok(())
     }
 }
@@ -274,23 +234,12 @@ impl FrameHandler for BaseInputTransport {
 // Audio task
 // ---------------------------------------------------------------------------
 
-/// The audio processing task.
-///
-/// Runs independently of the pipeline queue loop so that VAD latency is
-/// never affected by backpressure in the main processor chain.
-///
-/// Current behaviour: passthrough only.
-/// VAD integration is stubbed — see the clearly marked section below.
 async fn run_audio_task(
     state: Arc<InputTransportState>,
     mut rx: mpsc::Receiver<AudioRawData>,
     processor: FrameProcessor,
-    _sample_rate: u32,
 ) {
-    // Don't fire timeout warnings until the first frame arrives.
-    // This avoids noise before the client has connected.
     let mut audio_received = false;
-
     log::debug!("BaseInputTransport: audio task started");
 
     loop {
@@ -299,34 +248,79 @@ async fn run_audio_task(
             Ok(Some(data)) => {
                 audio_received = true;
 
-                // Ignore frames while paused.
                 if state.paused.load(Ordering::Relaxed) {
                     continue;
                 }
 
-                // ----------------------------------------------------------------
-                // VAD STUB
-                //
-                // When `pipecat-audio` Silero VAD is wired in, this is where
-                // it runs. It will:
-                //   1. Call `vad_analyzer.analyze(&data.audio)` → VadState
-                //   2. On QUIET → SPEAKING transition:
-                //        push Frame::vad_user_started_speaking(start_secs, ts)
-                //   3. On SPEAKING → QUIET transition:
-                //        push Frame::vad_user_stopped_speaking(stop_secs, ts)
-                //
-                // For now we fall straight through to passthrough.
-                // ----------------------------------------------------------------
-
-                // Passthrough: push InputAudioRaw downstream so STT services
-                // (and the future VAD processor) can consume it.
+                // Passthrough: downstream processors (STT etc.) still get the raw audio.
                 if state.params.audio_in_passthrough {
-                    let frame = Frame::input_audio_raw(data);
+                    let frame = Frame::input_audio_raw(data.clone());
                     if let Err(e) = processor
                         .push_frame(frame, FrameDirection::Downstream)
                         .await
                     {
                         log::error!("BaseInputTransport: push_frame failed: {}", e);
+                    }
+                }
+
+                // VAD — only runs if an analyzer is configured.
+                if let Some(analyzer) = &state.params.vad_analyzer {
+                    // Feed into state machine buffer; get a window when ready.
+                    let window_opt = {
+                        let mut machine = state.vad_machine.lock().unwrap();
+                        machine.as_mut().and_then(|m| m.next_window(&data.audio))
+                    };
+
+                    if let Some(window) = window_opt {
+                        let confidence = analyzer.voice_confidence(window.clone()).await;
+
+                        // Advance state machine with inference result.
+                        let new_vad_state = {
+                            let mut machine = state.vad_machine.lock().unwrap();
+                            machine.as_mut().map(|m| m.advance(confidence, &window))
+                        };
+
+                        if let Some(vad_state) = new_vad_state {
+                            let ts = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs_f64();
+
+                            let was_speaking = state.emitted_speaking.load(Ordering::Relaxed);
+
+                            // Emit events gated on emitted_speaking flag —
+                            // mirrors Python transport's user_speaking guard.
+                            // Starting/Stopping are internal states; never trigger emission.
+                            match vad_state {
+                                VadState::Speaking if !was_speaking => {
+                                    state.emitted_speaking.store(true, Ordering::Relaxed);
+                                    let frame = Frame::vad_user_started_speaking(
+                                        state.params.vad_params.start_secs,
+                                        ts,
+                                    );
+                                    if let Err(e) = processor
+                                        .push_frame(frame, FrameDirection::Downstream)
+                                        .await
+                                    {
+                                        log::error!("BaseInputTransport: VAD push failed: {}", e);
+                                    }
+                                }
+                                VadState::Quiet if was_speaking => {
+                                    state.emitted_speaking.store(false, Ordering::Relaxed);
+                                    let frame = Frame::vad_user_stopped_speaking(
+                                        state.params.vad_params.stop_secs,
+                                        ts,
+                                    );
+                                    if let Err(e) = processor
+                                        .push_frame(frame, FrameDirection::Downstream)
+                                        .await
+                                    {
+                                        log::error!("BaseInputTransport: VAD push failed: {}", e);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
@@ -340,13 +334,9 @@ async fn run_audio_task(
             // ---- Timeout ----
             Err(_) => {
                 if !audio_received {
-                    // Client not yet connected — keep waiting silently.
                     continue;
                 }
 
-                // Audio was flowing and then stopped.
-                // If the user was mid-utterance, push a forced stop so
-                // downstream processors don't hang waiting for silence.
                 if state.user_speaking.load(Ordering::Relaxed) {
                     log::warn!(
                         "BaseInputTransport: audio timeout while user speaking \

@@ -6,14 +6,16 @@
 //! Inference runs on `tokio::task::spawn_blocking` — never blocks the executor.
 //!
 //! Model API (verified via introspection):
-//!   Inputs:  "input" [1, num_samples], "sr" [1], "h" [2,1,128], "c" [2,1,128]
-//!   Outputs: "output" (confidence f32), "hn" [2,1,128], "cn" [2,1,128]
+//!   Inputs:  "input" [1, num_samples], "sr" [1], "h" [2,1,64], "c" [2,1,64]
+//!   Outputs: "output" (confidence f32), "hn" [2,1,64], "cn" [2,1,64]
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ort::session::{Session, builder::SessionBuilder};
 use ort::value::Value;
+
+use super::analyzer::VadAnalyzer;
 
 /// How often to reset model internal state (seconds).
 const MODEL_RESET_SECS: f64 = 5.0;
@@ -27,11 +29,7 @@ pub const DEFAULT_MODEL_PATH: &str = "silero_vad.onnx";
 
 struct SileroVadInner {
     session:     Session,
-    /// LSTM hidden state — shape [2, 1, 64] = 128 f32 elements.
-    /// Model input name: "h", output name: "hn".
     h:           Vec<f32>,
-    /// LSTM cell state — shape [2, 1, 64] = 128 f32 elements.
-    /// Model input name: "c", output name: "cn".
     c:           Vec<f32>,
     num_samples: usize,
     sample_rate: i64,
@@ -40,7 +38,6 @@ struct SileroVadInner {
 
 impl SileroVadInner {
     fn build(sample_rate: u32, model_path: &str) -> Result<Self, String> {
-        // Silero ONNX expects exactly 512 samples at 16kHz, 256 at 8kHz.
         let num_samples: usize = if sample_rate == 16000 { 512 } else { 256 };
 
         let session = SessionBuilder::new()
@@ -64,26 +61,20 @@ impl SileroVadInner {
     }
 
     pub fn infer(&mut self, audio_bytes: &[u8]) -> Result<f32, String> {
-        // i16 LE PCM → f32 normalised — shape [1, num_samples]
         let audio_f32: Vec<f32> = audio_bytes
             .chunks_exact(2)
             .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
             .collect();
 
-        // Build ORT input values using tuple (shape, data) API.
         let audio_val = Value::from_array(([1usize, self.num_samples], audio_f32))
             .map_err(|e| format!("Input tensor error: {}", e))?;
-
         let sr_val = Value::from_array(([1usize], vec![self.sample_rate]))
             .map_err(|e| format!("SR tensor error: {}", e))?;
-
         let h_val = Value::from_array(([2usize, 1usize, 64usize], self.h.clone()))
             .map_err(|e| format!("h tensor error: {}", e))?;
-
         let c_val = Value::from_array(([2usize, 1usize, 64usize], self.c.clone()))
             .map_err(|e| format!("c tensor error: {}", e))?;
 
-        // Named inputs — exact names verified via model introspection.
         let outputs = self.session
             .run(ort::inputs![
                 "input" => audio_val,
@@ -93,7 +84,6 @@ impl SileroVadInner {
             ])
             .map_err(|e| format!("Inference error: {}", e))?;
 
-        // "output" — confidence scalar
         let confidence = {
             outputs["output"]
                 .try_extract_array::<f32>()
@@ -104,34 +94,25 @@ impl SileroVadInner {
                 .unwrap_or(0.0)
         };
 
-        // "hn" — updated hidden state
-        let new_h: Vec<f32> = {
-            outputs["hn"]
-                .try_extract_array::<f32>()
-                .map_err(|e| format!("hn extract error: {}", e))?
-                .iter()
-                .copied()
-                .collect()
-        };
+        let new_h: Vec<f32> = outputs["hn"]
+            .try_extract_array::<f32>()
+            .map_err(|e| format!("hn extract error: {}", e))?
+            .iter()
+            .copied()
+            .collect();
 
-        // "cn" — updated cell state
-        let new_c: Vec<f32> = {
-            outputs["cn"]
-                .try_extract_array::<f32>()
-                .map_err(|e| format!("cn extract error: {}", e))?
-                .iter()
-                .copied()
-                .collect()
-        };
+        let new_c: Vec<f32> = outputs["cn"]
+            .try_extract_array::<f32>()
+            .map_err(|e| format!("cn extract error: {}", e))?
+            .iter()
+            .copied()
+            .collect();
 
-        // Drop outputs — releases borrow on self.session.
         drop(outputs);
 
-        // Persist LSTM states for temporal continuity across calls.
         self.h.copy_from_slice(&new_h);
         self.c.copy_from_slice(&new_c);
 
-        // Periodic state reset — mirrors Python's MODEL_RESET_SECS logic.
         if self.last_reset.elapsed().as_secs_f64() >= MODEL_RESET_SECS {
             self.reset_states();
             self.last_reset = Instant::now();
@@ -169,8 +150,6 @@ impl SileroVad {
     }
 
     /// Run inference asynchronously on a blocking thread.
-    ///
-    /// `audio_bytes` must be exactly `num_samples * 2` bytes of i16 LE PCM.
     pub async fn infer_async(&self, audio_bytes: Vec<u8>) -> Result<f32, String> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
@@ -179,5 +158,20 @@ impl SileroVad {
         })
         .await
         .map_err(|e| format!("spawn_blocking error: {}", e))?
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VadAnalyzer impl
+// ---------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl VadAnalyzer for SileroVad {
+    fn num_frames_required(&self) -> usize {
+        self.inner.lock().unwrap().num_samples
+    }
+
+    async fn voice_confidence(&self, audio: Vec<u8>) -> f32 {
+        self.infer_async(audio).await.unwrap_or(0.0)
     }
 }
