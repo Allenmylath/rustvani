@@ -45,6 +45,7 @@ pub enum FrameKind {
     End,
     // Data
     Data,
+    Transcription,
     // Data — audio output (ordered, cancellable)
     OutputAudioRaw,
 }
@@ -114,6 +115,24 @@ pub struct ErrorFrameData {
 pub struct DataFrameData {
     pub content:  Vec<u8>,
     pub metadata: HashMap<String, String>,
+}
+
+
+#[derive(Debug, Clone)]
+pub struct TranscriptionData {
+    pub text:      String,
+    pub user_id:   String,
+    pub timestamp: String,
+    pub language:  Option<String>,
+    pub finalized: bool,
+}
+
+impl TranscriptionData {
+    pub fn new(text: impl Into<String>, user_id: impl Into<String>, timestamp: impl Into<String>) -> Self {
+        Self { text: text.into(), user_id: user_id.into(), timestamp: timestamp.into(), language: None, finalized: false }
+    }
+    pub fn with_language(mut self, lang: impl Into<String>) -> Self { self.language = Some(lang.into()); self }
+    pub fn finalized(mut self) -> Self { self.finalized = true; self }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +208,7 @@ pub enum DataFrame {
     /// DataFrame so it participates in the ordered queue and is cancelled
     /// cleanly on interruption (bot stops speaking when user interrupts).
     OutputAudioRaw(AudioRawData),
+    Transcription(TranscriptionData),
 }
 
 /// Discriminant over System / Control / Data.
@@ -253,6 +273,7 @@ impl Frame {
             FrameInner::Data(d) => match d {
                 DataFrame::Data(_)         => "DataFrame",
                 DataFrame::OutputAudioRaw(_) => "OutputAudioRawFrame",
+                DataFrame::Transcription(_)  => "TranscriptionFrame",
             },
         }
     }
@@ -290,6 +311,7 @@ impl Frame {
             FrameInner::Data(d) => match d {
                 DataFrame::Data(_)           => FrameKind::Data,
                 DataFrame::OutputAudioRaw(_) => FrameKind::OutputAudioRaw,
+                DataFrame::Transcription(_)  => FrameKind::Transcription,
             },
         }
     }
@@ -515,6 +537,10 @@ impl Frame {
     }
 
     // ---- Generic data ----
+
+    pub fn transcription(data: TranscriptionData) -> Self {
+        Self::make(FrameInner::Data(DataFrame::Transcription(data)))
+    }
 
     pub fn data(content: Vec<u8>) -> Self {
         Self::make(FrameInner::Data(DataFrame::Data(DataFrameData {
