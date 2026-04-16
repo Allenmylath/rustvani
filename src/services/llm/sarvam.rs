@@ -38,15 +38,20 @@ pub struct SarvamLLMConfig {
     pub model: String,
     pub base_url: String,
     pub temperature: Option<f32>,
+    /// Controls CoT thinking mode. Any value ("low"/"medium"/"high") enables
+    /// thinking. Set to None to use non-think mode (fast, no <think> block).
+    /// Recommended: None for voice pipelines.
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for SarvamLLMConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
-            model: "sarvam-m".to_string(),
+            model: "sarvam-30b".to_string(),
             base_url: "https://api.sarvam.ai/v1".to_string(),
-            temperature: None,
+            temperature: Some(0.2),   // recommended for non-think mode
+            reasoning_effort: None,   // None = non-think mode
         }
     }
 }
@@ -62,6 +67,9 @@ struct ChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// Omit entirely for non-think mode. Any value enables CoT thinking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -114,10 +122,11 @@ impl SarvamLLMHandler {
         let url = format!("{}/chat/completions", self.config.base_url);
 
         log::info!(
-            "SarvamLLM: {} messages → {} (model={})",
+            "SarvamLLM: {} messages → {} (model={}, reasoning_effort={:?})",
             messages.len(),
             url,
-            self.config.model
+            self.config.model,
+            self.config.reasoning_effort,
         );
 
         let body = ChatRequest {
@@ -125,6 +134,7 @@ impl SarvamLLMHandler {
             messages,
             stream: true,
             temperature: self.config.temperature,
+            reasoning_effort: self.config.reasoning_effort.clone(),
         };
 
         let response = self
