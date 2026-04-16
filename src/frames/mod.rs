@@ -10,6 +10,7 @@ pub use processor::{
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex}; // added for LLMContextFrame
 
 // ---------------------------------------------------------------------------
 // Frame ID counter
@@ -41,11 +42,16 @@ pub enum FrameKind {
     PauseProcessor, PauseProcessorUrgent,
     ResumeProcessor, ResumeProcessorUrgent,
     Heartbeat,
+    // System — LLM response boundaries
+    LLMFullResponseStart,
+    LLMFullResponseEnd,
     // Control
     End,
     // Data
     Data,
     Transcription,
+    LLMText,
+    LLMContextFrame,
     // Data — audio output (ordered, cancellable)
     OutputAudioRaw,
 }
@@ -192,6 +198,12 @@ pub enum SystemFrame {
 
     // ---- Pipeline health probe ----
     Heartbeat(f64),
+
+    // ---- LLM response boundaries ----
+    /// Emitted by the LLM service before the first token arrives.
+    LLMFullResponseStart,
+    /// Emitted by the LLM service after [DONE] or on error — always fires.
+    LLMFullResponseEnd,
 }
 
 /// Ordered frames that survive interruption drains.
@@ -209,6 +221,11 @@ pub enum DataFrame {
     /// cleanly on interruption (bot stops speaking when user interrupts).
     OutputAudioRaw(AudioRawData),
     Transcription(TranscriptionData),
+    /// Individual text chunk from the LLM — forwarded to TTS as it arrives.
+    LLMText(String),
+    /// Carries shared conversation context — triggers LLM inference.
+    /// Cancelled on interruption so a stale context does not re-run the LLM.
+    LLMContextFrame(Arc<Mutex<crate::context::LLMContext>>),
 }
 
 /// Discriminant over System / Control / Data.
@@ -266,14 +283,18 @@ impl Frame {
                 SystemFrame::ResumeProcessor { .. }        => "ResumeProcessorFrame",
                 SystemFrame::ResumeProcessorUrgent { .. }  => "ResumeProcessorUrgentFrame",
                 SystemFrame::Heartbeat(_)                  => "HeartbeatFrame",
+                SystemFrame::LLMFullResponseStart          => "LLMFullResponseStartFrame",
+                SystemFrame::LLMFullResponseEnd            => "LLMFullResponseEndFrame",
             },
             FrameInner::Control(c) => match c {
                 ControlFrame::End { .. } => "EndFrame",
             },
             FrameInner::Data(d) => match d {
-                DataFrame::Data(_)         => "DataFrame",
-                DataFrame::OutputAudioRaw(_) => "OutputAudioRawFrame",
-                DataFrame::Transcription(_)  => "TranscriptionFrame",
+                DataFrame::Data(_)             => "DataFrame",
+                DataFrame::OutputAudioRaw(_)   => "OutputAudioRawFrame",
+                DataFrame::Transcription(_)    => "TranscriptionFrame",
+                DataFrame::LLMText(_)          => "LLMTextFrame",
+                DataFrame::LLMContextFrame(_)  => "LLMContextFrame",
             },
         }
     }
@@ -304,14 +325,18 @@ impl Frame {
                 SystemFrame::ResumeProcessor { .. }        => FrameKind::ResumeProcessor,
                 SystemFrame::ResumeProcessorUrgent { .. }  => FrameKind::ResumeProcessorUrgent,
                 SystemFrame::Heartbeat(_)                  => FrameKind::Heartbeat,
+                SystemFrame::LLMFullResponseStart          => FrameKind::LLMFullResponseStart,
+                SystemFrame::LLMFullResponseEnd            => FrameKind::LLMFullResponseEnd,
             },
             FrameInner::Control(c) => match c {
                 ControlFrame::End { .. } => FrameKind::End,
             },
             FrameInner::Data(d) => match d {
-                DataFrame::Data(_)           => FrameKind::Data,
-                DataFrame::OutputAudioRaw(_) => FrameKind::OutputAudioRaw,
-                DataFrame::Transcription(_)  => FrameKind::Transcription,
+                DataFrame::Data(_)             => FrameKind::Data,
+                DataFrame::OutputAudioRaw(_)   => FrameKind::OutputAudioRaw,
+                DataFrame::Transcription(_)    => FrameKind::Transcription,
+                DataFrame::LLMText(_)          => FrameKind::LLMText,
+                DataFrame::LLMContextFrame(_)  => FrameKind::LLMContextFrame,
             },
         }
     }
@@ -547,5 +572,27 @@ impl Frame {
             content,
             ..Default::default()
         })))
+    }
+
+    // ---- LLM ----
+
+    /// Signal start of LLM streaming response.
+    pub fn llm_full_response_start() -> Self {
+        Self::make(FrameInner::System(SystemFrame::LLMFullResponseStart))
+    }
+
+    /// Signal end of LLM streaming response — always emitted, even on error.
+    pub fn llm_full_response_end() -> Self {
+        Self::make(FrameInner::System(SystemFrame::LLMFullResponseEnd))
+    }
+
+    /// One SSE content chunk from the LLM.
+    pub fn llm_text(text: String) -> Self {
+        Self::make(FrameInner::Data(DataFrame::LLMText(text)))
+    }
+
+    /// Triggers LLM inference with the current conversation context.
+    pub fn llm_context(context: Arc<Mutex<crate::context::LLMContext>>) -> Self {
+        Self::make(FrameInner::Data(DataFrame::LLMContextFrame(context)))
     }
 }
