@@ -1,1 +1,1 @@
-![Hero](assets/hero.png)
+![Hero](assets/Gemini_Generated_Image_3ppqyo3ppqyo3ppq.png)
