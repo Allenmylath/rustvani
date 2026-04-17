@@ -4,34 +4,29 @@
 //! each installed on its own `FrameProcessor`. Concrete transports (WebRTC,
 //! WebSocket, etc.) embed this and expose `input()` / `output()` to the pipeline.
 //!
-//! # Usage
-//!
-//! ```text
-//! let transport = BaseTransport::new("WebRtc", params);
-//!
-//! // Wire into a pipeline.
-//! let pipeline = Pipeline::new(vec![
-//!     transport.input(),
-//!     stt,
-//!     llm,
-//!     tts,
-//!     transport.output(),
-//! ]);
-//!
-//! // Push audio from the network thread.
-//! transport.push_audio_frame(audio_data).await;
-//! ```
+//! The output transport can be wired to a concrete sink via `set_audio_out_tx()`.
+//! `WebSocketTransport` calls this after construction to connect `OutputAudioRaw`
+//! bytes to its socket loop.
 
-use crate::frames::{FrameProcessor, FrameHandler};
-use super::params::TransportParams;
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+
+use crate::frames::{FrameDirection, FrameHandler, FrameProcessor};
 use super::input::BaseInputTransport;
 use super::output::BaseOutputTransport;
+use super::params::TransportParams;
 
-/// Wraps a paired input + output transport as two `FrameProcessor`s.
+// ---------------------------------------------------------------------------
+// BaseTransport
+// ---------------------------------------------------------------------------
+
 pub struct BaseTransport {
-    input_processor:  FrameProcessor,
-    output_processor: FrameProcessor,
-    input_transport:  std::sync::Arc<BaseInputTransport>,
+    input_processor:   FrameProcessor,
+    output_processor:  FrameProcessor,
+    input_transport:   Arc<BaseInputTransport>,
+    /// Kept so callers can reach `set_audio_out_tx` after construction.
+    output_transport:  Arc<BaseOutputTransport>,
 }
 
 impl BaseTransport {
@@ -40,24 +35,18 @@ impl BaseTransport {
     /// The name is used as a prefix for the internal processor names
     /// (e.g. `"WebRtcInput"`, `"WebRtcOutput"`).
     pub fn new(name: &str, params: TransportParams) -> Self {
-        let input_transport = std::sync::Arc::new(
-            BaseInputTransport::new(params.clone())
-        );
-
-        // We need a FrameHandler that delegates to our Arc<BaseInputTransport>.
-        // We wrap it in a thin newtype so we can pass Box<dyn FrameHandler>.
-        let input_handler = InputHandlerWrapper(input_transport.clone());
-        let output_handler = BaseOutputTransport::new(params);
+        let input_transport  = Arc::new(BaseInputTransport::new(params.clone()));
+        let output_transport = Arc::new(BaseOutputTransport::new(params));
 
         let input_processor = FrameProcessor::new(
             format!("{}Input", name),
-            Box::new(input_handler),
+            Box::new(InputHandlerWrapper(input_transport.clone())),
             false,
         );
 
         let output_processor = FrameProcessor::new(
             format!("{}Output", name),
-            Box::new(output_handler),
+            Box::new(OutputHandlerWrapper(output_transport.clone())),
             false,
         );
 
@@ -65,6 +54,7 @@ impl BaseTransport {
             input_processor,
             output_processor,
             input_transport,
+            output_transport,
         }
     }
 
@@ -78,6 +68,14 @@ impl BaseTransport {
         self.output_processor.clone()
     }
 
+    /// Wire up audio output to a channel.
+    ///
+    /// The concrete transport calls this after creating the channel so that
+    /// `OutputAudioRaw` bytes are forwarded to the socket loop.
+    pub fn set_audio_out_tx(&self, tx: mpsc::Sender<Vec<u8>>) {
+        self.output_transport.set_audio_out_tx(tx);
+    }
+
     /// Push a raw audio chunk into the input transport's audio queue.
     ///
     /// Call this from your network/device callback.
@@ -88,18 +86,17 @@ impl BaseTransport {
         self.input_transport.push_audio_frame(data).await
     }
 
-    /// Clone the audio sender for transports that need to own it
-    /// (e.g. move into a network callback closure).
+    /// Clone the audio sender for transports that need to own it.
     pub fn audio_sender(&self) -> tokio::sync::mpsc::Sender<crate::frames::AudioRawData> {
         self.input_transport.audio_sender()
     }
 }
 
 // ---------------------------------------------------------------------------
-// Thin wrapper so Arc<BaseInputTransport> satisfies Box<dyn FrameHandler>
+// Thin wrappers: Arc<Transport> → Box<dyn FrameHandler>
 // ---------------------------------------------------------------------------
 
-struct InputHandlerWrapper(std::sync::Arc<BaseInputTransport>);
+struct InputHandlerWrapper(Arc<BaseInputTransport>);
 
 #[async_trait::async_trait]
 impl FrameHandler for InputHandlerWrapper {
@@ -108,6 +105,20 @@ impl FrameHandler for InputHandlerWrapper {
         processor: &FrameProcessor,
         frame: crate::frames::Frame,
         direction: crate::frames::FrameDirection,
+    ) -> crate::error::Result<()> {
+        self.0.on_process_frame(processor, frame, direction).await
+    }
+}
+
+struct OutputHandlerWrapper(Arc<BaseOutputTransport>);
+
+#[async_trait::async_trait]
+impl FrameHandler for OutputHandlerWrapper {
+    async fn on_process_frame(
+        &self,
+        processor: &FrameProcessor,
+        frame: crate::frames::Frame,
+        direction: FrameDirection,
     ) -> crate::error::Result<()> {
         self.0.on_process_frame(processor, frame, direction).await
     }

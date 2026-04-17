@@ -1,24 +1,20 @@
 //! Base output transport.
 //!
-//! `BaseOutputTransport` is a [`FrameHandler`] that handles the common output
-//! logic shared by all concrete transports:
+//! `BaseOutputTransport` handles the common output logic:
+//!   - Emitting `BotStartedSpeaking` / `BotStoppedSpeaking` signals.
+//!   - Forwarding `OutputAudioRaw` bytes to the concrete transport via an
+//!     optional `mpsc::Sender<Vec<u8>>`.
 //!
-//! - Emitting `BotStartedSpeaking` / `BotStoppedSpeaking` signals when audio
-//!   starts and stops flowing.
-//! - Draining queued `OutputAudioRaw` frames on interruption.
-//!
-//! # Status
-//!
-//! This is a **stub** — the full audio-out queue, mixing, and silence-padding
-//! logic will be added once `pipecat-audio` output processing is wired in.
-//! The structure is intentionally minimal so concrete transports can depend
-//! on it today.
+//! The concrete transport (e.g. `WebSocketTransport`) creates the channel,
+//! calls `set_audio_out_tx()` on construction, and owns the receiver end in
+//! its socket loop — which writes the bytes onto the wire.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use log;
+use tokio::sync::mpsc;
 
 use crate::error::Result;
 use crate::frames::{
@@ -28,7 +24,7 @@ use crate::frames::{
 use super::params::TransportParams;
 
 // ---------------------------------------------------------------------------
-// BaseOutputTransport
+// State
 // ---------------------------------------------------------------------------
 
 struct OutputTransportState {
@@ -37,9 +33,17 @@ struct OutputTransportState {
 
     /// True while `OutputAudioRaw` frames are being sent.
     bot_speaking: AtomicBool,
+
+    /// Set by the concrete transport after construction.
+    /// When `Some`, raw PCM bytes from `OutputAudioRaw` frames are forwarded
+    /// here so the socket loop can write them to the wire.
+    audio_out_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
 }
 
-/// Base output transport — shared logic for all concrete output transports.
+// ---------------------------------------------------------------------------
+// BaseOutputTransport
+// ---------------------------------------------------------------------------
+
 pub struct BaseOutputTransport {
     state: Arc<OutputTransportState>,
 }
@@ -50,8 +54,17 @@ impl BaseOutputTransport {
             state: Arc::new(OutputTransportState {
                 params,
                 bot_speaking: AtomicBool::new(false),
+                audio_out_tx: Mutex::new(None),
             }),
         }
+    }
+
+    /// Wire up the audio output channel.
+    ///
+    /// Called once by the concrete transport (e.g. `WebSocketTransport::new`)
+    /// before the pipeline starts. The receiver end lives in `run_socket`.
+    pub fn set_audio_out_tx(&self, tx: mpsc::Sender<Vec<u8>>) {
+        *self.state.audio_out_tx.lock().unwrap() = Some(tx);
     }
 
     pub fn is_bot_speaking(&self) -> bool {
@@ -73,42 +86,31 @@ impl FrameHandler for BaseOutputTransport {
     ) -> Result<()> {
         match &frame.inner {
             // ---- Audio output ----
-            //
-            // When the first OutputAudioRaw arrives, emit BotStartedSpeaking.
-            // When no more audio is queued, emit BotStoppedSpeaking.
-            //
-            // TODO: this is a placeholder. The real implementation will:
-            //   1. Feed audio into a resampler / mixer.
-            //   2. Chunk into transport-appropriate sizes.
-            //   3. Call the concrete transport's send_audio() method.
-            //   4. Emit BotStartedSpeaking / BotStoppedSpeaking at the right moments.
-            FrameInner::Data(DataFrame::OutputAudioRaw(_)) => {
+            FrameInner::Data(DataFrame::OutputAudioRaw(audio)) => {
+                // Emit BotStartedSpeaking on the first audio frame of a turn.
                 if !self.state.bot_speaking.swap(true, Ordering::Relaxed) {
-                    // Transition: was silent → now speaking.
                     log::debug!("BaseOutputTransport: bot started speaking");
-                    let started = Frame::bot_started_speaking();
-                    processor
-                        .broadcast_frame(started)
-                        .await?;
+                    processor.broadcast_frame(Frame::bot_started_speaking()).await?;
                 }
 
-                // Pass the audio frame through to the concrete transport.
+                // Forward bytes to the concrete transport's socket loop.
+                // `try_send` — if the channel is full we drop the chunk rather
+                // than blocking the pipeline (real-time audio: drop > delay).
+                let tx = self.state.audio_out_tx.lock().unwrap().clone();
+                if let Some(tx) = tx {
+                    if tx.try_send(audio.audio.clone()).is_err() {
+                        log::warn!("BaseOutputTransport: audio_out channel full — dropping chunk");
+                    }
+                }
+
                 processor.push_frame(frame, direction).await?;
             }
 
-            // ---- Interruption: drain queued audio ----
-            //
-            // When an interruption arrives, any OutputAudioRaw frames still
-            // queued should not be sent. The pipeline's interruption mechanism
-            // already drains the process queue, so we just need to emit
-            // BotStoppedSpeaking if we were speaking.
+            // ---- Interruption: bot stops speaking ----
             FrameInner::System(SystemFrame::Interruption) => {
                 if self.state.bot_speaking.swap(false, Ordering::Relaxed) {
                     log::debug!("BaseOutputTransport: bot stopped speaking (interruption)");
-                    let stopped = Frame::bot_stopped_speaking();
-                    // Broadcast so both upstream (BaseInputTransport) and
-                    // downstream (concrete transport) see the signal.
-                    processor.broadcast_frame(stopped).await?;
+                    processor.broadcast_frame(Frame::bot_stopped_speaking()).await?;
                 }
                 processor.push_frame(frame, direction).await?;
             }
@@ -117,9 +119,8 @@ impl FrameHandler for BaseOutputTransport {
             FrameInner::Control(_) | FrameInner::System(SystemFrame::Cancel { .. }) => {
                 if self.state.bot_speaking.swap(false, Ordering::Relaxed) {
                     log::debug!("BaseOutputTransport: bot stopped speaking (end/cancel)");
-                    let stopped = Frame::bot_stopped_speaking();
                     processor
-                        .push_frame(stopped, FrameDirection::Upstream)
+                        .push_frame(Frame::bot_stopped_speaking(), FrameDirection::Upstream)
                         .await?;
                 }
                 processor.push_frame(frame, direction).await?;

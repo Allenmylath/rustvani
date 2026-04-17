@@ -1,23 +1,30 @@
-//! rustvani WebSocket server with Sarvam STT.
+//! rustvani WebSocket voice agent server.
 //!
 //! Listens on ws://0.0.0.0:8080/ws
+//!
 //! Each connection gets a fully isolated pipeline:
-//!   WebSocketTransport.input() → SarvamSttHandler → PrintProcessor → WebSocketTransport.output()
+//!   WebSocketTransport.input()
+//!     → SarvamStt
+//!     → LLMUserAggregator
+//!     → SarvamLLM
+//!     → LLMAssistantAggregator
+//!     → SarvamTts
+//!     → WebSocketTransport.output()
 //!
-//! VAD runs inside the transport's audio task.
-//! SarvamStt opens its own WebSocket to Sarvam per connection.
-//! PrintProcessor logs VAD frames and TranscriptionFrames to stdout.
+//! Wire protocol:
+//!   Client → Server : Binary WebSocket — raw i16 LE PCM, 16 kHz mono, 512-sample chunks
+//!   Server → Client : Binary WebSocket — raw i16 LE PCM at TTS sample rate (22050 Hz bulbul:v2)
 //!
-//! Wire protocol (client → server):
-//!   Binary WebSocket messages — raw i16 LE PCM, 16kHz mono, 512-sample chunks
+//! Environment variables:
+//!   SARVAM_API_KEY   — required
+//!   SYSTEM_PROMPT    — optional, defaults to a general assistant prompt
+//!   RUST_LOG         — log level, e.g. "info" or "rustvani=debug,info"
 //!
 //! Run:
 //!   SARVAM_API_KEY=your-key cargo run --release --bin websocket_server
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use axum::{
     Router,
     extract::{State, WebSocketUpgrade, ws::WebSocket},
@@ -27,11 +34,18 @@ use axum::{
 use tower_http::cors::CorsLayer;
 
 use rustvani::{
-    system_clock, DataFrame, Frame, FrameDirection, FrameHandler, FrameInner,
-    FrameKind, FrameProcessor, PipelineParams, PipelineTask, Result, SileroVad,
-    VadParams,
+    shared_context, system_clock, SileroVad, VadParams,
+    PipelineParams, PipelineTask,
 };
-use rustvani::services::{SarvamSttConfig, SarvamSttHandler};
+use rustvani::processors::{
+    llm_assistant_aggregator::LLMAssistantAggregator,
+    llm_user_aggregator::LLMUserAggregator,
+};
+use rustvani::services::{
+    SarvamLLMConfig, SarvamLLMHandler,
+    SarvamSttConfig, SarvamSttHandler,
+    SarvamTtsConfig, SarvamTtsHandler,
+};
 use rustvani::transport::websocket::{WebSocketParams, WebSocketTransport};
 use rustvani::transport::TransportParams;
 
@@ -52,49 +66,7 @@ fn next_conn_id() -> u64 {
 #[derive(Clone)]
 struct AppState {
     sarvam_api_key: String,
-}
-
-// ---------------------------------------------------------------------------
-// PrintHandler — logs VAD frames and TranscriptionFrames with connection ID
-// ---------------------------------------------------------------------------
-
-struct PrintHandler {
-    conn_id: u64,
-}
-
-#[async_trait]
-impl FrameHandler for PrintHandler {
-    async fn on_process_frame(
-        &self,
-        processor: &FrameProcessor,
-        frame: Frame,
-        direction: FrameDirection,
-    ) -> Result<()> {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-
-        match frame.kind() {
-            FrameKind::VADUserStartedSpeaking => {
-                println!("[conn={}] [{:.3}] VADUserStartedSpeaking", self.conn_id, ts);
-            }
-            FrameKind::VADUserStoppedSpeaking => {
-                println!("[conn={}] [{:.3}] VADUserStoppedSpeaking", self.conn_id, ts);
-            }
-            FrameKind::Transcription => {
-                if let FrameInner::Data(DataFrame::Transcription(ref t)) = frame.inner {
-                    println!(
-                        "[conn={}] [{:.3}] Transcript  text=\"{}\"  lang={:?}  finalized={}",
-                        self.conn_id, ts, t.text, t.language, t.finalized
-                    );
-                }
-            }
-            _ => {}
-        }
-
-        processor.push_frame(frame, direction).await
-    }
+    system_prompt:  String,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,17 +82,18 @@ async fn ws_handler(
 
 async fn handle_connection(socket: WebSocket, app_state: AppState) {
     let conn_id = next_conn_id();
-    println!("[conn={}] connected", conn_id);
+    log::info!("[conn={}] connected", conn_id);
 
-    // Fresh VAD per connection — isolated LSTM state.
+    // ---- VAD ----
     let vad_analyzer = match SileroVad::new(16_000) {
         Ok(v) => Arc::new(v),
         Err(e) => {
-            println!("[conn={}] VAD init failed: {}", conn_id, e);
+            log::error!("[conn={}] VAD init failed: {}", conn_id, e);
             return;
         }
     };
 
+    // ---- Transport ----
     let transport = WebSocketTransport::new(
         &format!("WsTransport-{}", conn_id),
         WebSocketParams {
@@ -137,7 +110,11 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         },
     );
 
-    // Sarvam STT — one WebSocket connection to Sarvam per client connection.
+    // ---- Shared conversation context ----
+    let context = shared_context(Some(app_state.system_prompt.clone()));
+
+    // ---- Pipeline processors ----
+
     let stt = SarvamSttHandler::new(SarvamSttConfig {
         api_key:  app_state.sarvam_api_key.clone(),
         model:    "saaras:v3".to_string(),
@@ -147,25 +124,55 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     })
     .into_processor();
 
-    let printer = FrameProcessor::new(
-        format!("Printer-{}", conn_id),
-        Box::new(PrintHandler { conn_id }),
-        false,
-    );
+    let user_agg = LLMUserAggregator::new(context.clone());
 
+    let llm = SarvamLLMHandler::new(SarvamLLMConfig {
+        api_key: app_state.sarvam_api_key.clone(),
+        model:   "sarvam-30b".to_string(),
+        ..SarvamLLMConfig::default()
+    })
+    .into_processor();
+
+    let assistant_agg = LLMAssistantAggregator::new(context.clone());
+
+    let tts = match SarvamTtsHandler::new(SarvamTtsConfig {
+        api_key:  app_state.sarvam_api_key.clone(),
+        model:    "bulbul:v2".to_string(),
+        voice:    "anushka".to_string(),
+        language: "en-IN".to_string(),
+        ..SarvamTtsConfig::default()
+    }) {
+        Ok(t) => t.into_processor(),
+        Err(e) => {
+            log::error!("[conn={}] TTS init failed: {}", conn_id, e);
+            return;
+        }
+    };
+
+    // ---- Pipeline ----
     let task = PipelineTask::new(
-        vec![transport.input(), stt, printer, transport.output()],
+        vec![
+            transport.input(),
+            stt,
+            user_agg,
+            llm,
+            assistant_agg,
+            tts,
+            transport.output(),
+        ],
         PipelineParams::default(),
     );
 
     let push_tx = task.push_sender();
 
+    // Run pipeline and socket loop concurrently.
+    // Either side terminating (socket close or EndFrame) shuts both down.
     tokio::join!(
         async { task.run(system_clock(), None).await.ok(); },
         transport.run_socket(socket, push_tx),
     );
 
-    println!("[conn={}] disconnected", conn_id);
+    log::info!("[conn={}] disconnected", conn_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +189,14 @@ async fn main() {
     let sarvam_api_key = std::env::var("SARVAM_API_KEY")
         .expect("SARVAM_API_KEY env var not set");
 
-    let app_state = AppState { sarvam_api_key };
+    let system_prompt = std::env::var("SYSTEM_PROMPT").unwrap_or_else(|_| {
+        "You are a helpful voice assistant. \
+         Keep your answers concise and conversational — \
+         one or two sentences unless the user asks for more detail."
+            .to_string()
+    });
+
+    let app_state = AppState { sarvam_api_key, system_prompt };
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
@@ -190,8 +204,8 @@ async fn main() {
         .with_state(app_state);
 
     let addr = "0.0.0.0:8080";
-    println!("rustvani WebSocket server listening on ws://{}/ws", addr);
-    println!("Pipeline: audio → VAD → Sarvam STT → print");
+    log::info!("rustvani voice agent listening on ws://{}/ws", addr);
+    log::info!("Pipeline: audio → VAD → STT → LLM → TTS → audio");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
