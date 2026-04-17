@@ -8,6 +8,7 @@ pub mod observer;
 pub mod pipeline;
 pub mod processors;
 pub mod transport;
+pub mod utils;          // ← ADD THIS
 pub mod vad;
 
 pub use clock::{BaseClock, SystemClock, system_clock};
@@ -21,6 +22,10 @@ pub use frames::{
 pub use pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask};
 pub use processors::llm_user_aggregator::LLMUserAggregator;
 pub use processors::llm_assistant_aggregator::LLMAssistantAggregator;
-pub use services::{SarvamLLMConfig, SarvamLLMHandler, SarvamSttConfig, SarvamSttHandler};
+pub use services::{
+    SarvamLLMConfig, SarvamLLMHandler,
+    SarvamSttConfig, SarvamSttHandler,
+    SarvamTtsConfig, SarvamTtsHandler,   // ← ADD THIS LINE
+};
 pub use transport::{BaseInputTransport, BaseOutputTransport, BaseTransport, TransportParams};
 pub use vad::{SileroVad, VadAnalyzer, VadParams, VadState};

@@ -3,27 +3,79 @@ name = "rustvani"
 version = "0.1.0"
 edition = "2021"
 
+# ---------------------------------------------------------------------------
+# Binaries
+# ---------------------------------------------------------------------------
+
 [[bin]]
 name = "vad_test"
 path = "src/bin/vad_test.rs"
 
+[[bin]]
+name = "pipeline_test"
+path = "src/bin/pipeline_test.rs"
+
+[[bin]]
+name = "sarvam_ws_test"
+path = "src/bin/sarvam_ws_test.rs"
+
+[[bin]]
+name = "sarvam_test"
+path = "src/bin/sarvam_test.rs"
+
+[[bin]]
+name = "sarvam_pipeline_test"
+path = "src/bin/sarvam_pipeline_test.rs"
+
+[[bin]]
+name = "llm_only_test"
+path = "src/bin/llm_only_test.rs"
+
+[[bin]]
+name = "websocket_server"
+path = "src/bin/websocket_server.rs"
+
+[[bin]]
+name = "sarvam_tts_test"
+path = "src/bin/sarvam_tts_test.rs"
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
 [dependencies]
-tokio           = { version = "1", features = ["full"] }
+tokio           = { version = "1",        features = ["full"] }
 async-trait     = "0.1"
+async-recursion = "1"
 thiserror       = "1"
 futures         = "0.3"
 log             = "0.4"
 env_logger      = "0.11"
+
+# ONNX Runtime — for Silero VAD
 ort             = { version = "2.0.0-rc.12", features = ["download-binaries"] }
-async-recursion = "1"
+
+# Audio
 hound           = "3"
-axum = { version = "0.7", features = ["ws"] }
-tower-http = { version = "0.5", features = ["cors"] }
+
+# HTTP server (websocket_server binary)
+axum            = { version = "0.7", features = ["ws"] }
+tower-http      = { version = "0.5", features = ["cors"] }
+
+# WebSocket client (STT + TTS services)
 tokio-tungstenite = { version = "0.29.0", features = ["native-tls"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-base64 = "0.22.1"
-reqwest = { version = "0.12", features = ["json", "stream", "native-tls"] }
+
+# Serialisation
+serde           = { version = "1.0.228", features = ["derive"] }
+serde_json      = "1.0.149"
+base64          = "0.22.1"
+
+# HTTP client (LLM service)
+reqwest         = { version = "0.12", features = ["json", "stream", "native-tls"] }
+
+# ---------------------------------------------------------------------------
+# Dev dependencies
+# ---------------------------------------------------------------------------
 
 [dev-dependencies]
 tokio      = { version = "1", features = ["full", "test-util"] }
