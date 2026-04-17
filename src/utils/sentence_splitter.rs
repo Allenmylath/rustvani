@@ -572,9 +572,10 @@ mod tests {
 
     #[test]
     fn test_boundary_before_danda() {
+        // "नमस्ते।" = 18 bytes (6 Devanagari chars × 3 bytes) + 3 bytes for । = 21 bytes
+        // max_len must be >= 21 to include the first danda
         let text = "नमस्ते। अगला।";
-        // max_len covers only the first danda
-        let pos = find_sentence_boundary_before(text, 12).unwrap();
+        let pos = find_sentence_boundary_before(text, 25).unwrap();
         assert!(text[..pos].ends_with('।'));
     }
 }
