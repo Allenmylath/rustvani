@@ -1,6 +1,6 @@
 //! VAD configuration parameters.
 
-pub const VAD_CONFIDENCE: f32 = 0.1;
+pub const VAD_CONFIDENCE: f32 = 0.7;
 pub const VAD_START_SECS: f32 = 0.4;
 pub const VAD_STOP_SECS:  f32 = 0.4;
 pub const VAD_MIN_VOLUME: f32 = 0.3;

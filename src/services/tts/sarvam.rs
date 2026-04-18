@@ -3,30 +3,13 @@
 //! Connects to Sarvam's WebSocket streaming TTS API and pushes OutputAudioRaw
 //! frames downstream as audio arrives.
 //!
-//! Pipeline position:
-//!   SarvamLLMHandler → LLMAssistantAggregator → SarvamTtsHandler → transport.output()
-//!
-//! Frame flow:
-//!   StartFrame              → connect WebSocket, send config
-//!   LLMFullResponseStart    → pass through
-//!   LLMText(text)           → accumulate → sentence-split → send chunk to WS
-//!   LLMFullResponseEnd      → flush remaining buffer + send flush signal
-//!   BotStartedSpeaking      → set bot_speaking = true
-//!   BotStoppedSpeaking      → set bot_speaking = false
-//!   Interruption            → clear buffer; if bot_speaking → reconnect WS
-//!   EndFrame / CancelFrame  → disconnect
-//!
-//! Frames produced (by receive task):
-//!   OutputAudioRaw (downstream) — raw PCM audio from Sarvam
-//!   ErrorFrame     (upstream)   — on connection or server errors
-//!
-//! Ordering guarantee:
-//!   All text is sent over a SINGLE persistent WebSocket. Sarvam synthesizes
-//!   in order and returns audio over the same TCP-backed stream. No
-//!   serialization queue is needed — TCP preserves order for free.
+//! Timing prints added to expose exact moments:
+//!   [tts] send_text_chunk — text sent to Sarvam WS
+//!   [tts] send_flush      — flush signal sent, synthesis starts
+//!   [tts] first_audio     — first audio bytes received back
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -48,7 +31,18 @@ use crate::utils::sentence_splitter::{extract_sentences, find_sentence_end};
 use crate::utils::text_preprocessor::preprocess_for_tts;
 
 // ---------------------------------------------------------------------------
-// Model configs — mirrors Python's TTS_MODEL_CONFIGS exactly
+// Timing helper
+// ---------------------------------------------------------------------------
+
+fn now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+// ---------------------------------------------------------------------------
+// Model configs
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -111,7 +105,6 @@ pub const MODEL_BULBUL_V3: TtsModelConfig = TtsModelConfig {
     speakers:                      V3_SPEAKERS,
 };
 
-/// Resolve model name to its static config.
 pub fn get_model_config(model: &str) -> Option<&'static TtsModelConfig> {
     match model {
         "bulbul:v2"      => Some(&MODEL_BULBUL_V2),
@@ -125,48 +118,20 @@ pub fn get_model_config(model: &str) -> Option<&'static TtsModelConfig> {
 // Config
 // ---------------------------------------------------------------------------
 
-/// Configuration for SarvamTtsHandler.
 #[derive(Debug, Clone)]
 pub struct SarvamTtsConfig {
-    /// Sarvam API subscription key.
     pub api_key: String,
-
-    /// TTS model. Options: "bulbul:v2", "bulbul:v3-beta", "bulbul:v3".
     pub model: String,
-
-    /// Speaker voice. Uses model default if empty.
     pub voice: String,
-
-    /// BCP-47 target language code e.g. "ml-IN", "hi-IN", "en-IN".
     pub language: String,
-
-    /// Audio sample rate in Hz. Uses model default if None.
     pub sample_rate: Option<u32>,
-
-    /// Speech pace multiplier. Clamped to model's valid range.
-    /// bulbul:v2: 0.3–3.0 | bulbul:v3*: 0.5–2.0
     pub pace: f32,
-
-    /// Voice pitch (-0.75 to 0.75). bulbul:v2 only.
     pub pitch: Option<f32>,
-
-    /// Volume multiplier (0.3 to 3.0). bulbul:v2 only.
     pub loudness: Option<f32>,
-
-    /// Output randomness (0.01 to 1.0). bulbul:v3* only.
     pub temperature: Option<f32>,
-
-    /// Enable text preprocessing. Always true for bulbul:v3*.
     pub enable_preprocessing: bool,
-
-    /// Minimum characters to accumulate before sending a chunk.
-    /// Lower = lower latency, potentially more choppy.
     pub min_buffer_size: usize,
-
-    /// Maximum characters in a single chunk sent to Sarvam.
     pub max_chunk_length: usize,
-
-    /// WebSocket base URL.
     pub url: String,
 }
 
@@ -175,7 +140,7 @@ impl Default for SarvamTtsConfig {
         Self {
             api_key:              String::new(),
             model:                "bulbul:v2".to_string(),
-            voice:                String::new(), // resolved from model default
+            voice:                String::new(),
             language:             "en-IN".to_string(),
             sample_rate:          None,
             pace:                 1.0,
@@ -202,38 +167,33 @@ struct SarvamTtsMessage {
 }
 
 // ---------------------------------------------------------------------------
-// Internal mutable state — all fields behind a single Mutex.
-//
-// Lock scope rule: always extract what you need, drop the lock,
-// THEN do any .await. Never hold the Mutex across an await point.
+// Internal state
 // ---------------------------------------------------------------------------
 
 struct TtsState {
-    /// Channel to the WS send task.
     ws_tx:          Option<mpsc::Sender<String>>,
-
-    /// Accumulated LLM text waiting for a sentence boundary or max_chunk_length.
     text_buffer:    String,
-
-    /// True once the first OutputAudioRaw frame has been pushed downstream
-    /// (i.e. Sarvam has started returning audio for the current turn).
-    /// Cleared when BotStoppedSpeaking arrives.
     bot_speaking:   bool,
-
     send_task:      Option<JoinHandle<()>>,
     receive_task:   Option<JoinHandle<()>>,
     keepalive_task: Option<JoinHandle<()>>,
+    /// Timestamp when the last flush was sent — for measuring TTS API latency.
+    flush_sent_at:  Option<f64>,
+    /// True once first audio has arrived after a flush — reset each flush.
+    first_audio_logged: bool,
 }
 
 impl TtsState {
     fn new() -> Self {
         Self {
-            ws_tx:          None,
-            text_buffer:    String::new(),
-            bot_speaking:   false,
-            send_task:      None,
-            receive_task:   None,
-            keepalive_task: None,
+            ws_tx:              None,
+            text_buffer:        String::new(),
+            bot_speaking:       false,
+            send_task:          None,
+            receive_task:       None,
+            keepalive_task:     None,
+            flush_sent_at:      None,
+            first_audio_logged: true,
         }
     }
 }
@@ -250,7 +210,6 @@ pub struct SarvamTtsHandler {
 }
 
 impl SarvamTtsHandler {
-    /// Create a new handler, validating config against the selected model.
     pub fn new(mut config: SarvamTtsConfig) -> std::result::Result<Self, String> {
         let model_config = get_model_config(&config.model)
             .ok_or_else(|| format!("Unsupported TTS model: '{}'", config.model))?;
@@ -258,12 +217,10 @@ impl SarvamTtsHandler {
         let sample_rate = config.sample_rate
             .unwrap_or(model_config.default_sample_rate);
 
-        // Resolve default speaker
         if config.voice.is_empty() {
             config.voice = model_config.default_speaker.to_string();
         }
 
-        // Clamp pace to model's valid range
         if config.pace < model_config.pace_min || config.pace > model_config.pace_max {
             log::warn!(
                 "SarvamTts: pace {:.2} outside range ({:.1}–{:.1}) for {} — clamping",
@@ -272,12 +229,10 @@ impl SarvamTtsHandler {
             config.pace = config.pace.clamp(model_config.pace_min, model_config.pace_max);
         }
 
-        // Force preprocessing for v3 models
         if model_config.preprocessing_always_enabled {
             config.enable_preprocessing = true;
         }
 
-        // Warn and clear unsupported parameters
         if !model_config.supports_pitch && config.pitch.is_some() {
             log::warn!("SarvamTts: pitch not supported for {} — ignoring", config.model);
             config.pitch = None;
@@ -299,7 +254,6 @@ impl SarvamTtsHandler {
         })
     }
 
-    /// Wrap in a FrameProcessor ready for use in a PipelineTask.
     pub fn into_processor(self) -> FrameProcessor {
         FrameProcessor::new("SarvamTts", Box::new(self), false)
     }
@@ -351,11 +305,10 @@ impl SarvamTtsHandler {
 
         let send_task      = tokio::spawn(run_tts_send_task(sink, ws_rx));
         let receive_task   = tokio::spawn(run_tts_receive_task(
-            stream, processor.clone(), self.sample_rate,
+            stream, processor.clone(), self.sample_rate, self.state.clone(),
         ));
         let keepalive_task = tokio::spawn(run_tts_keepalive_task(ws_tx.clone()));
 
-        // Hold lock only for the state write — no .await while locked
         {
             let mut state      = self.state.lock().await;
             state.ws_tx        = Some(ws_tx.clone());
@@ -364,13 +317,11 @@ impl SarvamTtsHandler {
             state.keepalive_task = Some(keepalive_task);
         }
 
-        // Send config outside the lock — this is an async send
         self.send_config(&ws_tx).await;
         log::info!("SarvamTts: connected and configured");
     }
 
     async fn disconnect(&self) {
-        // Abort all background tasks, clear channel
         let mut state = self.state.lock().await;
         if let Some(h) = state.send_task.take()      { h.abort(); }
         if let Some(h) = state.receive_task.take()   { h.abort(); }
@@ -401,31 +352,37 @@ impl SarvamTtsHandler {
 
         let msg = serde_json::json!({ "type": "config", "data": config_data });
         let _ = ws_tx.send(msg.to_string()).await;
-        log::debug!("SarvamTts: config sent: {}", msg);
+        log::debug!("SarvamTts: config sent");
     }
 
     async fn send_text_chunk(&self, text: &str) {
-        // Clone the sender out of the lock — do NOT hold lock across .await
         let tx = { self.state.lock().await.ws_tx.clone() };
         if let Some(tx) = tx {
+            let ts = now();
+            println!("[{:.3}] [tts] send_text_chunk  ({} chars): {:?}", ts, text.len(), text);
             let msg = serde_json::json!({
                 "type": "text",
                 "data": { "text": text }
             });
             let _ = tx.send(msg.to_string()).await;
-            log::debug!("SarvamTts: sent text chunk ({} chars): {:?}", text.len(), text);
         }
     }
 
     async fn send_flush(&self) {
         let tx = { self.state.lock().await.ws_tx.clone() };
         if let Some(tx) = tx {
+            let ts = now();
+            println!("[{:.3}] [tts] send_flush  ← synthesis starts now", ts);
+            // Record flush time and reset first-audio flag
+            {
+                let mut state = self.state.lock().await;
+                state.flush_sent_at      = Some(ts);
+                state.first_audio_logged = false;
+            }
             let msg = serde_json::json!({ "type": "flush" });
             let _ = tx.send(msg.to_string()).await;
-            log::debug!("SarvamTts: sent flush");
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -441,31 +398,24 @@ impl FrameHandler for SarvamTtsHandler {
         direction: FrameDirection,
     ) -> Result<()> {
         match &frame.inner {
-            // ---- Lifecycle ----
             FrameInner::System(SystemFrame::Start(_)) => {
                 processor.push_frame(frame, direction).await?;
                 self.connect(processor.clone()).await;
             }
 
-            // ---- LLM turn start — nothing to do, pass through ----
             FrameInner::System(SystemFrame::LLMFullResponseStart) => {
                 processor.push_frame(frame, direction).await?;
             }
 
-            // ---- Accumulate LLM tokens and send sentence chunks ----
             FrameInner::Data(DataFrame::LLMText(text)) => {
                 let text = text.clone();
                 let min_buffer_size  = self.config.min_buffer_size;
                 let max_chunk_length = self.config.max_chunk_length;
 
-                // Lock scope: mutate buffer, extract chunks, release lock.
-                // No .await while holding the lock.
                 let chunks = {
                     let mut state = self.state.lock().await;
                     state.text_buffer.push_str(&text);
 
-                    // Don't attempt extraction until we have enough content.
-                    // This avoids sending tiny single-word chunks to Sarvam.
                     if state.text_buffer.len() < min_buffer_size
                         && find_sentence_end(&state.text_buffer).is_none()
                     {
@@ -473,21 +423,16 @@ impl FrameHandler for SarvamTtsHandler {
                     } else {
                         extract_sentences(&mut state.text_buffer, max_chunk_length)
                     }
-                }; // lock released here
+                };
 
-                // .await happens outside the lock
                 for chunk in chunks {
                     self.send_text_chunk(&preprocess_for_tts(&chunk)).await;
                 }
 
-                // Always pass LLMText downstream so LLMAssistantAggregator
-                // can build the full assistant turn for context.
                 processor.push_frame(frame, direction).await?;
             }
 
-            // ---- LLM turn end — flush remaining buffer ----
             FrameInner::System(SystemFrame::LLMFullResponseEnd) => {
-                // Extract remaining text outside the lock before sending
                 let remaining = {
                     let mut state = self.state.lock().await;
                     let tail = state.text_buffer.trim().to_string();
@@ -499,13 +444,10 @@ impl FrameHandler for SarvamTtsHandler {
                     self.send_text_chunk(&preprocess_for_tts(&remaining)).await;
                 }
 
-                // Tell Sarvam to synthesize everything buffered on its side
                 self.send_flush().await;
-
                 processor.push_frame(frame, direction).await?;
             }
 
-            // ---- Bot speaking state tracking ----
             FrameInner::System(SystemFrame::BotStartedSpeaking) => {
                 self.state.lock().await.bot_speaking = true;
                 processor.push_frame(frame, direction).await?;
@@ -516,14 +458,6 @@ impl FrameHandler for SarvamTtsHandler {
                 processor.push_frame(frame, direction).await?;
             }
 
-            // ---- Interruption ----
-            //
-            // Mirrors InterruptibleTTSService._handle_interruption():
-            //   1. Clear the local text buffer — no more text will be sent.
-            //   2. If the bot was already speaking, reconnect the WebSocket.
-            //      This drops Sarvam's server-side audio buffer, stopping
-            //      audio that hasn't been sent yet. Without reconnect, stale
-            //      audio chunks would continue arriving from the old socket.
             FrameInner::System(SystemFrame::Interruption) => {
                 let bot_speaking = {
                     let mut state = self.state.lock().await;
@@ -540,14 +474,12 @@ impl FrameHandler for SarvamTtsHandler {
                 processor.push_frame(frame, direction).await?;
             }
 
-            // ---- Shutdown ----
             FrameInner::Control(ControlFrame::End { .. })
             | FrameInner::System(SystemFrame::Cancel { .. }) => {
                 self.disconnect().await;
                 processor.push_frame(frame, direction).await?;
             }
 
-            // ---- Everything else: pass through ----
             _ => {
                 processor.push_frame(frame, direction).await?;
             }
@@ -578,7 +510,6 @@ type WsStream = futures::stream::SplitStream<
 // Background tasks
 // ---------------------------------------------------------------------------
 
-/// Drain the mpsc channel and write each message to the WebSocket.
 async fn run_tts_send_task(mut sink: WsSink, mut rx: mpsc::Receiver<String>) {
     while let Some(text) = rx.recv().await {
         if sink.send(Message::Text(text.into())).await.is_err() {
@@ -590,18 +521,18 @@ async fn run_tts_send_task(mut sink: WsSink, mut rx: mpsc::Receiver<String>) {
     log::debug!("SarvamTts: send task exited");
 }
 
-/// Read audio messages from Sarvam and push OutputAudioRaw frames downstream.
 async fn run_tts_receive_task(
     mut stream:     WsStream,
     processor:      FrameProcessor,
     sample_rate:    u32,
+    state:          Arc<Mutex<TtsState>>,
 ) {
     log::debug!("SarvamTts: receive task started");
 
     while let Some(result) = stream.next().await {
         match result {
             Ok(Message::Text(text)) => {
-                handle_tts_message(text.as_str(), &processor, sample_rate).await;
+                handle_tts_message(text.as_str(), &processor, sample_rate, &state).await;
             }
             Ok(Message::Close(_)) => {
                 log::info!("SarvamTts: server closed WebSocket");
@@ -613,31 +544,30 @@ async fn run_tts_receive_task(
                     .await;
                 break;
             }
-            _ => {} // ping / pong / binary — ignore
+            _ => {}
         }
     }
 
     log::debug!("SarvamTts: receive task exited");
 }
 
-/// Send a ping every 20 seconds to keep the WebSocket alive.
 async fn run_tts_keepalive_task(tx: mpsc::Sender<String>) {
     const KEEPALIVE_SECS: u64 = 20;
     loop {
         tokio::time::sleep(Duration::from_secs(KEEPALIVE_SECS)).await;
         let msg = serde_json::json!({ "type": "ping" }).to_string();
         if tx.send(msg).await.is_err() {
-            break; // send task has exited — nothing to keep alive
+            break;
         }
         log::debug!("SarvamTts: keepalive ping sent");
     }
 }
 
-/// Decode a single Sarvam TTS WebSocket message and push audio downstream.
 async fn handle_tts_message(
     text:        &str,
     processor:   &FrameProcessor,
     sample_rate: u32,
+    state:       &Arc<Mutex<TtsState>>,
 ) {
     log::trace!("SarvamTts: raw message: {}", text);
 
@@ -669,13 +599,30 @@ async fn handle_tts_message(
                 }
             };
 
-            // Strip WAV header if present (matches Python's stripping logic)
             if audio.len() > 44 && audio.starts_with(b"RIFF") {
                 audio = audio[44..].to_vec();
             }
 
             if audio.is_empty() {
                 return;
+            }
+
+            // ---- First audio timing log ----
+            {
+                let mut s = state.lock().await;
+                if !s.first_audio_logged {
+                    s.first_audio_logged = true;
+                    let ts = now();
+                    if let Some(flush_at) = s.flush_sent_at {
+                        println!(
+                            "[{:.3}] [tts] first_audio  ← Sarvam synthesis latency: {:.3}s",
+                            ts,
+                            ts - flush_at
+                        );
+                    } else {
+                        println!("[{:.3}] [tts] first_audio", ts);
+                    }
+                }
             }
 
             log::debug!("SarvamTts: received {} audio bytes", audio.len());
@@ -699,8 +646,6 @@ async fn handle_tts_message(
         }
 
         "done" => {
-            // Sarvam sends "done" after flush is fully synthesized.
-            // Nothing to do — the pipeline continues naturally.
             log::debug!("SarvamTts: synthesis done signal received");
         }
 
@@ -730,10 +675,6 @@ fn urlencoding(s: &str) -> String {
 mod tests {
     use super::*;
 
-    // Sentence splitting tests live in utils::sentence_splitter — not duplicated here.
-
-    // ---- Model config resolution ----
-
     #[test]
     fn test_model_config_v2() {
         let c = get_model_config("bulbul:v2").unwrap();
@@ -762,8 +703,6 @@ mod tests {
         assert!(get_model_config("bulbul:v99").is_none());
     }
 
-    // ---- SarvamTtsHandler construction ----
-
     #[test]
     fn test_handler_default_voice_resolved() {
         let h = SarvamTtsHandler::new(SarvamTtsConfig {
@@ -771,7 +710,6 @@ mod tests {
             ..SarvamTtsConfig::default()
         })
         .unwrap();
-        // Empty voice in config → filled from model default
         assert_eq!(h.config.voice, "anushka");
         assert_eq!(h.sample_rate, 22050);
     }
@@ -781,7 +719,7 @@ mod tests {
         let h = SarvamTtsHandler::new(SarvamTtsConfig {
             api_key:              "test".to_string(),
             model:                "bulbul:v3".to_string(),
-            enable_preprocessing: false, // should be overridden
+            enable_preprocessing: false,
             ..SarvamTtsConfig::default()
         })
         .unwrap();
@@ -793,7 +731,7 @@ mod tests {
         let h = SarvamTtsHandler::new(SarvamTtsConfig {
             api_key: "test".to_string(),
             model:   "bulbul:v3".to_string(),
-            pitch:   Some(0.5), // not supported for v3
+            pitch:   Some(0.5),
             ..SarvamTtsConfig::default()
         })
         .unwrap();
@@ -814,7 +752,7 @@ mod tests {
     fn test_handler_pace_clamped_high() {
         let h = SarvamTtsHandler::new(SarvamTtsConfig {
             api_key: "test".to_string(),
-            pace:    99.0, // way above v2 max of 3.0
+            pace:    99.0,
             ..SarvamTtsConfig::default()
         })
         .unwrap();
@@ -825,7 +763,7 @@ mod tests {
     fn test_handler_pace_clamped_low() {
         let h = SarvamTtsHandler::new(SarvamTtsConfig {
             api_key: "test".to_string(),
-            pace:    0.01, // below v2 min of 0.3
+            pace:    0.01,
             ..SarvamTtsConfig::default()
         })
         .unwrap();
@@ -840,7 +778,6 @@ mod tests {
             ..SarvamTtsConfig::default()
         })
         .unwrap();
-        // v3 default is 24000
         assert_eq!(h.sample_rate, 24000);
     }
 

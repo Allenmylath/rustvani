@@ -11,20 +11,30 @@
 //!     → SarvamTts
 //!     → WebSocketTransport.output()
 //!
+//! LatencyObserver logs every frame (except InputAudioRaw/OutputAudioRaw)
+//! with processor name, plus per-turn stage deltas:
+//!   t0  VADUserStoppedSpeaking  — user finished speaking
+//!   t1  Transcription           — STT returned
+//!   t2  LLMFullResponseStart    — first LLM token
+//!   t3  LLMFullResponseEnd      — LLM stream complete
+//!   t4  OutputAudioRaw (first)  — TTS first audio chunk out
+//!
 //! Wire protocol:
 //!   Client → Server : Binary WebSocket — raw i16 LE PCM, 16 kHz mono, 512-sample chunks
 //!   Server → Client : Binary WebSocket — raw i16 LE PCM at TTS sample rate (22050 Hz bulbul:v2)
 //!
 //! Environment variables:
 //!   SARVAM_API_KEY   — required
-//!   SYSTEM_PROMPT    — optional, defaults to a general assistant prompt
-//!   RUST_LOG         — log level, e.g. "info" or "rustvani=debug,info"
+//!   SYSTEM_PROMPT    — optional
+//!   RUST_LOG         — e.g. "info" or "rustvani=debug,info"
 //!
 //! Run:
 //!   SARVAM_API_KEY=your-key cargo run --release --bin websocket_server
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
+use async_trait::async_trait;
 use axum::{
     Router,
     extract::{State, WebSocketUpgrade, ws::WebSocket},
@@ -35,8 +45,9 @@ use tower_http::cors::CorsLayer;
 
 use rustvani::{
     shared_context, system_clock, SileroVad, VadParams,
-    PipelineParams, PipelineTask,
+    PipelineParams, PipelineTask, FrameKind,
 };
+use rustvani::observer::{BaseObserver, FrameProcessed, FramePushed};
 use rustvani::processors::{
     llm_assistant_aggregator::LLMAssistantAggregator,
     llm_user_aggregator::LLMUserAggregator,
@@ -67,6 +78,149 @@ fn next_conn_id() -> u64 {
 struct AppState {
     sarvam_api_key: String,
     system_prompt:  String,
+}
+
+// ---------------------------------------------------------------------------
+// LatencyObserver — inline, one instance per connection
+// ---------------------------------------------------------------------------
+
+struct TurnState {
+    turn:        u32,
+    in_turn:     bool,
+    t_vad:       f64,
+    t_stt:       Option<f64>,
+    t_llm_start: Option<f64>,
+    t_llm_end:   Option<f64>,
+    tts_first:   bool,
+}
+
+impl TurnState {
+    fn new() -> Self {
+        Self {
+            turn:        0,
+            in_turn:     false,
+            t_vad:       0.0,
+            t_stt:       None,
+            t_llm_start: None,
+            t_llm_end:   None,
+            tts_first:   false,
+        }
+    }
+}
+
+struct LatencyObserver {
+    conn_id: u64,
+    state:   Mutex<TurnState>,
+}
+
+impl LatencyObserver {
+    fn new(conn_id: u64) -> Self {
+        Self { conn_id, state: Mutex::new(TurnState::new()) }
+    }
+}
+
+#[async_trait]
+impl BaseObserver for LatencyObserver {
+    async fn on_process_frame(&self, event: FrameProcessed) {
+        let ts  = event.timestamp;
+        let cid = self.conn_id;
+
+        // ---- Full frame log (skip audio flood) ----
+        match event.frame.kind() {
+            FrameKind::InputAudioRaw | FrameKind::OutputAudioRaw => {}
+            _ => {
+                log::info!(
+                    "[conn={}] [{:.3}] {:>40}  @  {}",
+                    cid, ts,
+                    event.frame.name(),
+                    event.processor_name,
+                );
+            }
+        }
+
+        // ---- Latency tracking ----
+        let mut s = self.state.lock().unwrap();
+
+        match event.frame.kind() {
+            // t0 — user stopped speaking
+            FrameKind::VADUserStoppedSpeaking => {
+                if !s.in_turn {
+                    s.turn       += 1;
+                    s.in_turn     = true;
+                    s.t_vad       = ts;
+                    s.t_stt       = None;
+                    s.t_llm_start = None;
+                    s.t_llm_end   = None;
+                    s.tts_first   = false;
+                    log::info!(
+                        "[conn={}] [turn={}] ┌ t0  VAD stop",
+                        cid, s.turn
+                    );
+                }
+            }
+
+            // t1 — STT transcript
+            FrameKind::Transcription => {
+                if s.in_turn && s.t_stt.is_none() {
+                    s.t_stt = Some(ts);
+                    log::info!(
+                        "[conn={}] [turn={}] │ t1  STT transcript   {:>+7.3}s",
+                        cid, s.turn,
+                        ts - s.t_vad
+                    );
+                }
+            }
+
+            // t2 — LLM first token
+            FrameKind::LLMFullResponseStart => {
+                if s.in_turn && s.t_llm_start.is_none() {
+                    s.t_llm_start = Some(ts);
+                    let from = s.t_stt.unwrap_or(s.t_vad);
+                    log::info!(
+                        "[conn={}] [turn={}] │ t2  LLM first token  {:>+7.3}s",
+                        cid, s.turn,
+                        ts - from
+                    );
+                }
+            }
+
+            // t3 — LLM stream complete
+            FrameKind::LLMFullResponseEnd => {
+                if s.in_turn && s.t_llm_end.is_none() {
+                    s.t_llm_end = Some(ts);
+                    let from = s.t_llm_start.unwrap_or(s.t_vad);
+                    log::info!(
+                        "[conn={}] [turn={}] │ t3  LLM complete     {:>+7.3}s",
+                        cid, s.turn,
+                        ts - from
+                    );
+                }
+            }
+
+            // t4 — TTS first audio chunk
+            FrameKind::OutputAudioRaw => {
+                if s.in_turn && !s.tts_first {
+                    s.tts_first = true;
+                    let from    = s.t_llm_end.unwrap_or(s.t_vad);
+                    let total   = ts - s.t_vad;
+                    log::info!(
+                        "[conn={}] [turn={}] │ t4  TTS first audio  {:>+7.3}s",
+                        cid, s.turn,
+                        ts - from
+                    );
+                    log::info!(
+                        "[conn={}] [turn={}] └ TOTAL               {:>+7.3}s",
+                        cid, s.turn, total
+                    );
+                    s.in_turn = false;
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    async fn on_push_frame(&self, _event: FramePushed) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -163,12 +317,11 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         PipelineParams::default(),
     );
 
-    let push_tx = task.push_sender();
+    let push_tx  = task.push_sender();
+    let observer = Arc::new(LatencyObserver::new(conn_id));
 
-    // Run pipeline and socket loop concurrently.
-    // Either side terminating (socket close or EndFrame) shuts both down.
     tokio::join!(
-        async { task.run(system_clock(), None).await.ok(); },
+        async { task.run(system_clock(), Some(observer)).await.ok(); },
         transport.run_socket(socket, push_tx),
     );
 
