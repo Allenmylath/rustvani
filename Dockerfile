@@ -6,15 +6,14 @@ ARG MODE=prod
 
 # --- System dependencies ---
 # Fedora 40 has glibc 2.39 — satisfies ort __isoc23_* symbol requirements.
-# Independent of Canonical's repos which have been having major outages.
 RUN dnf install -y \
-        curl \
-        gcc \
-        gcc-c++ \
-        make \
-        pkg-config \
-        openssl-devel \
-        ca-certificates \
+    curl \
+    gcc \
+    gcc-c++ \
+    make \
+    pkg-config \
+    openssl-devel \
+    ca-certificates \
     && dnf clean all
 
 # --- Rust stable ---
@@ -28,17 +27,11 @@ WORKDIR /app
 COPY Cargo.toml .
 COPY src/ src/
 
-# --- Download Silero ONNX model ---
+# --- Copy Silero ONNX model from local source tree ---
 # Pinned to v4.0 — inference API (input/state/sr) matches v4 only
-RUN curl -fL \
-    "https://github.com/snakers4/silero-vad/raw/v4.0/files/silero_vad.onnx" \
-    -o silero_vad.onnx
+COPY src/vad/data/silero.onnx silero_vad.onnx
 
-# --- Download test WAV ---
-RUN curl -fL \
-    "https://github.com/snakers4/silero-vad/raw/master/tests/data/test.wav" \
-    -o test.wav \
-    && mkdir -p tests && cp test.wav tests/test.wav
+
 
 # --- Build release binaries ---
 # ort-sys downloads libonnxruntime prebuilt during this step.

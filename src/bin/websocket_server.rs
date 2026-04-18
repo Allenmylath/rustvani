@@ -6,7 +6,7 @@
 //!   WebSocketTransport.input()
 //!     → SarvamStt
 //!     → LLMUserAggregator
-//!     → SarvamLLM
+//!     → OpenAILLM
 //!     → LLMAssistantAggregator
 //!     → SarvamTts
 //!     → WebSocketTransport.output()
@@ -24,12 +24,13 @@
 //!   Server → Client : Binary WebSocket — raw i16 LE PCM at TTS sample rate (22050 Hz bulbul:v2)
 //!
 //! Environment variables:
-//!   SARVAM_API_KEY   — required
+//!   SARVAM_API_KEY   — required (STT + TTS)
+//!   OPENAI_API_KEY   — required (LLM)
 //!   SYSTEM_PROMPT    — optional
 //!   RUST_LOG         — e.g. "info" or "rustvani=debug,info"
 //!
 //! Run:
-//!   SARVAM_API_KEY=your-key cargo run --release --bin websocket_server
+//!   SARVAM_API_KEY=your-key OPENAI_API_KEY=your-key cargo run --release --bin websocket_server
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -53,7 +54,7 @@ use rustvani::processors::{
     llm_user_aggregator::LLMUserAggregator,
 };
 use rustvani::services::{
-    SarvamLLMConfig, SarvamLLMHandler,
+    OpenAILLMConfig, OpenAILLMHandler,
     SarvamSttConfig, SarvamSttHandler,
     SarvamTtsConfig, SarvamTtsHandler,
 };
@@ -77,6 +78,7 @@ fn next_conn_id() -> u64 {
 #[derive(Clone)]
 struct AppState {
     sarvam_api_key: String,
+    openai_api_key: String,
     system_prompt:  String,
 }
 
@@ -280,10 +282,10 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
 
     let user_agg = LLMUserAggregator::new(context.clone());
 
-    let llm = SarvamLLMHandler::new(SarvamLLMConfig {
-        api_key: app_state.sarvam_api_key.clone(),
-        model:   "sarvam-30b".to_string(),
-        ..SarvamLLMConfig::default()
+    let llm = OpenAILLMHandler::new(OpenAILLMConfig {
+        api_key: app_state.openai_api_key.clone(),
+        model:   "gpt-4o-mini".to_string(),
+        ..OpenAILLMConfig::default()
     })
     .into_processor();
 
@@ -342,6 +344,9 @@ async fn main() {
     let sarvam_api_key = std::env::var("SARVAM_API_KEY")
         .expect("SARVAM_API_KEY env var not set");
 
+    let openai_api_key = std::env::var("OPENAI_API_KEY")
+        .expect("OPENAI_API_KEY env var not set");
+
     let system_prompt = std::env::var("SYSTEM_PROMPT").unwrap_or_else(|_| {
         "You are a helpful voice assistant. \
          Keep your answers concise and conversational — \
@@ -349,7 +354,7 @@ async fn main() {
             .to_string()
     });
 
-    let app_state = AppState { sarvam_api_key, system_prompt };
+    let app_state = AppState { sarvam_api_key, openai_api_key, system_prompt };
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
@@ -358,7 +363,7 @@ async fn main() {
 
     let addr = "0.0.0.0:8080";
     log::info!("rustvani voice agent listening on ws://{}/ws", addr);
-    log::info!("Pipeline: audio → VAD → STT → LLM → TTS → audio");
+    log::info!("Pipeline: audio → VAD → STT(Sarvam) → LLM(OpenAI) → TTS(Sarvam) → audio");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
