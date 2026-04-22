@@ -361,7 +361,8 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 
-    let addr = "0.0.0.0:8080";
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let addr = format!("0.0.0.0:{}", port);
     log::info!("rustvani voice agent listening on ws://{}/ws", addr);
     log::info!("Pipeline: audio → VAD → STT(Sarvam) → LLM(OpenAI) → TTS(Sarvam) → audio");
 
