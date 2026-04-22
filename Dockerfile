@@ -26,7 +26,7 @@ COPY src/ src/
 # Pinned to v4.0 — inference API (input/state/sr) matches v4 only
 COPY src/vad/data/silero.onnx silero_vad.onnx
 # --- Copy Piper TTS models (downloaded locally, not committed to git) ---
-COPY piper-models/ piper-models/
+#COPY piper-models/ piper-models/
 # --- Build release binaries ---
 # ort-sys downloads libonnxruntime prebuilt during this step.
 # glibc 2.39 satisfies __isoc23_strtoll / strtol / strtoull symbols.
