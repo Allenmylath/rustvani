@@ -294,7 +294,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     let tts = match SarvamTtsHandler::new(SarvamTtsConfig {
         api_key:  app_state.sarvam_api_key.clone(),
         model:    "bulbul:v2".to_string(),
-        voice:    "anushka".to_string(),
+        voice:    "aditya".to_string(),
         language: "en-IN".to_string(),
         ..SarvamTtsConfig::default()
     }) {
