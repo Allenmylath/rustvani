@@ -407,7 +407,7 @@ impl FrameHandler for SarvamTtsHandler {
                 self.connect(processor.clone()).await;
             }
 
-            FrameInner::System(SystemFrame::LLMFullResponseStart) => {
+            FrameInner::Control(ControlFrame::LLMFullResponseStart) => {
                 processor.push_frame(frame, direction).await?;
             }
 
@@ -436,7 +436,7 @@ impl FrameHandler for SarvamTtsHandler {
                 processor.push_frame(frame, direction).await?;
             }
 
-            FrameInner::System(SystemFrame::LLMFullResponseEnd) => {
+            FrameInner::Control(ControlFrame::LLMFullResponseEnd) => {
                 let remaining = {
                     let mut state = self.state.lock().await;
                     let tail = state.text_buffer.trim().to_string();

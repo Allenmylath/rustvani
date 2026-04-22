@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rustvani::{
-    shared_context, system_clock, DataFrame, Frame, FrameDirection,
+    shared_context, system_clock, ControlFrame, DataFrame, Frame, FrameDirection,
     FrameInner, FrameKind, LLMAssistantAggregator, PipelineParams, PipelineTask, SystemFrame,
 };
 use rustvani::observer::{BaseObserver, FrameProcessed, FramePushed};
@@ -100,7 +100,7 @@ impl BaseObserver for FrameLogger {
         let is_first_receiver = event.processor_name == "LLMAssistantAggregator";
 
         match &event.frame.inner {
-            FrameInner::System(SystemFrame::LLMFullResponseStart) => {
+            FrameInner::Control(ControlFrame::LLMFullResponseStart) => {
                 println!(
                     "[{:.3}] PROCESS {} {}  @ {}",
                     event.timestamp, dir, event.frame.name(), event.processor_name
@@ -121,7 +121,7 @@ impl BaseObserver for FrameLogger {
                 }
             }
 
-            FrameInner::System(SystemFrame::LLMFullResponseEnd) => {
+            FrameInner::Control(ControlFrame::LLMFullResponseEnd) => {
                 if is_first_receiver {
                     println!(); // close the token line
                 }

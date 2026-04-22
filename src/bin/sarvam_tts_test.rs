@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rustvani::{
-    system_clock, DataFrame, Frame, FrameDirection, FrameHandler, FrameInner,
+    system_clock, ControlFrame, DataFrame, Frame, FrameDirection, FrameHandler, FrameInner,
     FrameKind, FrameProcessor, PipelineParams, PipelineTask, Result, SystemFrame,
 };
 use rustvani::services::{SarvamTtsConfig, SarvamTtsHandler};
@@ -46,7 +46,7 @@ impl FrameHandler for AudioPrinter {
                     count, audio.audio.len(), audio.sample_rate
                 );
             }
-            FrameInner::System(SystemFrame::LLMFullResponseEnd) => {
+            FrameInner::Control(ControlFrame::LLMFullResponseEnd) => {
                 println!("[tts] LLMFullResponseEnd received");
             }
             _ if frame.kind() == FrameKind::Error => {

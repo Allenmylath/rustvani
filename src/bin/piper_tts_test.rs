@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rustvani::{
-    system_clock, DataFrame, Frame, FrameDirection, FrameHandler, FrameInner,
+    system_clock, ControlFrame, DataFrame, Frame, FrameDirection, FrameHandler, FrameInner,
     FrameKind, FrameProcessor, PipelineParams, PipelineTask, Result, SystemFrame,
 };
 use rustvani::services::{PiperTtsConfig, PiperTtsHandler, PiperQuality};
@@ -53,7 +53,7 @@ impl FrameHandler for AudioPrinter {
                     );
                 }
             }
-            FrameInner::System(SystemFrame::LLMFullResponseEnd) => {
+            FrameInner::Control(ControlFrame::LLMFullResponseEnd) => {
                 println!("[tts] LLMFullResponseEnd received");
                 let count = *self.received.lock().unwrap();
                 let bytes = *self.total_bytes.lock().unwrap();

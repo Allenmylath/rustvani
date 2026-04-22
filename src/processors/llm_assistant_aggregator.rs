@@ -6,7 +6,8 @@ use log;
 use crate::context::LLMContext;
 use crate::error::Result;
 use crate::frames::{
-    DataFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor, SystemFrame,
+    ControlFrame, DataFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,
+    SystemFrame,
 };
 
 struct State {
@@ -51,7 +52,7 @@ impl FrameHandler for LLMAssistantAggregator {
         direction: FrameDirection,
     ) -> Result<()> {
         match &frame.inner {
-            FrameInner::System(SystemFrame::LLMFullResponseStart) => {
+            FrameInner::Control(ControlFrame::LLMFullResponseStart) => {
                 self.state.lock().unwrap().in_response = true;
                 processor.push_frame(frame, direction).await?;
             }
@@ -68,7 +69,7 @@ impl FrameHandler for LLMAssistantAggregator {
                 processor.push_frame(frame, direction).await?;
             }
 
-            FrameInner::System(SystemFrame::LLMFullResponseEnd) => {
+            FrameInner::Control(ControlFrame::LLMFullResponseEnd) => {
                 let aggregation = {
                     let mut state = self.state.lock().unwrap();
                     state.in_response = false;

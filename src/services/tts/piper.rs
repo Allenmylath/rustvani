@@ -567,7 +567,7 @@ impl FrameHandler for PiperTtsHandler {
             }
 
             // ---- LLM text streaming: buffer + sentence-split ----
-            FrameInner::System(SystemFrame::LLMFullResponseStart) => {
+            FrameInner::Control(ControlFrame::LLMFullResponseStart) => {
                 processor.push_frame(frame, direction).await?;
             }
 
@@ -598,7 +598,7 @@ impl FrameHandler for PiperTtsHandler {
             }
 
             // ---- LLM done: flush remaining buffer ----
-            FrameInner::System(SystemFrame::LLMFullResponseEnd) => {
+            FrameInner::Control(ControlFrame::LLMFullResponseEnd) => {
                 let remaining = {
                     let mut state = self.state.lock().await;
                     let tail = state.text_buffer.trim().to_string();
