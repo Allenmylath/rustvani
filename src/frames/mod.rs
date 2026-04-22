@@ -42,11 +42,11 @@ pub enum FrameKind {
     PauseProcessor, PauseProcessorUrgent,
     ResumeProcessor, ResumeProcessorUrgent,
     Heartbeat,
-    // System — LLM response boundaries
+    // Control — pipeline lifecycle
+    End,
+    // Control — LLM response boundaries
     LLMFullResponseStart,
     LLMFullResponseEnd,
-    // Control
-    End,
     // Data
     Data,
     Transcription,
@@ -198,18 +198,16 @@ pub enum SystemFrame {
 
     // ---- Pipeline health probe ----
     Heartbeat(f64),
-
-    // ---- LLM response boundaries ----
-    /// Emitted by the LLM service before the first token arrives.
-    LLMFullResponseStart,
-    /// Emitted by the LLM service after [DONE] or on error — always fires.
-    LLMFullResponseEnd,
 }
 
 /// Ordered frames that survive interruption drains.
 #[derive(Debug, Clone)]
 pub enum ControlFrame {
     End { reason: Option<String> },
+    /// Emitted by the LLM service before the first token arrives.
+    LLMFullResponseStart,
+    /// Emitted by the LLM service after [DONE] or on error — always fires.
+    LLMFullResponseEnd,
 }
 
 /// Ordered frames that are cancelled by interruptions.
@@ -283,11 +281,11 @@ impl Frame {
                 SystemFrame::ResumeProcessor { .. }        => "ResumeProcessorFrame",
                 SystemFrame::ResumeProcessorUrgent { .. }  => "ResumeProcessorUrgentFrame",
                 SystemFrame::Heartbeat(_)                  => "HeartbeatFrame",
-                SystemFrame::LLMFullResponseStart          => "LLMFullResponseStartFrame",
-                SystemFrame::LLMFullResponseEnd            => "LLMFullResponseEndFrame",
             },
             FrameInner::Control(c) => match c {
-                ControlFrame::End { .. } => "EndFrame",
+                ControlFrame::End { .. }           => "EndFrame",
+                ControlFrame::LLMFullResponseStart => "LLMFullResponseStartFrame",
+                ControlFrame::LLMFullResponseEnd   => "LLMFullResponseEndFrame",
             },
             FrameInner::Data(d) => match d {
                 DataFrame::Data(_)             => "DataFrame",
@@ -325,11 +323,11 @@ impl Frame {
                 SystemFrame::ResumeProcessor { .. }        => FrameKind::ResumeProcessor,
                 SystemFrame::ResumeProcessorUrgent { .. }  => FrameKind::ResumeProcessorUrgent,
                 SystemFrame::Heartbeat(_)                  => FrameKind::Heartbeat,
-                SystemFrame::LLMFullResponseStart          => FrameKind::LLMFullResponseStart,
-                SystemFrame::LLMFullResponseEnd            => FrameKind::LLMFullResponseEnd,
             },
             FrameInner::Control(c) => match c {
-                ControlFrame::End { .. } => FrameKind::End,
+                ControlFrame::End { .. }           => FrameKind::End,
+                ControlFrame::LLMFullResponseStart => FrameKind::LLMFullResponseStart,
+                ControlFrame::LLMFullResponseEnd   => FrameKind::LLMFullResponseEnd,
             },
             FrameInner::Data(d) => match d {
                 DataFrame::Data(_)             => FrameKind::Data,
@@ -578,12 +576,12 @@ impl Frame {
 
     /// Signal start of LLM streaming response.
     pub fn llm_full_response_start() -> Self {
-        Self::make(FrameInner::System(SystemFrame::LLMFullResponseStart))
+        Self::make(FrameInner::Control(ControlFrame::LLMFullResponseStart))
     }
 
     /// Signal end of LLM streaming response — always emitted, even on error.
     pub fn llm_full_response_end() -> Self {
-        Self::make(FrameInner::System(SystemFrame::LLMFullResponseEnd))
+        Self::make(FrameInner::Control(ControlFrame::LLMFullResponseEnd))
     }
 
     /// One SSE content chunk from the LLM.
