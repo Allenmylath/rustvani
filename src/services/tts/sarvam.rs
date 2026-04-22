@@ -356,6 +356,10 @@ impl SarvamTtsHandler {
     }
 
     async fn send_text_chunk(&self, text: &str) {
+        if !text.chars().any(|c| c.is_alphanumeric()) {
+            log::debug!("SarvamTts: skipping punctuation-only chunk: {:?}", text);
+            return;
+        }
         let tx = { self.state.lock().await.ws_tx.clone() };
         if let Some(tx) = tx {
             let ts = now();
