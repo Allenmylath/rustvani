@@ -316,7 +316,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
             tts,
             transport.output(),
         ],
-        PipelineParams::default(),
+        PipelineParams { allow_interruptions: true, ..PipelineParams::default() }
     );
 
     let push_tx  = task.push_sender();

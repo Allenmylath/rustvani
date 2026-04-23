@@ -1,14 +1,3 @@
-//! Base output transport.
-//!
-//! `BaseOutputTransport` handles the common output logic:
-//!   - Emitting `BotStartedSpeaking` / `BotStoppedSpeaking` signals.
-//!   - Forwarding `OutputAudioRaw` bytes to the concrete transport via an
-//!     optional `mpsc::Sender<Vec<u8>>`.
-//!
-//! The concrete transport (e.g. `WebSocketTransport`) creates the channel,
-//! calls `set_audio_out_tx()` on construction, and owns the receiver end in
-//! its socket loop — which writes the bytes onto the wire.
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -31,13 +20,17 @@ struct OutputTransportState {
     #[allow(dead_code)]
     params: TransportParams,
 
-    /// True while `OutputAudioRaw` frames are being sent.
+    /// True while OutputAudioRaw frames are being sent.
     bot_speaking: AtomicBool,
 
     /// Set by the concrete transport after construction.
-    /// When `Some`, raw PCM bytes from `OutputAudioRaw` frames are forwarded
-    /// here so the socket loop can write them to the wire.
     audio_out_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+
+    /// Mute gate — set true on InterruptionFrame so run_socket drops
+    /// any stale audio bytes already sitting in the channel.
+    /// Cleared automatically on the first OutputAudioRaw of the next
+    /// bot turn so audio flows again without any manual reset.
+    muted: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -55,20 +48,25 @@ impl BaseOutputTransport {
                 params,
                 bot_speaking: AtomicBool::new(false),
                 audio_out_tx: Mutex::new(None),
+                muted: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
 
     /// Wire up the audio output channel.
-    ///
-    /// Called once by the concrete transport (e.g. `WebSocketTransport::new`)
-    /// before the pipeline starts. The receiver end lives in `run_socket`.
+    /// Called once by the concrete transport before the pipeline starts.
     pub fn set_audio_out_tx(&self, tx: mpsc::Sender<Vec<u8>>) {
         *self.state.audio_out_tx.lock().unwrap() = Some(tx);
     }
 
     pub fn is_bot_speaking(&self) -> bool {
         self.state.bot_speaking.load(Ordering::Relaxed)
+    }
+
+    /// Clone the mute gate Arc so run_socket can share it.
+    /// When this returns true, run_socket should silently drop audio chunks.
+    pub fn mute_gate(&self) -> Arc<AtomicBool> {
+        self.state.muted.clone()
     }
 }
 
@@ -87,15 +85,16 @@ impl FrameHandler for BaseOutputTransport {
         match &frame.inner {
             // ---- Audio output ----
             FrameInner::Data(DataFrame::OutputAudioRaw(audio)) => {
-                // Emit BotStartedSpeaking on the first audio frame of a turn.
+                // New bot audio arriving — clear the mute gate so run_socket
+                // starts sending again. This handles the case where the bot
+                // was interrupted and is now responding to the new user turn.
+                self.state.muted.store(false, Ordering::Relaxed);
+
                 if !self.state.bot_speaking.swap(true, Ordering::Relaxed) {
                     log::debug!("BaseOutputTransport: bot started speaking");
                     processor.broadcast_frame(Frame::bot_started_speaking()).await?;
                 }
 
-                // Forward bytes to the concrete transport's socket loop.
-                // `try_send` — if the channel is full we drop the chunk rather
-                // than blocking the pipeline (real-time audio: drop > delay).
                 let tx = self.state.audio_out_tx.lock().unwrap().clone();
                 if let Some(tx) = tx {
                     if tx.try_send(audio.audio.clone()).is_err() {
@@ -106,8 +105,12 @@ impl FrameHandler for BaseOutputTransport {
                 processor.push_frame(frame, direction).await?;
             }
 
-            // ---- Interruption: bot stops speaking ----
+            // ---- Interruption: mute immediately + stop bot ----
             FrameInner::System(SystemFrame::Interruption) => {
+                // Set mute gate BEFORE anything else so run_socket drops
+                // in-flight chunks as fast as possible.
+                self.state.muted.store(true, Ordering::Relaxed);
+
                 if self.state.bot_speaking.swap(false, Ordering::Relaxed) {
                     log::debug!("BaseOutputTransport: bot stopped speaking (interruption)");
                     processor.broadcast_frame(Frame::bot_stopped_speaking()).await?;

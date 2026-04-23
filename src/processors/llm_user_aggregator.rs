@@ -22,7 +22,9 @@ struct State {
 ///   B. TranscriptionFrame arrives while user_speaking == false
 ///      (transcript arrived after VAD stop — the race condition fix).
 ///
-/// This covers both orderings without any additional pending flag.
+/// Interruption:
+///   On VADUserStartedSpeaking, if interruptions are allowed, broadcasts
+///   InterruptionFrame in both directions so the bot stops immediately.
 ///
 /// TranscriptionFrames are consumed here — not forwarded downstream.
 /// Everything else passes through unchanged.
@@ -88,6 +90,14 @@ impl FrameHandler for LLMUserAggregator {
             FrameInner::System(SystemFrame::VADUserStartedSpeaking { .. }) => {
                 self.state.lock().unwrap().user_speaking = true;
                 processor.push_frame(frame, direction).await?;
+
+                // Interrupt the bot if interruptions are enabled in PipelineParams.
+                // This floods InterruptionFrame both upstream (stops LLM) and
+                // downstream (stops TTS + clears output audio queue).
+                if processor.interruptions_allowed() {
+                    log::debug!("LLMUserAggregator: user started speaking — broadcasting interruption");
+                    processor.broadcast_interruption().await?;
+                }
             }
 
             FrameInner::System(SystemFrame::VADUserStoppedSpeaking { .. }) => {
