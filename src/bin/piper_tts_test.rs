@@ -95,18 +95,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let printer = FrameProcessor::new("AudioPrinter", Box::new(AudioPrinter::new()), false);
 
     let task = PipelineTask::new(
-        vec![tts, printer],
-        let task = PipelineTask::new(
-        vec![
-            transport.input(),
-            stt,
-            user_agg,
-            llm,
-            assistant_agg,
-            tts,
-            transport.output(),
-        ],
-        PipelineParams { allow_interruptions: true, ..PipelineParams::default() }
+    vec![
+        transport.input(),
+        stt,
+        user_agg,
+        llm,
+        assistant_agg,
+        tts,
+        transport.output(),
+    ],
+    PipelineParams { allow_interruptions: true, ..PipelineParams::default() },
     );
 
     let push_tx = task.push_sender();
