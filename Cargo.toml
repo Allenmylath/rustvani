@@ -40,10 +40,6 @@ name = "sarvam_tts_test"
 path = "src/bin/sarvam_tts_test.rs"
 
 [[bin]]
-name = "piper_tts_test"
-path = "src/bin/piper_tts_test.rs"
-
-[[bin]]
 name = "websocket_server_piper"
 path = "src/bin/websocket_server_piper.rs"
 
