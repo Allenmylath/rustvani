@@ -219,14 +219,6 @@ async fn run_audio_task(
                     if let Some(window) = window_opt {
                         let confidence = analyzer.voice_confidence(window.clone()).await;
 
-                        // Log every 10th inference so we don't flood
-                        if chunk_count % 10 == 0 {
-                            log::info!(
-                                "VAD: chunk={} confidence={:.3} bytes={}",
-                                chunk_count, confidence, window.len()
-                            );
-                        }
-
                         let new_vad_state = {
                             let mut machine = state.vad_machine.lock().unwrap();
                             machine.as_mut().map(|m| m.advance(confidence, &window))
@@ -272,12 +264,6 @@ async fn run_audio_task(
                                 _ => {}
                             }
                         }
-                    } else if chunk_count <= 5 {
-                        // Log first few chunks to confirm audio is arriving
-                        log::info!(
-                            "VAD: chunk={} buffering... audio_bytes={}",
-                            chunk_count, data.audio.len()
-                        );
                     }
                 }
             }
