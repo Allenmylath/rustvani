@@ -128,7 +128,7 @@ impl BaseObserver for LatencyObserver {
         match event.frame.kind() {
             FrameKind::InputAudioRaw
             | FrameKind::OutputAudioRaw
-            | FrameKind::LLMTextFrame => {}
+            | FrameKind::LLMText => {}
             _ => {
                 log::info!(
                     "[conn={}] [{:.3}] {:>40}  @  {}",
