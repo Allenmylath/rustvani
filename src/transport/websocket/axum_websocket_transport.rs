@@ -59,7 +59,7 @@ const AUDIO_OUT_CHANNEL_CAP: usize = 500;
 /// Send interval — one chunk every 5 ms (half of the 10 ms chunk duration).
 /// Mirrors Python's `_send_interval = (chunk_size / sample_rate) / 2` logic.
 /// Keeps the client buffer near-zero so interruption is felt immediately.
-const SEND_INTERVAL: Duration = Duration::from_millis(5);
+const SEND_INTERVAL: Duration = Duration::from_millis(10);
 
 impl WebSocketTransport {
     pub fn new(name: &str, params: WebSocketParams) -> Self {
