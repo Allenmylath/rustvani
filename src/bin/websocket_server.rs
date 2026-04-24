@@ -11,7 +11,7 @@
 //!     → SarvamTts
 //!     → WebSocketTransport.output()
 //!
-//! LatencyObserver logs every frame (except InputAudioRaw/OutputAudioRaw)
+//! LatencyObserver logs every frame (except InputAudioRaw/OutputAudioRaw/LLMTextFrame)
 //! with processor name, plus per-turn stage deltas:
 //!   t0  VADUserStoppedSpeaking  — user finished speaking
 //!   t1  Transcription           — STT returned
@@ -124,9 +124,11 @@ impl BaseObserver for LatencyObserver {
         let ts  = event.timestamp;
         let cid = self.conn_id;
 
-        // ---- Full frame log (skip audio flood) ----
+        // ---- Full frame log (skip high-frequency frames) ----
         match event.frame.kind() {
-            FrameKind::InputAudioRaw | FrameKind::OutputAudioRaw => {}
+            FrameKind::InputAudioRaw
+            | FrameKind::OutputAudioRaw
+            | FrameKind::LLMTextFrame => {}
             _ => {
                 log::info!(
                     "[conn={}] [{:.3}] {:>40}  @  {}",
