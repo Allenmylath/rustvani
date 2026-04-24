@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use tokio::sync::mpsc;
@@ -55,6 +56,11 @@ pub struct WebSocketTransport {
 /// 5 s of buffering headroom — about 240 KB of memory.
 const AUDIO_OUT_CHANNEL_CAP: usize = 500;
 
+/// Send interval — one chunk every 5 ms (half of the 10 ms chunk duration).
+/// Mirrors Python's `_send_interval = (chunk_size / sample_rate) / 2` logic.
+/// Keeps the client buffer near-zero so interruption is felt immediately.
+const SEND_INTERVAL: Duration = Duration::from_millis(5);
+
 impl WebSocketTransport {
     pub fn new(name: &str, params: WebSocketParams) -> Self {
         let base = Arc::new(BaseTransport::new(name, params.transport));
@@ -62,7 +68,6 @@ impl WebSocketTransport {
         let (audio_out_tx, audio_out_rx) = mpsc::channel::<Vec<u8>>(AUDIO_OUT_CHANNEL_CAP);
         base.set_audio_out_tx(audio_out_tx);
 
-        // Get the mute gate from the output transport so run_socket can share it.
         let mute_gate = base.mute_gate();
 
         Self {
@@ -82,11 +87,23 @@ impl WebSocketTransport {
 
     /// Drive the WebSocket connection until it closes.
     ///
-    /// Two arms:
-    ///   - Incoming binary frames from client → push_audio_frame (VAD/STT path)
-    ///   - Outgoing audio bytes from pipeline → send to client (TTS path)
-    ///     but ONLY when mute_gate is false — stale chunks after an interruption
-    ///     are dropped silently so the user hears the bot stop immediately.
+    /// Three-arm select loop:
+    ///
+    ///   Arm 1 — `socket.recv()`: always active.
+    ///            Incoming binary frames from the client are pushed into the
+    ///            VAD/STT pipeline immediately regardless of send timing.
+    ///
+    ///   Arm 2 — `audio_out_rx.recv()`: active only when `pending_chunk` is empty.
+    ///            Pulls the next 10 ms chunk from the pipeline into a staging slot.
+    ///            While muted (interruption in progress) it drains the channel
+    ///            silently and resets the send timer so the next bot turn starts clean.
+    ///
+    ///   Arm 3 — `sleep_until(next_send_time)`: active only when `pending_chunk` is Some.
+    ///            Fires at the scheduled deadline and sends the staged chunk.
+    ///            Advances the deadline by SEND_INTERVAL after each send.
+    ///
+    /// This design ensures the incoming-audio arm is never blocked by the
+    /// outgoing pacing sleep, preserving VAD / interruption responsiveness.
     pub async fn run_socket(
         &self,
         mut socket: WebSocket,
@@ -102,9 +119,17 @@ impl WebSocketTransport {
         let base      = self.base.clone();
         let mute_gate = self.mute_gate.clone();
 
+        // Pacing state.
+        // `pending_chunk`  — staged audio waiting for its send deadline.
+        // `next_send_time` — when to fire arm 3. None means no active bot turn.
+        let mut pending_chunk:  Option<Vec<u8>>              = None;
+        let mut next_send_time: Option<tokio::time::Instant> = None;
+
         loop {
             tokio::select! {
-                // ---- Incoming audio: client → pipeline (STT path) ----
+                // ----------------------------------------------------------------
+                // Arm 1: incoming user audio → pipeline (always active)
+                // ----------------------------------------------------------------
                 msg = socket.recv() => {
                     match msg {
                         Some(Ok(Message::Binary(bytes))) => {
@@ -123,32 +148,65 @@ impl WebSocketTransport {
                     }
                 }
 
-                // ---- Outgoing audio: pipeline → client (TTS path) ----
-                audio_bytes = audio_out_rx.recv() => {
+                // ----------------------------------------------------------------
+                // Arm 2: pull next chunk into the pending slot
+                // Active only when the slot is empty — prevents skipping the timer.
+                // ----------------------------------------------------------------
+                audio_bytes = audio_out_rx.recv(), if pending_chunk.is_none() => {
                     match audio_bytes {
                         Some(bytes) => {
-                            // Drop stale chunks while muted. The mute gate is
-                            // set true by BaseOutputTransport on InterruptionFrame
-                            // and cleared automatically on the first new
-                            // OutputAudioRaw after the bot starts speaking again.
                             if mute_gate.load(Ordering::Relaxed) {
+                                // Interruption active — drain silently.
+                                // Reset timer so next bot turn starts with a
+                                // fresh deadline rather than an inherited offset.
+                                next_send_time = None;
                                 continue;
                             }
-                            if socket.send(Message::Binary(bytes.into())).await.is_err() {
+
+                            pending_chunk = Some(bytes);
+
+                            // Initialise deadline at the start of each bot turn.
+                            if next_send_time.is_none() {
+                                next_send_time =
+                                    Some(tokio::time::Instant::now() + SEND_INTERVAL);
+                            }
+                        }
+                        None => {
+                            // Pipeline shut down — exit the loop.
+                            break;
+                        }
+                    }
+                }
+
+                // ----------------------------------------------------------------
+                // Arm 3: paced send — fires when the deadline arrives
+                // Active only when there is a staged chunk to send.
+                // `std::future::pending()` makes this arm dormant (no busy-spin)
+                // when there is no active bot turn.
+                // ----------------------------------------------------------------
+                _ = async {
+                    if let Some(t) = next_send_time {
+                        tokio::time::sleep_until(t).await
+                    } else {
+                        std::future::pending::<()>().await
+                    }
+                }, if pending_chunk.is_some() => {
+                    if let Some(chunk) = pending_chunk.take() {
+                        if !mute_gate.load(Ordering::Relaxed) {
+                            if socket.send(Message::Binary(chunk.into())).await.is_err() {
                                 log::warn!("WebSocketTransport: failed to send audio to client");
                                 break;
                             }
                         }
-                        None => {
-                            // Channel closed — pipeline has shut down.
-                            break;
-                        }
+                        // Advance the deadline whether we sent or were muted,
+                        // so timing stays consistent across an interrupted turn.
+                        next_send_time = next_send_time.map(|t| t + SEND_INTERVAL);
                     }
                 }
             }
         }
 
-        // Terminate the pipeline.
+        // Signal pipeline shutdown.
         let _ = push_tx
             .send((Frame::end(), FrameDirection::Downstream))
             .await;

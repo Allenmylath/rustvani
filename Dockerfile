@@ -39,6 +39,7 @@ RUN cargo test --no-run
 
 # --- Make libonnxruntime findable at runtime ---
 RUN cp /opt/onnxruntime/lib/libonnxruntime.so* /usr/local/lib/ \
+    && ln -sf /usr/local/lib/libonnxruntime.so.1.22.0 /usr/local/lib/libonnxruntime.so.1 \
     && ldconfig
 
 RUN printf '#!/bin/bash\nif [ "$MODE" = "test" ]; then\n  exec cargo test -- --test-output immediate\nelse\n  exec /app/target/release/websocket_server\nfi\n' \
