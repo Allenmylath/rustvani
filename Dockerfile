@@ -24,7 +24,7 @@ COPY Cargo.toml .
 COPY src/ src/
 # --- Copy Silero ONNX model from local source tree ---
 # Pinned to v4.0 — inference API (input/state/sr) matches v4 only
-COPY src/vad/data/silero.onnx silero_vad.onnx
+COPY src/vad/data/silero.onnx silero.onnx
 # --- Copy Piper TTS models (downloaded locally, not committed to git) ---
 #COPY piper-models/ piper-models/
 # --- Build release binaries ---

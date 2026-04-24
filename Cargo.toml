@@ -7,9 +7,6 @@ edition = "2021"
 # Binaries
 # ---------------------------------------------------------------------------
 
-[[bin]]
-name = "vad_test"
-path = "src/bin/vad_test.rs"
 
 [[bin]]
 name = "pipeline_test"
@@ -56,8 +53,10 @@ futures         = "0.3"
 log             = "0.4"
 env_logger      = "0.11"
 
+
 # ONNX Runtime — for Silero VAD
-ort             = { version = "2.0.0-rc.12", features = ["download-binaries"] }
+ort = { version = "=2.0.0-rc.10", features = ["ndarray", "download-binaries"] }
+ndarray = "0.16"
 
 # Audio
 hound           = "3"

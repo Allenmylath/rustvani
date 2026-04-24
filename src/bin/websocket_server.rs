@@ -21,16 +21,13 @@
 //!
 //! Wire protocol:
 //!   Client → Server : Binary WebSocket — raw i16 LE PCM, 16 kHz mono, 512-sample chunks
-//!   Server → Client : Binary WebSocket — raw i16 LE PCM at TTS sample rate (22050 Hz bulbul:v2)
+//!   Server → Client : Binary WebSocket — raw i16 LE PCM at TTS sample rate
 //!
 //! Environment variables:
 //!   SARVAM_API_KEY   — required (STT + TTS)
 //!   OPENAI_API_KEY   — required (LLM)
 //!   SYSTEM_PROMPT    — optional
 //!   RUST_LOG         — e.g. "info" or "rustvani=debug,info"
-//!
-//! Run:
-//!   SARVAM_API_KEY=your-key OPENAI_API_KEY=your-key cargo run --release --bin websocket_server
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -144,7 +141,6 @@ impl BaseObserver for LatencyObserver {
         let mut s = self.state.lock().unwrap();
 
         match event.frame.kind() {
-            // t0 — user stopped speaking
             FrameKind::VADUserStoppedSpeaking => {
                 if !s.in_turn {
                     s.turn       += 1;
@@ -161,7 +157,6 @@ impl BaseObserver for LatencyObserver {
                 }
             }
 
-            // t1 — STT transcript
             FrameKind::Transcription => {
                 if s.in_turn && s.t_stt.is_none() {
                     s.t_stt = Some(ts);
@@ -173,7 +168,6 @@ impl BaseObserver for LatencyObserver {
                 }
             }
 
-            // t2 — LLM first token
             FrameKind::LLMFullResponseStart => {
                 if s.in_turn && s.t_llm_start.is_none() {
                     s.t_llm_start = Some(ts);
@@ -186,7 +180,6 @@ impl BaseObserver for LatencyObserver {
                 }
             }
 
-            // t3 — LLM stream complete
             FrameKind::LLMFullResponseEnd => {
                 if s.in_turn && s.t_llm_end.is_none() {
                     s.t_llm_end = Some(ts);
@@ -199,7 +192,6 @@ impl BaseObserver for LatencyObserver {
                 }
             }
 
-            // t4 — TTS first audio chunk
             FrameKind::OutputAudioRaw => {
                 if s.in_turn && !s.tts_first {
                     s.tts_first = true;
@@ -248,6 +240,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
             return;
         }
     };
+    log::info!("[conn={}] VAD initialized, confidence=0.3 min_volume=0.0", conn_id);
 
     // ---- Transport ----
     let transport = WebSocketTransport::new(
@@ -260,7 +253,11 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
                 audio_in_passthrough:     true,
                 audio_in_stream_on_start: true,
                 vad_analyzer:             Some(vad_analyzer),
-                vad_params:               VadParams::default(),
+                vad_params:               VadParams {
+                    confidence: 0.4,
+                    min_volume: 0.1,
+                    ..VadParams::default()
+                },
                 ..TransportParams::default()
             },
         },
@@ -293,7 +290,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
 
     let tts = match SarvamTtsHandler::new(SarvamTtsConfig {
         api_key:  app_state.sarvam_api_key.clone(),
-        model: "bulbul:v3".to_string(),
+        model:    "bulbul:v3".to_string(),
         voice:    "aditya".to_string(),
         language: "en-IN".to_string(),
         ..SarvamTtsConfig::default()
@@ -316,7 +313,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
             tts,
             transport.output(),
         ],
-        PipelineParams { allow_interruptions: true, ..PipelineParams::default() }
+        PipelineParams { allow_interruptions: true, ..PipelineParams::default() },
     );
 
     let push_tx  = task.push_sender();
