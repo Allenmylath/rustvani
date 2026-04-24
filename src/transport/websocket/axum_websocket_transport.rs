@@ -56,7 +56,7 @@ pub struct WebSocketTransport {
 /// 5 s of buffering headroom — about 240 KB of memory.
 const AUDIO_OUT_CHANNEL_CAP: usize = 500;
 
-/// Send interval — one chunk every 5 ms (half of the 10 ms chunk duration).
+/// Send interval — one chunk every 10 ms, matching the chunk duration.
 /// Mirrors Python's `_send_interval = (chunk_size / sample_rate) / 2` logic.
 /// Keeps the client buffer near-zero so interruption is felt immediately.
 const SEND_INTERVAL: Duration = Duration::from_millis(10);
@@ -95,15 +95,25 @@ impl WebSocketTransport {
     ///
     ///   Arm 2 — `audio_out_rx.recv()`: active only when `pending_chunk` is empty.
     ///            Pulls the next 10 ms chunk from the pipeline into a staging slot.
-    ///            While muted (interruption in progress) it drains the channel
-    ///            silently and resets the send timer so the next bot turn starts clean.
+    ///            When muted (interruption in progress) it drains the channel
+    ///            silently and resets next_send_time to None so the next bot
+    ///            turn always starts with a fresh deadline.
     ///
     ///   Arm 3 — `sleep_until(next_send_time)`: active only when `pending_chunk` is Some.
     ///            Fires at the scheduled deadline and sends the staged chunk.
     ///            Advances the deadline by SEND_INTERVAL after each send.
     ///
-    /// This design ensures the incoming-audio arm is never blocked by the
-    /// outgoing pacing sleep, preserving VAD / interruption responsiveness.
+    /// Deadline anchoring (the liveness fix):
+    ///
+    ///   next_send_time is re-anchored to `now + SEND_INTERVAL` whenever the
+    ///   staged chunk arrives and the existing deadline is in the past (or None).
+    ///   This covers three cases:
+    ///     1. First-ever chunk — next_send_time is None.
+    ///     2. New turn after STT/LLM gap — next_send_time is stale.
+    ///     3. Resume after interruption — next_send_time was reset to None.
+    ///   Without this, a stale deadline causes arm 3 to fire for every chunk
+    ///   immediately, dumping the entire TTS response into the client buffer
+    ///   at once (observed: 15+ seconds of buffered audio).
     pub async fn run_socket(
         &self,
         mut socket: WebSocket,
@@ -157,18 +167,26 @@ impl WebSocketTransport {
                         Some(bytes) => {
                             if mute_gate.load(Ordering::Relaxed) {
                                 // Interruption active — drain silently.
-                                // Reset timer so next bot turn starts with a
-                                // fresh deadline rather than an inherited offset.
+                                // Reset deadline to None so the next bot turn
+                                // anchors cleanly via the stale-check below.
                                 next_send_time = None;
                                 continue;
                             }
 
                             pending_chunk = Some(bytes);
 
-                            // Initialise deadline at the start of each bot turn.
-                            if next_send_time.is_none() {
-                                next_send_time =
-                                    Some(tokio::time::Instant::now() + SEND_INTERVAL);
+                            // Anchor the deadline to now if:
+                            //   - first chunk (None), OR
+                            //   - stale deadline from a previous turn
+                            //     (gap between turns > remaining interval)
+                            //
+                            // Without this guard, next_send_time sits in the
+                            // past for the entire STT+LLM latency window and
+                            // arm 3 fires for every chunk with zero sleep,
+                            // flooding the client buffer.
+                            let now = tokio::time::Instant::now();
+                            if next_send_time.map_or(true, |t| t <= now) {
+                                next_send_time = Some(now + SEND_INTERVAL);
                             }
                         }
                         None => {
