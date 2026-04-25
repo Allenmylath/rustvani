@@ -46,18 +46,23 @@ pub struct WebSocketTransport {
     /// Shared with BaseOutputTransport. When true, run_socket drops outgoing
     /// audio chunks so the user hears the bot stop immediately on interruption.
     mute_gate:    Arc<AtomicBool>,
+    /// Send interval — derived from `audio_out_10ms_chunks`.
+    /// Mirrors Python's `_send_interval = (chunk_size / sample_rate) / 2`
+    /// which simplifies to `(10ms × chunks) / 2`.
+    send_interval: Duration,
 }
 
-
-const AUDIO_OUT_CHANNEL_CAP: usize = 125;
-
-/// Send interval — one chunk every 10 ms, matching the chunk duration.
-/// Mirrors Python's `_send_interval = (chunk_size / sample_rate) / 2` logic.
-/// Keeps the client buffer near-zero so interruption is felt immediately.
-const SEND_INTERVAL: Duration = Duration::from_millis(20);
+/// Channel capacity sized for chunked audio.
+///
+/// With 40 ms chunks (audio_out_10ms_chunks=4) a 5-second TTS response
+/// produces ~125 chunks.  Cap = 150 gives comfortable headroom.
+const AUDIO_OUT_CHANNEL_CAP: usize = 150;
 
 impl WebSocketTransport {
     pub fn new(name: &str, params: WebSocketParams) -> Self {
+        let chunks = params.transport.audio_out_10ms_chunks.max(1) as u64;
+        let send_interval = Duration::from_millis((10 * chunks) / 2);
+
         let base = Arc::new(BaseTransport::new(name, params.transport));
 
         let (audio_out_tx, audio_out_rx) = mpsc::channel::<Vec<u8>>(AUDIO_OUT_CHANNEL_CAP);
@@ -69,6 +74,7 @@ impl WebSocketTransport {
             base,
             audio_out_rx: std::sync::Mutex::new(Some(audio_out_rx)),
             mute_gate,
+            send_interval,
         }
     }
 
@@ -89,26 +95,16 @@ impl WebSocketTransport {
     ///            VAD/STT pipeline immediately regardless of send timing.
     ///
     ///   Arm 2 — `audio_out_rx.recv()`: active only when `pending_chunk` is empty.
-    ///            Pulls the next 10 ms chunk from the pipeline into a staging slot.
+    ///            Pulls the next chunk from the pipeline into a staging slot.
     ///            When muted (interruption in progress) it drains the channel
     ///            silently and resets next_send_time to None so the next bot
     ///            turn always starts with a fresh deadline.
     ///
     ///   Arm 3 — `sleep_until(next_send_time)`: active only when `pending_chunk` is Some.
     ///            Fires at the scheduled deadline and sends the staged chunk.
-    ///            Advances the deadline by SEND_INTERVAL after each send.
-    ///
-    /// Deadline anchoring (the liveness fix):
-    ///
-    ///   next_send_time is re-anchored to `now + SEND_INTERVAL` whenever the
-    ///   staged chunk arrives and the existing deadline is in the past (or None).
-    ///   This covers three cases:
-    ///     1. First-ever chunk — next_send_time is None.
-    ///     2. New turn after STT/LLM gap — next_send_time is stale.
-    ///     3. Resume after interruption — next_send_time was reset to None.
-    ///   Without this, a stale deadline causes arm 3 to fire for every chunk
-    ///   immediately, dumping the entire TTS response into the client buffer
-    ///   at once (observed: 15+ seconds of buffered audio).
+    ///            Uses Python-style drift handling: if the deadline was already
+    ///            in the past (no actual sleep), resets to now + interval.
+    ///            If we slept normally, advances the absolute timeline.
     pub async fn run_socket(
         &self,
         mut socket: WebSocket,
@@ -123,6 +119,7 @@ impl WebSocketTransport {
 
         let base      = self.base.clone();
         let mute_gate = self.mute_gate.clone();
+        let send_interval = self.send_interval;
 
         // Pacing state.
         // `pending_chunk`  — staged audio waiting for its send deadline.
@@ -156,32 +153,27 @@ impl WebSocketTransport {
                 // ----------------------------------------------------------------
                 // Arm 2: pull next chunk into the pending slot
                 // Active only when the slot is empty — prevents skipping the timer.
+                // Only anchors the deadline when None (first chunk or post-
+                // interruption). Drift correction happens in arm 3.
                 // ----------------------------------------------------------------
                 audio_bytes = audio_out_rx.recv(), if pending_chunk.is_none() => {
                     match audio_bytes {
                         Some(bytes) => {
                             if mute_gate.load(Ordering::Relaxed) {
                                 // Interruption active — drain silently.
-                                // Reset deadline to None so the next bot turn
-                                // anchors cleanly via the stale-check below.
+                                // Reset deadline so the next bot turn starts
+                                // with a fresh anchor.
                                 next_send_time = None;
                                 continue;
                             }
 
                             pending_chunk = Some(bytes);
 
-                            // Anchor the deadline to now if:
-                            //   - first chunk (None), OR
-                            //   - stale deadline from a previous turn
-                            //     (gap between turns > remaining interval)
-                            //
-                            // Without this guard, next_send_time sits in the
-                            // past for the entire STT+LLM latency window and
-                            // arm 3 fires for every chunk with zero sleep,
-                            // flooding the client buffer.
-                            let now = tokio::time::Instant::now();
-                            if next_send_time.map_or(true, |t| t <= now) {
-                                next_send_time = Some(now + SEND_INTERVAL);
+                            // Only set deadline if there isn't one.
+                            // First chunk of a new turn or resume after
+                            // interruption — arm 3 handles everything else.
+                            if next_send_time.is_none() {
+                                next_send_time = Some(tokio::time::Instant::now() + send_interval);
                             }
                         }
                         None => {
@@ -194,8 +186,12 @@ impl WebSocketTransport {
                 // ----------------------------------------------------------------
                 // Arm 3: paced send — fires when the deadline arrives
                 // Active only when there is a staged chunk to send.
-                // `std::future::pending()` makes this arm dormant (no busy-spin)
-                // when there is no active bot turn.
+                //
+                // Python-style drift handling after each send:
+                //   - If deadline was in the past (sleep_duration == 0),
+                //     we fell behind → reset to now + interval.
+                //   - If we actually slept, we're on time → advance the
+                //     absolute timeline by interval.
                 // ----------------------------------------------------------------
                 _ = async {
                     if let Some(t) = next_send_time {
@@ -211,9 +207,18 @@ impl WebSocketTransport {
                                 break;
                             }
                         }
-                        // Advance the deadline whether we sent or were muted,
-                        // so timing stays consistent across an interrupted turn.
-                        next_send_time = next_send_time.map(|t| t + SEND_INTERVAL);
+
+                        // Python-style drift correction.
+                        let now = tokio::time::Instant::now();
+                        if let Some(t) = next_send_time {
+                            if t <= now {
+                                // Behind schedule — reset clock to now.
+                                next_send_time = Some(now + send_interval);
+                            } else {
+                                // On time — advance absolute timeline.
+                                next_send_time = Some(t + send_interval);
+                            }
+                        }
                     }
                 }
             }
