@@ -17,7 +17,6 @@ use super::params::TransportParams;
 // ---------------------------------------------------------------------------
 
 struct OutputTransportState {
-    #[allow(dead_code)]
     params: TransportParams,
 
     /// True while OutputAudioRaw frames are being sent.
@@ -34,12 +33,14 @@ struct OutputTransportState {
 
     /// Accumulates incoming TTS audio bytes between chunk boundaries.
     /// Drained in `chunk_size`-byte pieces so each mpsc send is exactly
-    /// one 10 ms frame.  Remainder carries over to the next TTS blob.
+    /// one output chunk.  Remainder carries over to the next TTS blob.
     audio_buffer: Mutex<Vec<u8>>,
 
-    /// Bytes per 10 ms output chunk.
+    /// Bytes per output chunk.
     /// Computed dynamically from the first OutputAudioRaw frame:
-    ///   chunk_size = (sample_rate / 100) × channels × 2   (16-bit PCM)
+    ///   chunk_size = (sample_rate / 100) × channels × 2 × audio_out_10ms_chunks
+    ///              = 10ms_bytes × audio_out_10ms_chunks
+    /// e.g. at 24 kHz mono, 4 chunks → 480 × 4 = 1920 bytes (40 ms)
     /// Stored so we can log it once and clear the buffer on interruption.
     chunk_size: AtomicU32,
 }
@@ -96,18 +97,26 @@ impl FrameHandler for BaseOutputTransport {
         direction: FrameDirection,
     ) -> Result<()> {
         match &frame.inner {
-            // ---- Audio output: chunk into 10 ms pieces ----
+            // ---- Audio output: chunk into N×10ms pieces ----
             FrameInner::Data(DataFrame::OutputAudioRaw(audio)) => {
                 // New bot audio arriving — clear the mute gate so run_socket
                 // starts sending again.
                 self.state.muted.store(false, Ordering::Relaxed);
 
-                // Compute chunk size from this frame's sample rate.
-                // Formula: (sample_rate / 100) × channels × 2  (16-bit PCM)
-                // At 24 kHz mono → 240 samples × 2 bytes = 480 bytes per 10 ms
-                // At 22050 Hz mono → 220 samples × 2 bytes = 440 bytes per 10 ms
+                // Compute chunk size from this frame's sample rate and the
+                // configurable 10ms multiplier.
+                //
+                // Base 10ms bytes = (sample_rate / 100) × channels × 2  (16-bit PCM)
+                // Chunk size      = base_10ms × audio_out_10ms_chunks
+                //
+                // Examples (mono):
+                //   audio_out_10ms_chunks=1, 24 kHz → 480 B   (10 ms)
+                //   audio_out_10ms_chunks=4, 24 kHz → 1920 B  (40 ms)  ← Python default
+                //   audio_out_10ms_chunks=4, 16 kHz → 1280 B  (40 ms)
                 let channels = audio.num_channels.max(1) as u32;
-                let new_chunk_size = (audio.sample_rate / 100) * channels * 2;
+                let multiplier = self.state.params.audio_out_10ms_chunks.max(1);
+                let base_10ms = (audio.sample_rate / 100) * channels * 2;
+                let new_chunk_size = base_10ms * multiplier;
 
                 if new_chunk_size == 0 {
                     log::warn!(
@@ -122,10 +131,12 @@ impl FrameHandler for BaseOutputTransport {
                 let prev = self.state.chunk_size.swap(new_chunk_size, Ordering::Relaxed);
                 if prev != new_chunk_size {
                     log::info!(
-                        "BaseOutputTransport: 10ms chunk_size={}B (sr={}, ch={})",
+                        "BaseOutputTransport: chunk_size={}B ({}ms) (sr={}, ch={}, 10ms_chunks={})",
                         new_chunk_size,
+                        multiplier * 10,
                         audio.sample_rate,
                         channels,
+                        multiplier,
                     );
                 }
 
@@ -137,7 +148,7 @@ impl FrameHandler for BaseOutputTransport {
                     processor.broadcast_frame(Frame::bot_started_speaking()).await?;
                 }
 
-                // Append to buffer and extract 10 ms chunks.
+                // Append to buffer and extract chunks.
                 let chunks: Vec<Vec<u8>> = {
                     let mut buf = self.state.audio_buffer.lock().unwrap();
                     buf.extend_from_slice(&audio.audio);
