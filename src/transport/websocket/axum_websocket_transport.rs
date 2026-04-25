@@ -48,18 +48,13 @@ pub struct WebSocketTransport {
     mute_gate:    Arc<AtomicBool>,
 }
 
-/// Channel capacity sized for 10 ms chunked audio.
-///
-/// With 10 ms chunks the output transport pushes many small messages
-/// instead of a few large blobs.  At 24 kHz mono (480 B/chunk) a
-/// 5-second TTS response produces ~500 chunks.  Cap = 500 gives
-/// 5 s of buffering headroom — about 240 KB of memory.
-const AUDIO_OUT_CHANNEL_CAP: usize = 500;
+
+const AUDIO_OUT_CHANNEL_CAP: usize = 125;
 
 /// Send interval — one chunk every 10 ms, matching the chunk duration.
 /// Mirrors Python's `_send_interval = (chunk_size / sample_rate) / 2` logic.
 /// Keeps the client buffer near-zero so interruption is felt immediately.
-const SEND_INTERVAL: Duration = Duration::from_millis(2);
+const SEND_INTERVAL: Duration = Duration::from_millis(20);
 
 impl WebSocketTransport {
     pub fn new(name: &str, params: WebSocketParams) -> Self {
