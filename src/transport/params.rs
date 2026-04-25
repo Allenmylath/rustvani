@@ -19,6 +19,7 @@ pub struct TransportParams {
     pub vad_analyzer:             Option<Arc<dyn VadAnalyzer>>,
     /// VAD tuning parameters. Only used when `vad_analyzer` is `Some`.
     pub vad_params:               VadParams,
+    pub audio_out_10ms_chunks:     u32,
 }
 
 impl std::fmt::Debug for TransportParams {
