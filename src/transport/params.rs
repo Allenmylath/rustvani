@@ -37,6 +37,7 @@ impl std::fmt::Debug for TransportParams {
             .field("audio_out_bitrate",         &self.audio_out_bitrate)
             .field("vad_analyzer",              &self.vad_analyzer.as_ref().map(|_| "Some(...)"))
             .field("vad_params",                &self.vad_params)
+            .field("audio_out_10ms_chunks", &self.audio_out_10ms_chunks)
             .finish()
     }
 }
@@ -56,6 +57,7 @@ impl Default for TransportParams {
             audio_out_bitrate:        96_000,
             vad_analyzer:             None,
             vad_params:               VadParams::default(),
+            audio_out_10ms_chunks:    4,
         }
     }
 }
