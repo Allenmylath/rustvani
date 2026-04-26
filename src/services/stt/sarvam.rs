@@ -15,8 +15,8 @@
 //!
 //! Frames consumed:
 //!   - StartFrame             → connects WebSocket
-//!   - InputAudioRaw          → base64 encodes PCM, sends to Sarvam
-//!   - VADUserStoppedSpeaking → sends flush signal
+//!   - InputAudioRaw          → denoise → base64 encode → send to Sarvam
+//!   - VADUserStoppedSpeaking → flush noise filter → send flush signal
 //!   - EndFrame / CancelFrame → disconnects WebSocket
 //!
 //! Frames produced:
@@ -41,6 +41,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::audio_process::noisefilter::RNNoiseFilter;
 use crate::error::Result;
 use crate::frames::{
     ControlFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,
@@ -101,6 +102,10 @@ pub struct SarvamSttConfig {
 
     /// Receive VAD signals from server (speech_start / speech_end events).
     pub vad_signals: bool,
+
+    /// Enable RNNoise noise suppression before sending audio to Sarvam.
+    /// Default: true.
+    pub noise_reduction: bool,
 }
 
 impl Default for SarvamSttConfig {
@@ -114,6 +119,7 @@ impl Default for SarvamSttConfig {
             encoding:             "wav".to_string(),
             high_vad_sensitivity: false,
             vad_signals:          false,
+            noise_reduction:      true,
         }
     }
 }
@@ -209,13 +215,26 @@ impl SarvamSttState {
 pub struct SarvamSttHandler {
     config: SarvamSttConfig,
     state:  Arc<Mutex<SarvamSttState>>,
+    /// Noise filter shared with the receive task (for reset on transcript).
+    noise_filter: Option<Arc<Mutex<RNNoiseFilter>>>,
 }
 
 impl SarvamSttHandler {
     pub fn new(config: SarvamSttConfig) -> Self {
+        let noise_filter = if config.noise_reduction {
+            log::info!(
+                "SarvamStt: noise reduction enabled (sample_rate={})",
+                config.sample_rate
+            );
+            Some(Arc::new(Mutex::new(RNNoiseFilter::new(config.sample_rate))))
+        } else {
+            None
+        };
+
         Self {
             config,
             state: Arc::new(Mutex::new(SarvamSttState::new())),
+            noise_filter,
         }
     }
 
@@ -273,7 +292,8 @@ impl SarvamSttHandler {
 
         let send_task    = tokio::spawn(run_send_task(sink, ws_rx));
         let lang_fb      = self.config.language.clone();
-        let receive_task = tokio::spawn(run_receive_task(stream, processor, lang_fb));
+        let nf_clone     = self.noise_filter.clone();
+        let receive_task = tokio::spawn(run_receive_task(stream, processor, lang_fb, nf_clone));
 
         let mut state     = self.state.lock().await;
         state.ws_tx        = Some(ws_tx);
@@ -319,6 +339,21 @@ impl SarvamSttHandler {
 }
 
 // ---------------------------------------------------------------------------
+// Audio byte ↔ i16 helpers
+// ---------------------------------------------------------------------------
+
+fn bytes_to_i16(audio: &[u8]) -> Vec<i16> {
+    audio
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
+fn i16_to_bytes(samples: &[i16]) -> Vec<u8> {
+    samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+}
+
+// ---------------------------------------------------------------------------
 // FrameHandler impl
 // ---------------------------------------------------------------------------
 
@@ -338,11 +373,34 @@ impl FrameHandler for SarvamSttHandler {
 
             FrameInner::System(SystemFrame::InputAudioRaw(ref audio)) => {
                 processor.push_frame(frame.clone(), direction).await?;
-                self.send_audio(&audio.audio).await;
+
+                // Denoise then send
+                let out_bytes = if let Some(ref nf) = self.noise_filter {
+                    let pcm = bytes_to_i16(&audio.audio);
+                    let filtered = nf.lock().await.filter(&pcm);
+                    if filtered.is_empty() {
+                        // Buffering — nothing to send yet
+                        return Ok(());
+                    }
+                    i16_to_bytes(&filtered)
+                } else {
+                    audio.audio.clone()
+                };
+
+                self.send_audio(&out_bytes).await;
             }
 
             FrameInner::System(SystemFrame::VADUserStoppedSpeaking { .. }) => {
                 processor.push_frame(frame, direction).await?;
+
+                // Flush noise filter — send any remaining denoised audio
+                if let Some(ref nf) = self.noise_filter {
+                    let tail = nf.lock().await.flush();
+                    if !tail.is_empty() {
+                        self.send_audio(&i16_to_bytes(&tail)).await;
+                    }
+                }
+
                 self.send_flush().await;
             }
 
@@ -395,13 +453,20 @@ async fn run_receive_task(
     mut stream:          WsStream,
     processor:           FrameProcessor,
     language_fallback:   Option<String>,
+    noise_filter:        Option<Arc<Mutex<RNNoiseFilter>>>,
 ) {
     log::debug!("SarvamStt: receive task started");
 
     while let Some(result) = stream.next().await {
         match result {
             Ok(Message::Text(text)) => {
-                handle_message(text.as_str(), &processor, &language_fallback).await;
+                handle_message(
+                    text.as_str(),
+                    &processor,
+                    &language_fallback,
+                    &noise_filter,
+                )
+                .await;
             }
             Ok(Message::Close(_)) => {
                 log::info!("SarvamStt: server closed WebSocket");
@@ -424,6 +489,7 @@ async fn handle_message(
     text:              &str,
     processor:         &FrameProcessor,
     language_fallback: &Option<String>,
+    noise_filter:      &Option<Arc<Mutex<RNNoiseFilter>>>,
 ) {
     log::debug!("SarvamStt: raw message: {}", text);
 
@@ -437,7 +503,7 @@ async fn handle_message(
 
     match msg.msg_type.as_str() {
         "data" => {
-            handle_transcript(msg.data, processor, language_fallback).await;
+            handle_transcript(msg.data, processor, language_fallback, noise_filter).await;
         }
         "events" => {
             if let Some(data) = msg.data {
@@ -465,6 +531,7 @@ async fn handle_transcript(
     data:              Option<serde_json::Value>,
     processor:         &FrameProcessor,
     language_fallback: &Option<String>,
+    noise_filter:      &Option<Arc<Mutex<RNNoiseFilter>>>,
 ) {
     let data = match data {
         Some(d) => d,
@@ -482,6 +549,13 @@ async fn handle_transcript(
     };
 
     let language = t.language_code.or_else(|| language_fallback.clone());
+
+    // Reset noise filter — Sarvam's server-side VAD may have finalised
+    // this transcript without local VAD firing, so clear any buffered
+    // audio to start clean for the next utterance.
+    if let Some(ref nf) = noise_filter {
+        nf.lock().await.reset();
+    }
 
     let mut frame_data = TranscriptionData::new(text, "", time_now_iso8601());
     frame_data.language  = language;
