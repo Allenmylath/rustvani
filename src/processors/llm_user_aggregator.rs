@@ -25,6 +25,8 @@ struct State {
 /// Interruption:
 ///   On VADUserStartedSpeaking, if interruptions are allowed, broadcasts
 ///   InterruptionFrame in both directions so the bot stops immediately.
+///   On TranscriptionFrame, also broadcasts InterruptionFrame as a fallback
+///   in case VAD missed.  Duplicate interruptions are idempotent downstream.
 ///
 /// TranscriptionFrames are consumed here — not forwarded downstream.
 /// Everything else passes through unchanged.
@@ -91,9 +93,6 @@ impl FrameHandler for LLMUserAggregator {
                 self.state.lock().unwrap().user_speaking = true;
                 processor.push_frame(frame, direction).await?;
 
-                // Interrupt the bot if interruptions are enabled in PipelineParams.
-                // This floods InterruptionFrame both upstream (stops LLM) and
-                // downstream (stops TTS + clears output audio queue).
                 if processor.interruptions_allowed() {
                     log::debug!("LLMUserAggregator: user started speaking — broadcasting interruption");
                     processor.broadcast_interruption().await?;
@@ -102,7 +101,6 @@ impl FrameHandler for LLMUserAggregator {
 
             FrameInner::System(SystemFrame::VADUserStoppedSpeaking { .. }) => {
                 self.state.lock().unwrap().user_speaking = false;
-                // Push VAD frame first so downstream sees it before LLMContextFrame
                 processor.push_frame(frame, direction).await?;
                 // Path A: transcripts already arrived — flush now
                 self.flush_and_trigger(processor).await?;
@@ -124,12 +122,17 @@ impl FrameHandler for LLMUserAggregator {
                     state.user_speaking
                 };
 
+                // Transcript proves user spoke — interrupt even if VAD missed.
+                // Duplicate interruptions are idempotent downstream.
+                if processor.interruptions_allowed() {
+                    processor.broadcast_interruption().await?;
+                }
+
                 if !user_speaking {
                     // Path B: VAD already stopped — trigger immediately
                     log::debug!("LLMUserAggregator: late transcript, triggering now");
                     self.flush_and_trigger(processor).await?;
                 }
-                // if user_speaking == true: just accumulated, VAD stop will flush
             }
 
             FrameInner::System(SystemFrame::Interruption) => {
