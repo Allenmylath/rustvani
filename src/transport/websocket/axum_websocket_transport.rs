@@ -75,8 +75,10 @@ impl WebSocketTransport {
     ///
     /// Simple two-arm select:
     ///
-    ///   Arm 1 — `socket.recv()`: incoming user audio → pipeline via
-    ///            `push_audio_frame`. Always active.
+    ///   Arm 1 — `socket.recv()`: incoming user audio or control messages.
+    ///            Binary → pipeline via `push_audio_frame`.
+    ///            Text `{"type":"client_interruption"}` → push Interruption
+    ///            frame into the pipeline.
     ///
     ///   Arm 2 — `audio_out_rx.recv()`: outgoing pipeline messages.
     ///            `Audio(bytes)` → send binary frame immediately.
@@ -99,7 +101,7 @@ impl WebSocketTransport {
         loop {
             tokio::select! {
                 // ----------------------------------------------------------------
-                // Arm 1: incoming user audio → pipeline
+                // Arm 1: incoming user audio / control messages → pipeline
                 // ----------------------------------------------------------------
                 msg = socket.recv() => {
                     match msg {
@@ -107,11 +109,21 @@ impl WebSocketTransport {
                             let data = AudioRawData::new(bytes.to_vec(), 16_000, 1);
                             base.push_audio_frame(data).await;
                         }
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if msg.get("type").and_then(|v| v.as_str()) == Some("client_interruption") {
+                                    log::info!("WebSocketTransport: client-initiated interruption");
+                                    let _ = push_tx
+                                        .send((Frame::interruption(), FrameDirection::Downstream))
+                                        .await;
+                                }
+                            }
+                        }
                         Some(Ok(Message::Close(_))) | None => {
                             log::debug!("WebSocketTransport: client closed connection");
                             break;
                         }
-                        Some(Ok(_)) => {} // text / ping / pong — ignore
+                        Some(Ok(_)) => {} // ping / pong — ignore
                         Some(Err(e)) => {
                             log::warn!("WebSocketTransport: socket error: {}", e);
                             break;
