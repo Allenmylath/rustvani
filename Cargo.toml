@@ -52,6 +52,8 @@ thiserror       = "1"
 futures         = "0.3"
 log             = "0.4"
 env_logger      = "0.11"
+nnnoiseless     = "0.1"
+rubato          = "0.14"
 
 
 # ONNX Runtime — for Silero VAD
