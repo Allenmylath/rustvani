@@ -1,11 +1,10 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use tokio::sync::mpsc;
 
 use crate::frames::{FrameDirection, FrameHandler, FrameProcessor};
 use super::input::BaseInputTransport;
-use super::output::BaseOutputTransport;
+use super::output::{BaseOutputTransport, OutputMessage};
 use super::params::TransportParams;
 
 // ---------------------------------------------------------------------------
@@ -55,7 +54,7 @@ impl BaseTransport {
     }
 
     /// Wire up audio output to a channel.
-    pub fn set_audio_out_tx(&self, tx: mpsc::Sender<Vec<u8>>) {
+    pub fn set_audio_out_tx(&self, tx: mpsc::Sender<OutputMessage>) {
         self.output_transport.set_audio_out_tx(tx);
     }
 
@@ -67,12 +66,6 @@ impl BaseTransport {
     /// Clone the audio sender for transports that need to own it.
     pub fn audio_sender(&self) -> tokio::sync::mpsc::Sender<crate::frames::AudioRawData> {
         self.input_transport.audio_sender()
-    }
-
-    /// Shared mute gate — pass to run_socket so it can drop stale audio
-    /// chunks immediately when the user interrupts the bot.
-    pub fn mute_gate(&self) -> Arc<AtomicBool> {
-        self.output_transport.mute_gate()
     }
 }
 
