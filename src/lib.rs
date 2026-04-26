@@ -10,6 +10,7 @@ pub mod processors;
 pub mod transport;
 pub mod utils;
 pub mod vad;
+pub mod audio_process;
 
 pub use clock::{BaseClock, SystemClock, system_clock};
 pub use context::{shared_context, LLMContext};
