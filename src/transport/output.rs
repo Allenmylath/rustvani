@@ -13,18 +13,15 @@ use crate::frames::{
 use super::params::TransportParams;
 
 // ---------------------------------------------------------------------------
-// OutputMessage — transport-agnostic envelope
+// OutputMessage
 // ---------------------------------------------------------------------------
 
 /// Sent through the audio-out channel to the concrete transport.
-///
-/// The concrete transport decides what each variant means on the wire:
-///   - WebSocket → JSON `{"type":"interruption"}`
-///   - Twilio   → `{"event":"clear","streamSid":"..."}`
-///   - ESP32    → single byte `0xFF` or similar
 #[derive(Debug)]
 pub enum OutputMessage {
     Audio(Vec<u8>),
+    /// Serialised JSON text frame — used by RAVI for protocol messages.
+    Text(String),
     Interruption,
 }
 
@@ -34,23 +31,9 @@ pub enum OutputMessage {
 
 struct OutputTransportState {
     params: TransportParams,
-
-    /// True while OutputAudioRaw frames are being sent.
     bot_speaking: AtomicBool,
-
-    /// Set by the concrete transport after construction.
     audio_out_tx: Mutex<Option<mpsc::Sender<OutputMessage>>>,
-
-    /// Accumulates incoming TTS audio bytes between chunk boundaries.
-    /// Drained in `chunk_size`-byte pieces so each mpsc send is exactly
-    /// one output chunk.  Remainder carries over to the next TTS blob.
     audio_buffer: Mutex<Vec<u8>>,
-
-    /// Bytes per output chunk.
-    /// Computed dynamically from the first OutputAudioRaw frame:
-    ///   chunk_size = (sample_rate / 100) × channels × 2 × audio_out_10ms_chunks
-    ///              = 10ms_bytes × audio_out_10ms_chunks
-    /// e.g. at 24 kHz mono, 4 chunks → 480 × 4 = 1920 bytes (40 ms)
     chunk_size: AtomicU32,
 }
 
@@ -75,14 +58,23 @@ impl BaseOutputTransport {
         }
     }
 
-    /// Wire up the audio output channel.
-    /// Called once by the concrete transport before the pipeline starts.
     pub fn set_audio_out_tx(&self, tx: mpsc::Sender<OutputMessage>) {
         *self.state.audio_out_tx.lock().unwrap() = Some(tx);
     }
 
     pub fn is_bot_speaking(&self) -> bool {
         self.state.bot_speaking.load(Ordering::Relaxed)
+    }
+
+    /// Send a text (JSON) message to the client without going through the
+    /// frame pipeline — used by RAVI server message / response frames.
+    fn send_text(&self, payload: &str) {
+        let tx = self.state.audio_out_tx.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            if tx.try_send(OutputMessage::Text(payload.to_string())).is_err() {
+                log::warn!("BaseOutputTransport: text output channel full — dropping RAVI message");
+            }
+        }
     }
 }
 
@@ -99,7 +91,7 @@ impl FrameHandler for BaseOutputTransport {
         direction: FrameDirection,
     ) -> Result<()> {
         match &frame.inner {
-            // ---- Audio output: chunk into N×10ms pieces ----
+            // ---- Audio output ----
             FrameInner::Data(DataFrame::OutputAudioRaw(audio)) => {
                 let channels = audio.num_channels.max(1) as u32;
                 let multiplier = self.state.params.audio_out_10ms_chunks.max(1);
@@ -119,27 +111,21 @@ impl FrameHandler for BaseOutputTransport {
                 if prev != new_chunk_size {
                     log::info!(
                         "BaseOutputTransport: chunk_size={}B ({}ms) (sr={}, ch={}, 10ms_chunks={})",
-                        new_chunk_size,
-                        multiplier * 10,
-                        audio.sample_rate,
-                        channels,
-                        multiplier,
+                        new_chunk_size, multiplier * 10,
+                        audio.sample_rate, channels, multiplier,
                     );
                 }
 
                 let chunk_size = new_chunk_size as usize;
 
-                // Signal bot started speaking.
                 if !self.state.bot_speaking.swap(true, Ordering::Relaxed) {
                     log::debug!("BaseOutputTransport: bot started speaking");
                     processor.broadcast_frame(Frame::bot_started_speaking()).await?;
                 }
 
-                // Append to buffer and extract chunks.
                 let chunks: Vec<Vec<u8>> = {
                     let mut buf = self.state.audio_buffer.lock().unwrap();
                     buf.extend_from_slice(&audio.audio);
-
                     let mut out = Vec::with_capacity(buf.len() / chunk_size + 1);
                     while buf.len() >= chunk_size {
                         out.push(buf.drain(..chunk_size).collect());
@@ -147,7 +133,6 @@ impl FrameHandler for BaseOutputTransport {
                     out
                 };
 
-                // Send each chunk immediately — no pacing, no gating.
                 let tx = self.state.audio_out_tx.lock().unwrap().clone();
                 if let Some(tx) = tx {
                     for chunk in chunks {
@@ -160,14 +145,26 @@ impl FrameHandler for BaseOutputTransport {
                 processor.push_frame(frame, direction).await?;
             }
 
-            // ---- Interruption: send marker + clear buffer + stop bot ----
+            // ---- RAVI outbound messages ----
+            // These are system frames so they bypass the ordered data queue.
+            // Serialize → text channel → WebSocket sends them to the client.
+
+            FrameInner::System(SystemFrame::RaviServerMessage { payload }) => {
+                log::trace!("BaseOutputTransport: sending RAVI server message");
+                self.send_text(payload);
+                processor.push_frame(frame, direction).await?;
+            }
+
+            FrameInner::System(SystemFrame::RaviServerResponse { payload, .. }) => {
+                log::trace!("BaseOutputTransport: sending RAVI server response");
+                self.send_text(payload);
+                processor.push_frame(frame, direction).await?;
+            }
+
+            // ---- Interruption ----
             FrameInner::System(SystemFrame::Interruption) => {
-                // Clear any partial audio in the chunking buffer.
                 self.state.audio_buffer.lock().unwrap().clear();
 
-                // Push the interruption marker into the channel.
-                // The concrete transport will drain stale audio and notify
-                // the client in whatever wire format it uses.
                 let tx = self.state.audio_out_tx.lock().unwrap().clone();
                 if let Some(tx) = tx {
                     let _ = tx.try_send(OutputMessage::Interruption);
@@ -180,7 +177,7 @@ impl FrameHandler for BaseOutputTransport {
                 processor.push_frame(frame, direction).await?;
             }
 
-            // ---- End / Cancel: clear speaking state + buffer ----
+            // ---- End / Cancel ----
             FrameInner::Control(_) | FrameInner::System(SystemFrame::Cancel { .. }) => {
                 self.state.audio_buffer.lock().unwrap().clear();
 
@@ -193,7 +190,7 @@ impl FrameHandler for BaseOutputTransport {
                 processor.push_frame(frame, direction).await?;
             }
 
-            // ---- Everything else: pass through ----
+            // ---- Everything else ----
             _ => {
                 processor.push_frame(frame, direction).await?;
             }
