@@ -757,7 +757,6 @@ impl FrameProcessor {
             }
             _ => {
                 self.cancel_process_task().await;
-                self.reset_process_queue().await;
                 self.create_process_task();
             }
         }
