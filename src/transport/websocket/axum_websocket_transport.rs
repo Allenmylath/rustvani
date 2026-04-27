@@ -35,19 +35,11 @@ impl Default for WebSocketParams {
 // WebSocketTransport
 // ---------------------------------------------------------------------------
 
-/// WebSocket transport — wraps BaseTransport with bidirectional audio.
-///
-/// Each connection should create a new instance so that VAD state, audio
-/// buffers, and pipeline resources are fully isolated.
 pub struct WebSocketTransport {
     base:         Arc<BaseTransport>,
     audio_out_rx: std::sync::Mutex<Option<mpsc::Receiver<OutputMessage>>>,
 }
 
-/// Channel capacity sized for chunked audio.
-///
-/// With 40 ms chunks (audio_out_10ms_chunks=4) a 5-second TTS response
-/// produces ~125 chunks.  Cap = 150 gives comfortable headroom.
 const AUDIO_OUT_CHANNEL_CAP: usize = 150;
 
 impl WebSocketTransport {
@@ -73,17 +65,19 @@ impl WebSocketTransport {
 
     /// Drive the WebSocket connection until it closes.
     ///
-    /// Simple two-arm select:
+    /// Arm 1 — `socket.recv()`: incoming messages from the client.
     ///
-    ///   Arm 1 — `socket.recv()`: incoming user audio or control messages.
-    ///            Binary → pipeline via `push_audio_frame`.
-    ///            Text `{"type":"client_interruption"}` → push Interruption
-    ///            frame into the pipeline.
+    ///   - Binary  → raw PCM audio → pipeline via `push_audio_frame`.
+    ///   - Text JSON:
+    ///       • `{"label":"rtvi-ai", ...}` → parsed as a RAVI inbound message
+    ///         and pushed into the pipeline as `RaviClientMessage`.
+    ///       • `{"type":"client_interruption"}` → `InterruptionFrame` downstream.
     ///
-    ///   Arm 2 — `audio_out_rx.recv()`: outgoing pipeline messages.
-    ///            `Audio(bytes)` → send binary frame immediately.
-    ///            `Interruption` → drain stale audio from channel,
-    ///            then send JSON text frame to client.
+    /// Arm 2 — `audio_out_rx.recv()`: outgoing pipeline messages.
+    ///
+    ///   - `Audio(bytes)` → binary WebSocket frame.
+    ///   - `Text(json)` → text WebSocket frame (RAVI protocol messages).
+    ///   - `Interruption` → drain stale audio, then send JSON clear marker.
     pub async fn run_socket(
         &self,
         mut socket: WebSocket,
@@ -101,7 +95,7 @@ impl WebSocketTransport {
         loop {
             tokio::select! {
                 // ----------------------------------------------------------------
-                // Arm 1: incoming user audio / control messages → pipeline
+                // Arm 1: incoming messages → pipeline
                 // ----------------------------------------------------------------
                 msg = socket.recv() => {
                     match msg {
@@ -109,21 +103,18 @@ impl WebSocketTransport {
                             let data = AudioRawData::new(bytes.to_vec(), 16_000, 1);
                             base.push_audio_frame(data).await;
                         }
+
                         Some(Ok(Message::Text(text))) => {
-                            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if msg.get("type").and_then(|v| v.as_str()) == Some("client_interruption") {
-                                    log::info!("WebSocketTransport: client-initiated interruption");
-                                    let _ = push_tx
-                                        .send((Frame::interruption(), FrameDirection::Downstream))
-                                        .await;
-                                }
-                            }
+                            handle_incoming_text(&text, &push_tx).await;
                         }
+
                         Some(Ok(Message::Close(_))) | None => {
                             log::debug!("WebSocketTransport: client closed connection");
                             break;
                         }
+
                         Some(Ok(_)) => {} // ping / pong — ignore
+
                         Some(Err(e)) => {
                             log::warn!("WebSocketTransport: socket error: {}", e);
                             break;
@@ -138,40 +129,98 @@ impl WebSocketTransport {
                     match output_msg {
                         Some(OutputMessage::Audio(bytes)) => {
                             if socket.send(Message::Binary(bytes.into())).await.is_err() {
-                                log::warn!("WebSocketTransport: failed to send audio to client");
+                                log::warn!("WebSocketTransport: failed to send audio");
                                 break;
                             }
                         }
+
+                        Some(OutputMessage::Text(json)) => {
+                            // RAVI protocol messages (bot-ready, transcriptions, etc.)
+                            if socket.send(Message::Text(json.into())).await.is_err() {
+                                log::warn!("WebSocketTransport: failed to send RAVI text message");
+                                break;
+                            }
+                        }
+
                         Some(OutputMessage::Interruption) => {
-                            // Drain any stale audio chunks queued before
-                            // the interruption marker.
-                            while let Ok(msg) = audio_out_rx.try_recv() {
-                                match msg {
-                                    OutputMessage::Audio(_) => {} // discard
+                            // Drain stale audio chunks queued before the marker.
+                            while let Ok(queued) = audio_out_rx.try_recv() {
+                                match queued {
+                                    OutputMessage::Audio(_) => {}    // discard
                                     OutputMessage::Interruption => break,
+                                    OutputMessage::Text(_) => {}     // discard (shouldn't queue during interruption)
                                 }
                             }
 
-                            // Tell client to flush its playback buffer.
                             let json = r#"{"type":"interruption"}"#;
                             if socket.send(Message::Text(json.into())).await.is_err() {
-                                log::warn!("WebSocketTransport: failed to send interruption to client");
+                                log::warn!("WebSocketTransport: failed to send interruption");
                                 break;
                             }
                             log::debug!("WebSocketTransport: sent interruption to client");
                         }
-                        None => {
-                            // Pipeline shut down.
-                            break;
-                        }
+
+                        None => break, // pipeline shut down
                     }
                 }
             }
         }
 
-        // Signal pipeline shutdown.
         let _ = push_tx
             .send((Frame::end(), FrameDirection::Downstream))
+            .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Incoming text message handler
+// ---------------------------------------------------------------------------
+
+/// Parse an incoming text WebSocket message and push the appropriate frame.
+///
+/// Two protocols are recognised:
+///
+/// 1. **RAVI** (`label == "rtvi-ai"`) — parsed into a `RaviClientMessage`
+///    frame and sent downstream. The `RaviProcessor` in the pipeline handles
+///    the protocol logic.
+///
+/// 2. **Legacy interruption** (`type == "client_interruption"`) — kept for
+///    backward-compatibility with clients that pre-date RAVI.
+async fn handle_incoming_text(
+    text: &str,
+    push_tx: &mpsc::Sender<(Frame, FrameDirection)>,
+) {
+    let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else {
+        log::warn!("WebSocketTransport: ignoring non-JSON text message");
+        return;
+    };
+
+    let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let label    = msg.get("label").and_then(|v| v.as_str()).unwrap_or("");
+
+    if label == "ravi" {
+        // RAVI inbound message.
+        let Some(msg_id) = msg.get("id").and_then(|v| v.as_str()) else {
+            log::warn!("WebSocketTransport: RAVI message missing 'id' field — dropping");
+            return;
+        };
+
+        // `data` is optional; serialise it back to a JSON string so the
+        // RaviProcessor can deserialise it into the appropriate type.
+        let data_str = msg.get("data").map(|d| d.to_string());
+
+        let frame = Frame::ravi_client_message(msg_id, msg_type, data_str);
+        let _ = push_tx.send((frame, FrameDirection::Downstream)).await;
+
+        log::trace!("WebSocketTransport: RAVI '{}' (id={})", msg_type, msg_id);
+        return;
+    }
+
+    // Legacy: bare client interruption without RAVI label.
+    if msg_type == "client_interruption" {
+        log::info!("WebSocketTransport: legacy client-initiated interruption");
+        let _ = push_tx
+            .send((Frame::interruption(), FrameDirection::Downstream))
             .await;
     }
 }
