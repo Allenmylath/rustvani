@@ -13,6 +13,10 @@ name = "pipeline_test"
 path = "src/bin/pipeline_test.rs"
 
 [[bin]]
+name = "ravi_server"
+path = "src/bin/ravi_server.rs"
+
+[[bin]]
 name = "sarvam_ws_test"
 path = "src/bin/sarvam_ws_test.rs"
 
