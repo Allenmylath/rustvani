@@ -1,5 +1,7 @@
 FROM fedora:40
+
 ARG MODE=prod
+
 RUN dnf install -y \
     curl \
     wget \
@@ -11,23 +13,32 @@ RUN dnf install -y \
     ca-certificates \
     espeak-ng \
     && dnf clean all
+
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable
+
 ENV PATH="/root/.cargo/bin:${PATH}"
+
 RUN wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz \
     -O /tmp/ort.tgz \
     && mkdir -p /opt/onnxruntime \
     && tar -xzf /tmp/ort.tgz -C /opt/onnxruntime --strip-components=1 \
     && rm /tmp/ort.tgz
+
 ENV ORT_LIB_LOCATION=/opt/onnxruntime
 ENV ORT_SKIP_DOWNLOAD=1
 ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib
+
 WORKDIR /app
+
 COPY Cargo.toml .
 COPY src/ src/
 COPY src/vad/data/silero.onnx silero.onnx
+
 RUN cargo build --release
 RUN cargo test --no-run
-RUN printf '#!/bin/bash\nif [ "$MODE" = "test" ]; then\n  exec cargo test -- --test-output immediate\nelse\n  exec /app/target/release/websocket_server\nfi\n' \
+
+RUN printf '#!/bin/bash\nif [ "$MODE" = "test" ]; then\n  exec cargo test -- --test-output immediate\nelse\n  exec /app/target/release/ravi_server\nfi\n' \
     > /entrypoint.sh && chmod +x /entrypoint.sh
+
 CMD ["/entrypoint.sh"]
