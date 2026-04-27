@@ -1,26 +1,3 @@
-/// `RaviProcessor` — RAVI protocol handler sitting in the pipeline.
-///
-/// Place it early in the pipeline (after the input transport, before the LLM
-/// aggregators).  It intercepts `RaviClientMessage` system frames, handles
-/// protocol handshaking and control messages, and passes everything else
-/// through unchanged.
-///
-/// # Typical pipeline
-///
-/// ```text
-/// [WS Input] → [RaviProcessor] → [LLMUserAggregator] → [LLM] →
-///             [LLMAssistantAggregator] → [TTS] → [WS Output]
-/// ```
-///
-/// # Sending outbound messages
-///
-/// To push a RAVI message from anywhere in your app:
-/// ```rust
-/// processor.push_frame(
-///     Frame::ravi_server_message(models::msg_server_message(json!({...}))),
-///     FrameDirection::Downstream,
-/// ).await?;
-/// ```
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -29,46 +6,35 @@ use serde_json::Value;
 use crate::context::LLMContext;
 use crate::error::Result;
 use crate::frames::{
-    ControlFrame, DataFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,
-    SystemFrame,
+    Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor, SystemFrame,
 };
 
-use super::models::{self, ClientReadyData, SendTextData, SendTextOptions};
+use super::models::{self, ClientReadyData, SendTextData};
 use super::observer::{RaviObserver, RaviObserverParams};
 
 // ---------------------------------------------------------------------------
 // RaviParams
 // ---------------------------------------------------------------------------
 
-/// Configuration for `RaviProcessor`.
 #[derive(Debug, Clone)]
 pub struct RaviParams {
-    /// Static `about` metadata included in `bot-ready`.
-    /// Defaults to `{"library":"rustvani"}`.
-    pub about: Option<Value>,
-
-    /// If true, the bot-ready message is sent automatically as soon as the
-    /// client-ready handshake completes (version validated).
-    /// Set to false if you need to delay bot-ready (e.g. until a DB call
-    /// completes), and call `send_bot_ready()` manually instead.
-    pub auto_bot_ready: bool,
-
-    /// RTVI protocol version we advertise.  Defaults to `models::PROTOCOL_VERSION`.
+    pub about:            Option<Value>,
+    pub auto_bot_ready:   bool,
     pub protocol_version: String,
 }
 
 impl Default for RaviParams {
     fn default() -> Self {
         Self {
-            about: Some(serde_json::json!({ "library": "rustvani" })),
-            auto_bot_ready: true,
+            about:            Some(serde_json::json!({ "library": "rustvani" })),
+            auto_bot_ready:   true,
             protocol_version: models::PROTOCOL_VERSION.to_string(),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Internal mutable state (behind Mutex for &self access in FrameHandler)
+// State
 // ---------------------------------------------------------------------------
 
 struct State {
@@ -78,7 +44,7 @@ struct State {
 }
 
 // ---------------------------------------------------------------------------
-// Inner handler
+// RaviHandler
 // ---------------------------------------------------------------------------
 
 struct RaviHandler {
@@ -98,33 +64,25 @@ impl RaviHandler {
         }
     }
 
-    // ---- Protocol handlers ----
-
-    /// `client-ready` — validate version; optionally emit `bot-ready`.
     async fn handle_client_ready(
         &self,
         processor: &FrameProcessor,
         msg_id: &str,
         data_raw: Option<&str>,
     ) -> Result<()> {
-        let client_data: Option<ClientReadyData> = data_raw
-            .and_then(|s| serde_json::from_str(s).ok());
+        let client_data: Option<ClientReadyData> =
+            data_raw.and_then(|s| serde_json::from_str(s).ok());
 
         let version = client_data.as_ref().map(|d| d.version.as_str()).unwrap_or("unknown");
         log::info!("RaviProcessor: client-ready (version={})", version);
 
-        // Version compatibility check: major must match.
         let server_major = self.params.protocol_version
             .split('.')
             .next()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(1);
 
-        if let Some(client_major) = version
-            .split('.')
-            .next()
-            .and_then(|s| s.parse::<u32>().ok())
-        {
+        if let Some(client_major) = version.split('.').next().and_then(|s| s.parse::<u32>().ok()) {
             if client_major != server_major {
                 let err = format!(
                     "RAVI version {} is not compatible with server protocol {}. \
@@ -134,7 +92,10 @@ impl RaviHandler {
                 log::warn!("RaviProcessor: {}", err);
                 let payload = models::msg_error_response(msg_id, &err);
                 processor
-                    .push_frame(Frame::ravi_server_response(msg_id, payload), FrameDirection::Downstream)
+                    .push_frame(
+                        Frame::ravi_server_response(msg_id, payload),
+                        FrameDirection::Downstream,
+                    )
                     .await?;
             }
         }
@@ -152,9 +113,7 @@ impl RaviHandler {
         Ok(())
     }
 
-    /// Send `bot-ready` to the client.  Called automatically if
-    /// `auto_bot_ready = true`, or manually by the user otherwise.
-    pub async fn send_bot_ready(&self, processor: &FrameProcessor) -> Result<()> {
+    async fn send_bot_ready(&self, processor: &FrameProcessor) -> Result<()> {
         let (msg_id, already_sent) = {
             let mut s = self.state.lock().unwrap();
             let id   = s.client_ready_id.clone();
@@ -170,23 +129,18 @@ impl RaviHandler {
 
         let payload = models::msg_bot_ready(&msg_id, self.params.about.clone());
         processor
-            .push_frame(
-                Frame::ravi_server_message(payload),
-                FrameDirection::Downstream,
-            )
+            .push_frame(Frame::ravi_server_message(payload), FrameDirection::Downstream)
             .await?;
 
         log::info!("RaviProcessor: bot-ready sent");
         Ok(())
     }
 
-    /// `disconnect-bot` — gracefully end the pipeline.
     async fn handle_disconnect(&self, processor: &FrameProcessor) -> Result<()> {
         log::info!("RaviProcessor: disconnect-bot received — ending pipeline");
         processor.push_frame(Frame::end(), FrameDirection::Downstream).await
     }
 
-    /// `send-text` — inject user text directly into the LLM context.
     async fn handle_send_text(
         &self,
         processor: &FrameProcessor,
@@ -208,21 +162,14 @@ impl RaviHandler {
         }
 
         context.lock().unwrap().add_message("user", &data.content);
-
         processor
-            .push_frame(
-                Frame::llm_context(context.clone()),
-                FrameDirection::Downstream,
-            )
+            .push_frame(Frame::llm_context(context.clone()), FrameDirection::Downstream)
             .await?;
 
         log::debug!("RaviProcessor: send-text injected: '{}'", data.content);
         Ok(())
     }
 
-    /// `client-message` — re-emit for user-defined handlers further down the
-    /// pipeline.  Other processors can match on `RaviClientMessage` frames
-    /// with `msg_type` set to whatever custom type the client sent.
     async fn handle_client_message(
         &self,
         processor: &FrameProcessor,
@@ -231,7 +178,6 @@ impl RaviHandler {
         data: Option<String>,
     ) -> Result<()> {
         log::debug!("RaviProcessor: client-message type='{}' id='{}'", msg_type, msg_id);
-        // Re-push with the inner type so downstream handlers can pattern-match.
         processor
             .push_frame(
                 Frame::ravi_client_message(msg_id, msg_type, data),
@@ -242,7 +188,7 @@ impl RaviHandler {
 }
 
 // ---------------------------------------------------------------------------
-// FrameHandler implementation
+// FrameHandler
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -267,9 +213,6 @@ impl FrameHandler for RaviHandler {
                         self.handle_disconnect(processor).await?;
                     }
                     "client-message" => {
-                        // The actual inner type is in `data.t` per the RAVI spec.
-                        // Re-emit as a new RaviClientMessage with the inner type
-                        // so downstream processors have a clean frame to match.
                         if let Some(raw) = &data {
                             if let Ok(inner) = serde_json::from_str::<serde_json::Value>(raw) {
                                 let inner_type = inner.get("t")
@@ -278,10 +221,19 @@ impl FrameHandler for RaviHandler {
                                     .to_string();
                                 let inner_data = inner.get("d").map(|v| v.to_string());
                                 self.handle_client_message(
-                                    processor, &msg_id, &inner_type, inner_data
+                                    processor, &msg_id, &inner_type, inner_data,
                                 ).await?;
                             }
                         }
+                    }
+                    "send-text" => {
+                        // send-text needs an LLMContext — not available here without
+                        // the user wiring one in. Log a warning; users who need this
+                        // should subclass or handle downstream.
+                        log::warn!(
+                            "RaviProcessor: send-text received but no context wired — \
+                             handle this in a downstream processor"
+                        );
                     }
                     unknown => {
                         log::warn!("RaviProcessor: unsupported message type '{}'", unknown);
@@ -298,8 +250,6 @@ impl FrameHandler for RaviHandler {
                     }
                 }
             }
-
-            // Pass everything else through.
             _ => {
                 processor.push_frame(frame, direction).await?;
             }
@@ -310,28 +260,16 @@ impl FrameHandler for RaviHandler {
 }
 
 // ---------------------------------------------------------------------------
-// Public constructor
+// Public API
 // ---------------------------------------------------------------------------
 
-/// Create the `RaviProcessor` `FrameProcessor`.
-///
-/// # Example
-/// ```rust
-/// let ravi = RaviProcessor::new(RaviParams::default());
-/// let observer = RaviProcessor::create_observer(&ravi, RaviObserverParams::default());
-/// // wire ravi into your pipeline, then set observer on the pipeline task
-/// ```
 pub struct RaviProcessor;
 
 impl RaviProcessor {
-    /// Build and return a `FrameProcessor` wrapping the RAVI protocol handler.
     pub fn new(params: RaviParams) -> FrameProcessor {
         FrameProcessor::new("RaviProcessor", Box::new(RaviHandler::new(params)), false)
     }
 
-    /// Create a `RaviObserver` that uses `proc` to push outbound messages.
-    ///
-    /// `proc` should be the same `FrameProcessor` returned by `RaviProcessor::new`.
     pub fn create_observer(proc: &FrameProcessor, params: RaviObserverParams) -> RaviObserver {
         RaviObserver::new(proc.clone(), params)
     }
