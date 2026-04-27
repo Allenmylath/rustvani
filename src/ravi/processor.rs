@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -21,6 +21,10 @@ pub struct RaviParams {
     pub about:            Option<Value>,
     pub auto_bot_ready:   bool,
     pub protocol_version: String,
+    /// If set, `send-text` client messages will inject turns into this context
+    /// and push an `LLMContextFrame` downstream. If `None`, `send-text` is
+    /// logged as a warning and ignored.
+    pub context:          Option<Arc<Mutex<LLMContext>>>,
 }
 
 impl Default for RaviParams {
@@ -29,6 +33,7 @@ impl Default for RaviParams {
             about:            Some(serde_json::json!({ "library": "rustvani" })),
             auto_bot_ready:   true,
             protocol_version: models::PROTOCOL_VERSION.to_string(),
+            context:          None,
         }
     }
 }
@@ -48,8 +53,8 @@ struct State {
 // ---------------------------------------------------------------------------
 
 struct RaviHandler {
-    params: RaviParams,
-    state:  Mutex<State>,
+    params:  RaviParams,
+    state:   Mutex<State>,
 }
 
 impl RaviHandler {
@@ -145,7 +150,7 @@ impl RaviHandler {
         &self,
         processor: &FrameProcessor,
         data_raw: Option<&str>,
-        context: &std::sync::Arc<std::sync::Mutex<LLMContext>>,
+        context: &Arc<Mutex<LLMContext>>,
     ) -> Result<()> {
         let data: SendTextData = match data_raw.and_then(|s| serde_json::from_str(s).ok()) {
             Some(d) => d,
@@ -227,13 +232,17 @@ impl FrameHandler for RaviHandler {
                         }
                     }
                     "send-text" => {
-                        // send-text needs an LLMContext — not available here without
-                        // the user wiring one in. Log a warning; users who need this
-                        // should subclass or handle downstream.
-                        log::warn!(
-                            "RaviProcessor: send-text received but no context wired — \
-                             handle this in a downstream processor"
-                        );
+                        match &self.params.context {
+                            Some(ctx) => {
+                                self.handle_send_text(processor, data.as_deref(), ctx).await?;
+                            }
+                            None => {
+                                log::warn!(
+                                    "RaviProcessor: send-text received but no context wired — \
+                                     set RaviParams::context to handle this"
+                                );
+                            }
+                        }
                     }
                     unknown => {
                         log::warn!("RaviProcessor: unsupported message type '{}'", unknown);
