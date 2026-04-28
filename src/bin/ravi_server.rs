@@ -1,31 +1,18 @@
-//! rustvani RAVI WebSocket voice agent server.
+//! rustvani RAVI WebSocket voice agent server — with tool calling.
 //!
-//! Listens on ws://0.0.0.0:{PORT}/ws  (PORT env var, default 10000 for Render)
+//! Demonstrates function calling with a `get_weather` tool.
+//! When the user asks about weather, the LLM calls the tool, gets the result,
+//! and speaks the answer.
 //!
-//! Each connection gets a fully isolated pipeline:
+//! Pipeline:
 //!   WebSocketTransport.input()
-//!     → RaviProcessor          (client-ready / disconnect-bot / send-text)
+//!     → RaviProcessor
 //!     → SarvamStt
 //!     → LLMUserAggregator
-//!     → OpenAILLM
+//!     → OpenAILLM              ← calls get_weather when needed
 //!     → LLMAssistantAggregator
 //!     → SarvamTts
 //!     → WebSocketTransport.output()
-//!
-//! RaviObserver watches the pipeline and emits RAVI protocol events back to
-//! the client (bot-ready, speaking events, transcriptions, LLM start/stop).
-//!
-//! Wire protocol:
-//!   Client → Server : Binary  — raw i16 LE PCM, 16 kHz mono, 512-sample chunks
-//!                     Text    — RAVI JSON messages (label == "ravi")
-//!   Server → Client : Binary  — raw i16 LE PCM at TTS sample rate
-//!                     Text    — RAVI JSON protocol events
-//!
-//! Environment variables:
-//!   PORT             — listen port (default: 10000, Render default)
-//!   SARVAM_API_KEY   — required (STT + TTS)
-//!   OPENAI_API_KEY   — required (LLM)
-//!   SYSTEM_PROMPT    — optional
 
 use std::sync::Arc;
 
@@ -36,19 +23,22 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 use rustvani::{
     shared_context, system_clock, SileroVad, VadParams,
-    PipelineParams, PipelineTask,
+    PipelineParams, PipelineTask, FunctionRegistry,
 };
+use rustvani::adapters::schemas::{FunctionSchema, ToolsSchema};
+use rustvani::context::shared_context_with_tools;
 use rustvani::observer::{BaseObserver, FrameProcessed, FramePushed};
 use rustvani::processors::{
     llm_assistant_aggregator::LLMAssistantAggregator,
     llm_user_aggregator::LLMUserAggregator,
 };
 use rustvani::ravi::{
-    RaviObserver, RaviObserverParams,
+    RaviObserverParams,
     processor::{RaviParams, RaviProcessor},
 };
 use rustvani::services::{
@@ -81,8 +71,61 @@ struct AppState {
 }
 
 // ---------------------------------------------------------------------------
-// NullObserver — RaviObserver handles all client-facing events;
-// this satisfies the PipelineTask observer slot when we want nothing extra.
+// Tool: get_weather
+// ---------------------------------------------------------------------------
+
+/// Fake weather lookup — returns hardcoded data for demo purposes.
+/// In production this would call a real weather API.
+async fn get_weather(args_json: String) -> String {
+    // Parse the arguments
+    let args: serde_json::Value = serde_json::from_str(&args_json).unwrap_or_default();
+    let city = args["city"].as_str().unwrap_or("unknown");
+
+    log::info!("[tool] get_weather called for city={}", city);
+
+    // Simulate a tiny delay like a real API would have
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Return fake weather data
+    json!({
+        "city": city,
+        "temperature_celsius": 31,
+        "condition": "partly cloudy",
+        "humidity_percent": 78,
+        "wind_kph": 12,
+    })
+    .to_string()
+}
+
+/// Build the FunctionSchema for get_weather.
+fn weather_tool_schema() -> FunctionSchema {
+    FunctionSchema::new("get_weather", "Get the current weather for a city")
+        .with_parameters(json!({
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "The city name, e.g. 'Kochi' or 'New Delhi'"
+                }
+            },
+            "required": ["city"]
+        }))
+}
+
+/// Build the function registry with all tools.
+fn build_registry() -> FunctionRegistry {
+    let mut registry = FunctionRegistry::new();
+    registry.register("get_weather", get_weather);
+    registry
+}
+
+/// Build the tools schema (tells the LLM what tools are available).
+fn build_tools_schema() -> ToolsSchema {
+    ToolsSchema::new(vec![weather_tool_schema()])
+}
+
+// ---------------------------------------------------------------------------
+// NullObserver
 // ---------------------------------------------------------------------------
 
 struct NullObserver;
@@ -138,8 +181,12 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         },
     );
 
-    // ---- Shared conversation context ----
-    let context = shared_context(Some(app_state.system_prompt.clone()));
+    // ---- Shared conversation context WITH TOOLS ----
+    let context = shared_context_with_tools(
+        Some(app_state.system_prompt.clone()),
+        build_tools_schema(),
+        None, // tool_choice = None → provider default ("auto")
+    );
 
     // ---- Pipeline processors ----
 
@@ -148,8 +195,6 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         ..RaviParams::default()
     });
 
-    // RaviObserver watches the pipeline and pushes RAVI events back to client
-    // through the ravi processor → output transport → WS text frames.
     let ravi_observer: Arc<dyn BaseObserver> = Arc::new(
         RaviProcessor::create_observer(&ravi, RaviObserverParams::default()),
     );
@@ -165,11 +210,15 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
 
     let user_agg = LLMUserAggregator::new(context.clone());
 
-    let llm = OpenAILLMHandler::new(OpenAILLMConfig {
-        api_key: app_state.openai_api_key.clone(),
-        model:   "gpt-4o-mini".to_string(),
-        ..OpenAILLMConfig::default()
-    })
+    // ---- LLM with function registry ----
+    let llm = OpenAILLMHandler::with_registry(
+        OpenAILLMConfig {
+            api_key: app_state.openai_api_key.clone(),
+            model:   "gpt-4o-mini".to_string(),
+            ..OpenAILLMConfig::default()
+        },
+        build_registry(),
+    )
     .into_processor();
 
     let assistant_agg = LLMAssistantAggregator::new(context.clone());
@@ -231,9 +280,9 @@ async fn main() {
         .expect("OPENAI_API_KEY env var not set");
 
     let system_prompt = std::env::var("SYSTEM_PROMPT").unwrap_or_else(|_| {
-        "You are a helpful voice assistant. \
-         Keep your answers concise and conversational — \
-         one or two sentences unless the user asks for more detail."
+        "You are a helpful voice assistant with access to tools. \
+         When the user asks about weather, use the get_weather tool. \
+         Keep your answers concise and conversational."
             .to_string()
     });
 
@@ -248,7 +297,8 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", port);
 
     log::info!("rustvani RAVI voice agent listening on ws://{}/ws", addr);
-    log::info!("Pipeline: audio → VAD → RaviProcessor → STT(Sarvam) → LLM(OpenAI) → TTS(Sarvam) → audio");
+    log::info!("Pipeline: audio → VAD → RAVI → STT → LLM(+tools) → TTS → audio");
+    log::info!("Tools: get_weather");
 
     let listener = tokio::net::TcpListener::bind(&addr).await
         .unwrap_or_else(|e| panic!("Failed to bind {}: {}", addr, e));
