@@ -42,11 +42,6 @@ pub struct ToolCallOutput {
     /// Full structured payload. `None` suppresses the raw result frame.
     pub full_data: Option<Value>,
 }
-#[derive(Clone)]
-pub enum RegistryHandler {
-    Simple(HandlerFn),
-    Data(DataHandlerFn),
-}
 
 impl ToolCallOutput {
     /// Convenience constructor: summary only, no raw data frame.
@@ -81,6 +76,7 @@ pub type DataHandlerFn = Arc<dyn Fn(String) -> DataHandlerFuture + Send + Sync>;
 // ---------------------------------------------------------------------------
 
 /// Discriminates between the two handler breeds stored in the registry.
+#[derive(Clone)]
 pub enum RegistryHandler {
     /// Plain string return — goes to LLM context as-is.
     Simple(HandlerFn),
