@@ -51,11 +51,17 @@ pub enum FrameKind {
     // Control — LLM response boundaries
     LLMFullResponseStart,
     LLMFullResponseEnd,
+    // Control — function call boundaries
+    FunctionCallStart,
+    FunctionCallEnd,
     // Data
     Data,
     Transcription,
     LLMText,
     LLMContextFrame,
+    // Data — function calling
+    FunctionCallInProgress,
+    FunctionCallResult,
     // Data — audio output
     OutputAudioRaw,
 }
@@ -132,6 +138,28 @@ impl TranscriptionData {
     pub fn finalized(mut self) -> Self { self.finalized = true; self }
 }
 
+/// Payload for FunctionCallInProgressFrame — the model wants to invoke a tool.
+#[derive(Debug, Clone)]
+pub struct FunctionCallData {
+    /// Unique call ID assigned by the model (e.g. `"call_abc123"`).
+    pub id: String,
+    /// Name of the function to invoke.
+    pub function_name: String,
+    /// Raw JSON string of the function arguments.
+    pub arguments: String,
+}
+
+/// Payload for FunctionCallResultFrame — tool execution result.
+#[derive(Debug, Clone)]
+pub struct FunctionCallResultData {
+    /// Matches the `id` of the `FunctionCallData` this responds to.
+    pub id: String,
+    /// Name of the function that was called.
+    pub function_name: String,
+    /// Serialized result (typically JSON).
+    pub result: String,
+}
+
 // ---------------------------------------------------------------------------
 // SystemFrame
 // ---------------------------------------------------------------------------
@@ -173,23 +201,14 @@ pub enum SystemFrame {
     Heartbeat(f64),
 
     // ---- RAVI protocol ----
-
-    /// Parsed inbound client message from the transport.
-    /// `data` is the raw JSON string of the `data` field, if present.
     RaviClientMessage {
         msg_id:   String,
         msg_type: String,
         data:     Option<String>,
     },
-
-    /// Pre-serialised JSON to send to the client (pushed downstream to the
-    /// output transport, which emits it as a WebSocket text frame).
     RaviServerMessage {
         payload: String,
     },
-
-    /// Pre-serialised JSON response to a specific client request.
-    /// Carries `client_msg_id` so the observer / transport can correlate it.
     RaviServerResponse {
         client_msg_id: String,
         payload:       String,
@@ -205,6 +224,10 @@ pub enum ControlFrame {
     End { reason: Option<String> },
     LLMFullResponseStart,
     LLMFullResponseEnd,
+    /// Signals that the model returned tool calls — execution is starting.
+    FunctionCallStart,
+    /// Signals that all tool calls for this turn have been executed.
+    FunctionCallEnd,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +237,10 @@ pub enum DataFrame {
     Transcription(TranscriptionData),
     LLMText(String),
     LLMContextFrame(Arc<Mutex<crate::context::LLMContext>>),
+    /// Model wants to invoke a tool — downstream observers can show "thinking…"
+    FunctionCallInProgress(FunctionCallData),
+    /// Tool execution result — downstream observers can show the result.
+    FunctionCallResult(FunctionCallResultData),
 }
 
 #[derive(Debug, Clone)]
@@ -273,13 +300,17 @@ impl Frame {
                 ControlFrame::End { .. }           => "EndFrame",
                 ControlFrame::LLMFullResponseStart => "LLMFullResponseStartFrame",
                 ControlFrame::LLMFullResponseEnd   => "LLMFullResponseEndFrame",
+                ControlFrame::FunctionCallStart    => "FunctionCallStartFrame",
+                ControlFrame::FunctionCallEnd      => "FunctionCallEndFrame",
             },
             FrameInner::Data(d) => match d {
-                DataFrame::Data(_)             => "DataFrame",
-                DataFrame::OutputAudioRaw(_)   => "OutputAudioRawFrame",
-                DataFrame::Transcription(_)    => "TranscriptionFrame",
-                DataFrame::LLMText(_)          => "LLMTextFrame",
-                DataFrame::LLMContextFrame(_)  => "LLMContextFrame",
+                DataFrame::Data(_)                     => "DataFrame",
+                DataFrame::OutputAudioRaw(_)           => "OutputAudioRawFrame",
+                DataFrame::Transcription(_)            => "TranscriptionFrame",
+                DataFrame::LLMText(_)                  => "LLMTextFrame",
+                DataFrame::LLMContextFrame(_)          => "LLMContextFrame",
+                DataFrame::FunctionCallInProgress(_)   => "FunctionCallInProgressFrame",
+                DataFrame::FunctionCallResult(_)       => "FunctionCallResultFrame",
             },
         }
     }
@@ -318,13 +349,17 @@ impl Frame {
                 ControlFrame::End { .. }           => FrameKind::End,
                 ControlFrame::LLMFullResponseStart => FrameKind::LLMFullResponseStart,
                 ControlFrame::LLMFullResponseEnd   => FrameKind::LLMFullResponseEnd,
+                ControlFrame::FunctionCallStart    => FrameKind::FunctionCallStart,
+                ControlFrame::FunctionCallEnd      => FrameKind::FunctionCallEnd,
             },
             FrameInner::Data(d) => match d {
-                DataFrame::Data(_)             => FrameKind::Data,
-                DataFrame::OutputAudioRaw(_)   => FrameKind::OutputAudioRaw,
-                DataFrame::Transcription(_)    => FrameKind::Transcription,
-                DataFrame::LLMText(_)          => FrameKind::LLMText,
-                DataFrame::LLMContextFrame(_)  => FrameKind::LLMContextFrame,
+                DataFrame::Data(_)                     => FrameKind::Data,
+                DataFrame::OutputAudioRaw(_)           => FrameKind::OutputAudioRaw,
+                DataFrame::Transcription(_)            => FrameKind::Transcription,
+                DataFrame::LLMText(_)                  => FrameKind::LLMText,
+                DataFrame::LLMContextFrame(_)          => FrameKind::LLMContextFrame,
+                DataFrame::FunctionCallInProgress(_)   => FrameKind::FunctionCallInProgress,
+                DataFrame::FunctionCallResult(_)       => FrameKind::FunctionCallResult,
             },
         }
     }
@@ -472,9 +507,21 @@ impl Frame {
         Self::make(FrameInner::Data(DataFrame::LLMContextFrame(context)))
     }
 
-    // ---- RAVI protocol ----
+    // ---- Function calling ----
+    pub fn function_call_start() -> Self {
+        Self::make(FrameInner::Control(ControlFrame::FunctionCallStart))
+    }
+    pub fn function_call_end() -> Self {
+        Self::make(FrameInner::Control(ControlFrame::FunctionCallEnd))
+    }
+    pub fn function_call_in_progress(data: FunctionCallData) -> Self {
+        Self::make(FrameInner::Data(DataFrame::FunctionCallInProgress(data)))
+    }
+    pub fn function_call_result(data: FunctionCallResultData) -> Self {
+        Self::make(FrameInner::Data(DataFrame::FunctionCallResult(data)))
+    }
 
-    /// Inbound: parsed client message from the WebSocket transport.
+    // ---- RAVI protocol ----
     pub fn ravi_client_message(
         msg_id:   impl Into<String>,
         msg_type: impl Into<String>,
@@ -486,15 +533,11 @@ impl Frame {
             data,
         }))
     }
-
-    /// Outbound: pre-serialised JSON to send to the client.
     pub fn ravi_server_message(payload: impl Into<String>) -> Self {
         Self::make(FrameInner::System(SystemFrame::RaviServerMessage {
             payload: payload.into(),
         }))
     }
-
-    /// Outbound response to a specific client request.
     pub fn ravi_server_response(
         client_msg_id: impl Into<String>,
         payload:       impl Into<String>,
