@@ -13,6 +13,7 @@ pub mod vad;
 pub mod audio_process;
 pub mod ravi;
 pub mod adapters;
+pub mod dhara;
 
 pub use clock::{BaseClock, SystemClock, system_clock};
 pub use error::{PipecatError, Result};
@@ -34,3 +35,4 @@ pub use services::{
 };
 pub use transport::{BaseInputTransport, BaseOutputTransport, BaseTransport, TransportParams};
 pub use vad::{SileroVad, VadAnalyzer, VadParams, VadState};
+
