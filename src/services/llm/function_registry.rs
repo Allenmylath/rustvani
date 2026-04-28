@@ -42,6 +42,11 @@ pub struct ToolCallOutput {
     /// Full structured payload. `None` suppresses the raw result frame.
     pub full_data: Option<Value>,
 }
+#[derive(Clone)]
+pub enum RegistryHandler {
+    Simple(HandlerFn),
+    Data(DataHandlerFn),
+}
 
 impl ToolCallOutput {
     /// Convenience constructor: summary only, no raw data frame.
