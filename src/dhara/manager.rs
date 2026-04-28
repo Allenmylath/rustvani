@@ -124,6 +124,17 @@ impl DharaManager {
         self.nodes.insert(name, RegisteredNode { config, handlers });
     }
 
+    /// Register a node with no tool handlers.
+    pub fn register_node_no_tools(
+        &mut self,
+        name: impl Into<String>,
+        config: NodeConfig,
+    ) {
+        let name = name.into();
+        log::debug!("Dhara: registered node '{}' (no tools)", name);
+        self.nodes.insert(name, RegisteredNode { config, handlers: vec![] });
+    }
+
     /// Set the initial node. Applies immediately (no pending transition).
     ///
     /// Panics if the node name is not registered.
