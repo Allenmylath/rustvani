@@ -62,6 +62,10 @@ pub enum FrameKind {
     // Data — function calling
     FunctionCallInProgress,
     FunctionCallResult,
+    /// Raw structured data from a data tool — full payload, not summarised.
+    /// Downstream processors (loggers, UI aggregators) consume this.
+    /// The LLM never sees this — it gets only the summary via FunctionCallResult.
+    FunctionCallRawResult,
     // Data — audio output
     OutputAudioRaw,
 }
@@ -150,14 +154,33 @@ pub struct FunctionCallData {
 }
 
 /// Payload for FunctionCallResultFrame — tool execution result.
+///
+/// Carries the *summary* string that goes into LLM context.
+/// For the full raw payload, see `FunctionCallRawResultData`.
 #[derive(Debug, Clone)]
 pub struct FunctionCallResultData {
     /// Matches the `id` of the `FunctionCallData` this responds to.
     pub id: String,
     /// Name of the function that was called.
     pub function_name: String,
-    /// Serialized result (typically JSON).
+    /// Summarised result — what the LLM sees in context.
     pub result: String,
+}
+
+/// Payload for FunctionCallRawResultFrame — full structured data from a data tool.
+///
+/// Emitted *alongside* `FunctionCallResultFrame` when a data tool returns
+/// `full_data: Some(value)`. The LLM never sees this — only the summary in
+/// `FunctionCallResultFrame` goes into context. Downstream processors
+/// (loggers, UI, storage sinks) consume this frame.
+#[derive(Debug, Clone)]
+pub struct FunctionCallRawResultData {
+    /// Matches the `id` of the originating `FunctionCallData`.
+    pub id: String,
+    /// Name of the function that was called.
+    pub function_name: String,
+    /// Full structured output from the tool handler.
+    pub raw_data: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -239,8 +262,10 @@ pub enum DataFrame {
     LLMContextFrame(Arc<Mutex<crate::context::LLMContext>>),
     /// Model wants to invoke a tool — downstream observers can show "thinking…"
     FunctionCallInProgress(FunctionCallData),
-    /// Tool execution result — downstream observers can show the result.
+    /// Tool execution summary — what goes into LLM context.
     FunctionCallResult(FunctionCallResultData),
+    /// Full raw structured data from a data tool — LLM never sees this.
+    FunctionCallRawResult(FunctionCallRawResultData),
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +336,7 @@ impl Frame {
                 DataFrame::LLMContextFrame(_)          => "LLMContextFrame",
                 DataFrame::FunctionCallInProgress(_)   => "FunctionCallInProgressFrame",
                 DataFrame::FunctionCallResult(_)       => "FunctionCallResultFrame",
+                DataFrame::FunctionCallRawResult(_)    => "FunctionCallRawResultFrame",
             },
         }
     }
@@ -360,6 +386,7 @@ impl Frame {
                 DataFrame::LLMContextFrame(_)          => FrameKind::LLMContextFrame,
                 DataFrame::FunctionCallInProgress(_)   => FrameKind::FunctionCallInProgress,
                 DataFrame::FunctionCallResult(_)       => FrameKind::FunctionCallResult,
+                DataFrame::FunctionCallRawResult(_)    => FrameKind::FunctionCallRawResult,
             },
         }
     }
@@ -519,6 +546,13 @@ impl Frame {
     }
     pub fn function_call_result(data: FunctionCallResultData) -> Self {
         Self::make(FrameInner::Data(DataFrame::FunctionCallResult(data)))
+    }
+    /// Emit full structured data from a data tool.
+    ///
+    /// Only pushed when `ToolCallOutput.full_data` is `Some`. The LLM never
+    /// sees this frame — it receives only the summary via `function_call_result`.
+    pub fn function_call_raw_result(data: FunctionCallRawResultData) -> Self {
+        Self::make(FrameInner::Data(DataFrame::FunctionCallRawResult(data)))
     }
 
     // ---- RAVI protocol ----
