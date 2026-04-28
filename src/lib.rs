@@ -20,8 +20,9 @@ pub use error::{PipecatError, Result};
 pub use frames::{
     AudioRawData, ControlFrame, DataFrame, DataFrameData, ErrorFrameData, Frame, FrameDirection,
     FrameHandler, FrameInner, FrameKind, FrameProcessor, FrameProcessorSetup, PassthroughHandler,
-    StartFrameData, SystemFrame, TranscriptionData,
+    StartFrameData, SystemFrame, TranscriptionData, FunctionCallData, FunctionCallResultData,
 };
+pub use context::{shared_context, LLMContext, ToolCall};
 pub use pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask};
 pub use processors::llm_user_aggregator::LLMUserAggregator;
 pub use processors::llm_assistant_aggregator::LLMAssistantAggregator;
