@@ -1,3 +1,8 @@
+//! LLM Assistant Aggregator.
+//!
+//! Collects LLMTextFrames during a bot response and saves the complete
+//! assistant message to the shared LLMContext.
+
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -15,13 +20,13 @@ struct State {
     in_response: bool,
 }
 
-/// Collects LLMTextFrames between LLMFullResponseStart and LLMFullResponseEnd.
+/// Collects LLMTextFrames between LLMFullResponseStart and LLMFullResponseEnd,
+/// then saves the complete assistant message to shared LLMContext.
 ///
-/// When the response ends:
-///   - Appends the complete assistant turn to the shared LLMContext.
+/// LLMTextFrames pass through unchanged — TTS needs each chunk for streaming.
 ///
-/// LLMTextFrames ARE passed downstream — TTS needs them as they arrive.
-/// On interruption the partial aggregation is discarded — not saved to context.
+/// On interruption mid-response, the partial aggregation is discarded and
+/// not saved to context — the model never "said" the interrupted portion.
 pub struct LLMAssistantAggregator {
     context: Arc<Mutex<LLMContext>>,
     state: Mutex<State>,
@@ -53,7 +58,11 @@ impl FrameHandler for LLMAssistantAggregator {
     ) -> Result<()> {
         match &frame.inner {
             FrameInner::Control(ControlFrame::LLMFullResponseStart) => {
-                self.state.lock().unwrap().in_response = true;
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.in_response = true;
+                    state.aggregation.clear();
+                }
                 processor.push_frame(frame, direction).await?;
             }
 
@@ -86,7 +95,7 @@ impl FrameHandler for LLMAssistantAggregator {
                     self.context
                         .lock()
                         .unwrap()
-                        .add_message("assistant", &aggregation);
+                        .add_assistant_message(&aggregation);
                 }
 
                 processor.push_frame(frame, direction).await?;

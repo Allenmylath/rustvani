@@ -53,17 +53,65 @@ impl LLMAdapter for OpenAILLMAdapter {
     }
 
     fn convert_messages(&self, messages: &[Message]) -> Vec<Value> {
-        messages
-            .iter()
-            .map(|msg| {
-                // For now, simple text messages. When Message gains
-                // tool_calls / tool_call_id fields, this will expand
-                // to emit the full OpenAI message shape.
+        messages.iter().map(|msg| Self::message_to_value(msg)).collect()
+    }
+}
+
+impl OpenAILLMAdapter {
+    /// Convert a single `Message` enum variant to OpenAI's JSON shape.
+    fn message_to_value(msg: &Message) -> Value {
+        match msg {
+            Message::System { content } => {
+                json!({ "role": "system", "content": content })
+            }
+
+            Message::User { content } => {
+                json!({ "role": "user", "content": content })
+            }
+
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("role".into(), Value::String("assistant".into()));
+
+                // content can be null when the model only produces tool calls
+                match content {
+                    Some(text) => obj.insert("content".into(), Value::String(text.clone())),
+                    None => obj.insert("content".into(), Value::Null),
+                };
+
+                if let Some(calls) = tool_calls {
+                    let calls_json: Vec<Value> = calls
+                        .iter()
+                        .map(|tc| {
+                            json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function_name,
+                                    "arguments": tc.arguments,
+                                }
+                            })
+                        })
+                        .collect();
+                    obj.insert("tool_calls".into(), Value::Array(calls_json));
+                }
+
+                Value::Object(obj)
+            }
+
+            Message::ToolResult {
+                tool_call_id,
+                content,
+            } => {
                 json!({
-                    "role": msg.role,
-                    "content": msg.content
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": content,
                 })
-            })
-            .collect()
+            }
+        }
     }
 }

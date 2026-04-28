@@ -1,7 +1,8 @@
 //! Sarvam LLM service.
 //!
 //! Direct HTTP to https://api.sarvam.ai/v1/chat/completions.
-//! No OpenAI client, no adapter chain — plain reqwest + SSE parsing.
+//! Uses the OpenAI adapter for message/tool conversion since Sarvam's API
+//! is OpenAI-compatible.
 //!
 //! Pipeline position:
 //!   LLMUserAggregator → SarvamLLMHandler → LLMAssistantAggregator
@@ -20,7 +21,10 @@ use futures::StreamExt;
 use log;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::adapters::base::LLMAdapter;
+use crate::adapters::openai::OpenAILLMAdapter;
 use crate::context::LLMContext;
 use crate::error::{PipecatError, Result};
 use crate::frames::{
@@ -50,8 +54,8 @@ impl Default for SarvamLLMConfig {
             api_key: String::new(),
             model: "sarvam-30b".to_string(),
             base_url: "https://api.sarvam.ai/v1".to_string(),
-            temperature: Some(0.2),   // recommended for non-think mode
-            reasoning_effort: None,   // None = non-think mode
+            temperature: Some(0.2),
+            reasoning_effort: None,
         }
     }
 }
@@ -63,13 +67,20 @@ impl Default for SarvamLLMConfig {
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
-    messages: Vec<crate::context::Message>,
+    /// Messages as provider-formatted JSON (produced by the adapter).
+    messages: Vec<Value>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     /// Omit entirely for non-think mode. Any value enables CoT thinking.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    /// Tool definitions. Omitted when no tools are configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
+    /// Tool choice. Omitted when no tools are configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +107,7 @@ struct ChunkDelta {
 pub struct SarvamLLMHandler {
     config: SarvamLLMConfig,
     client: Client,
+    adapter: OpenAILLMAdapter,
 }
 
 impl SarvamLLMHandler {
@@ -103,6 +115,7 @@ impl SarvamLLMHandler {
         Self {
             config,
             client: Client::new(),
+            adapter: OpenAILLMAdapter::new(),
         }
     }
 
@@ -116,14 +129,30 @@ impl SarvamLLMHandler {
         context: std::sync::Arc<std::sync::Mutex<LLMContext>>,
         processor: &FrameProcessor,
     ) -> Result<()> {
-        // Snapshot messages — release lock before any await
-        let messages = context.lock().unwrap().to_api_messages();
+        // Lock context, extract what we need, release lock immediately
+        let (api_messages, tools, tool_choice) = {
+            let ctx = context.lock().unwrap();
+            let messages = ctx.to_api_messages();
+
+            // Convert through the adapter (same format as OpenAI)
+            let converted = self.adapter.convert_messages(&messages);
+
+            let tools = ctx.tools.as_ref().map(|t| {
+                self.adapter.to_provider_tools_format(t)
+            });
+
+            let tool_choice = ctx.tool_choice.as_ref().map(|tc| {
+                self.adapter.to_provider_tool_choice(tc)
+            });
+
+            (converted, tools, tool_choice)
+        };
 
         let url = format!("{}/chat/completions", self.config.base_url);
 
         log::info!(
             "SarvamLLM: {} messages → {} (model={}, reasoning_effort={:?})",
-            messages.len(),
+            api_messages.len(),
             url,
             self.config.model,
             self.config.reasoning_effort,
@@ -131,10 +160,12 @@ impl SarvamLLMHandler {
 
         let body = ChatRequest {
             model: self.config.model.clone(),
-            messages,
+            messages: api_messages,
             stream: true,
             temperature: self.config.temperature,
             reasoning_effort: self.config.reasoning_effort.clone(),
+            tools,
+            tool_choice,
         };
 
         let response = self
@@ -167,7 +198,6 @@ impl SarvamLLMHandler {
 
             buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-            // Drain all complete lines from buffer
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].trim_end_matches('\r').trim().to_string();
                 buffer = buffer[pos + 1..].to_string();
@@ -178,7 +208,7 @@ impl SarvamLLMHandler {
 
                 let data = match line.strip_prefix("data: ") {
                     Some(d) => d,
-                    None => continue, // e.g. "event: ...", ignore
+                    None => continue,
                 };
 
                 if data == "[DONE]" {
