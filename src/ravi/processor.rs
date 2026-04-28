@@ -166,7 +166,7 @@ impl RaviHandler {
             processor.broadcast_interruption().await?;
         }
 
-        context.lock().unwrap().add_message("user", &data.content);
+        context.lock().unwrap().add_user_message(&data.content);
         processor
             .push_frame(Frame::llm_context(context.clone()), FrameDirection::Downstream)
             .await?;
