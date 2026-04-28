@@ -24,11 +24,11 @@ use crate::adapters::openai::OpenAILLMAdapter;
 use crate::context::{LLMContext, ToolCall};
 use crate::error::{PipecatError, Result};
 use crate::frames::{
-    DataFrame, Frame, FrameDirection, FunctionCallData, FunctionCallResultData,
-    FrameHandler, FrameInner, FrameProcessor,
+    DataFrame, Frame, FrameDirection, FunctionCallData, FunctionCallRawResultData,
+    FunctionCallResultData, FrameHandler, FrameInner, FrameProcessor,
 };
 
-use super::function_registry::FunctionRegistry;
+use super::function_registry::{FunctionRegistry, RegistryHandler};
 
 /// Hook called after all tool calls in a batch complete, before re-invoking
 /// inference. Used by DharaManager to apply node transitions.
@@ -381,24 +381,53 @@ impl OpenAILLMHandler {
                             reg.get(&tc.function_name).cloned()
                         };
 
-                        let result = if let Some(handler) = handler {
-                            log::info!("OpenAILLM: executing '{}' (id={})", tc.function_name, tc.id);
-                            handler(tc.arguments.clone()).await
-                        } else {
-                            log::warn!("OpenAILLM: no handler for '{}'", tc.function_name);
-                            format!("{{\"error\": \"function '{}' is not registered\"}}", tc.function_name)
+                        // Execute handler and resolve to (summary, Option<raw_data>)
+                        // based on which breed registered the function.
+                        let (summary, raw_data) = match handler {
+                            Some(RegistryHandler::Simple(f)) => {
+                                log::info!("OpenAILLM: executing simple '{}' (id={})", tc.function_name, tc.id);
+                                let result = f(tc.arguments.clone()).await;
+                                (result, None)
+                            }
+                            Some(RegistryHandler::Data(f)) => {
+                                log::info!("OpenAILLM: executing data '{}' (id={})", tc.function_name, tc.id);
+                                let output = f(tc.arguments.clone()).await;
+                                (output.summary, output.full_data)
+                            }
+                            None => {
+                                log::warn!("OpenAILLM: no handler for '{}'", tc.function_name);
+                                (
+                                    format!("{{\"error\": \"function '{}' is not registered\"}}", tc.function_name),
+                                    None,
+                                )
+                            }
                         };
 
+                        // If the data handler returned a full payload, emit it
+                        // as a raw result frame downstream. The LLM never sees this.
+                        if let Some(data) = raw_data {
+                            processor.push_frame(
+                                Frame::function_call_raw_result(FunctionCallRawResultData {
+                                    id: tc.id.clone(),
+                                    function_name: tc.function_name.clone(),
+                                    raw_data: data,
+                                }),
+                                FrameDirection::Downstream,
+                            ).await?;
+                        }
+
+                        // Summary result frame — LLM sees this on next round.
                         processor.push_frame(
                             Frame::function_call_result(FunctionCallResultData {
                                 id: tc.id.clone(),
                                 function_name: tc.function_name.clone(),
-                                result: result.clone(),
+                                result: summary.clone(),
                             }),
                             FrameDirection::Downstream,
                         ).await?;
 
-                        context.lock().unwrap().add_tool_result(&tc.id, &result);
+                        // Only the summary goes into LLM context.
+                        context.lock().unwrap().add_tool_result(&tc.id, &summary);
                     }
 
                     processor.push_frame(Frame::function_call_end(), FrameDirection::Downstream).await?;
