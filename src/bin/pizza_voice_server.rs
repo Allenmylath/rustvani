@@ -474,7 +474,7 @@ fn build_flow() -> ConnectionFlow {
         ("place_order", make_place_order_handler(order.clone())),
     ]);
 
-    dhara.register_node("farewell", farewell_node(), vec![]);
+    dhara.register_node_no_tools("farewell", farewell_node());
 
     dhara.set_initial_node("greeting");
 
