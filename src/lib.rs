@@ -34,3 +34,4 @@ pub use services::{
 };
 pub use transport::{BaseInputTransport, BaseOutputTransport, BaseTransport, TransportParams};
 pub use vad::{SileroVad, VadAnalyzer, VadParams, VadState};
+pub mod dhara;
