@@ -31,6 +31,7 @@ pub use services::{
     SarvamSttConfig, SarvamSttHandler,
     SarvamTtsConfig, SarvamTtsHandler,
     PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler,
+    OpenAILLMConfig, OpenAILLMHandler, FunctionRegistry,
 };
 pub use transport::{BaseInputTransport, BaseOutputTransport, BaseTransport, TransportParams};
 pub use vad::{SileroVad, VadAnalyzer, VadParams, VadState};
