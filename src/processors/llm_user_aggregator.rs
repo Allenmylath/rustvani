@@ -1,3 +1,7 @@
+//! LLM User Aggregator.
+//!
+//! Collects TranscriptionFrames during a user turn and triggers LLM inference.
+
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -10,7 +14,7 @@ use crate::frames::{
 };
 
 struct State {
-    aggregation:   String,
+    aggregation: String,
     user_speaking: bool,
 }
 
@@ -25,14 +29,12 @@ struct State {
 /// Interruption:
 ///   On VADUserStartedSpeaking, if interruptions are allowed, broadcasts
 ///   InterruptionFrame in both directions so the bot stops immediately.
-///   On TranscriptionFrame, also broadcasts InterruptionFrame as a fallback
-///   in case VAD missed.  Duplicate interruptions are idempotent downstream.
 ///
 /// TranscriptionFrames are consumed here — not forwarded downstream.
 /// Everything else passes through unchanged.
 pub struct LLMUserAggregator {
     context: Arc<Mutex<LLMContext>>,
-    state:   Mutex<State>,
+    state: Mutex<State>,
 }
 
 impl LLMUserAggregator {
@@ -42,7 +44,7 @@ impl LLMUserAggregator {
             Box::new(Self {
                 context,
                 state: Mutex::new(State {
-                    aggregation:   String::new(),
+                    aggregation: String::new(),
                     user_speaking: false,
                 }),
             }),
@@ -67,7 +69,7 @@ impl LLMUserAggregator {
 
         log::info!("LLMUserAggregator: user said: '{}'", aggregation);
 
-        self.context.lock().unwrap().add_message("user", &aggregation);
+        self.context.lock().unwrap().add_user_message(&aggregation);
 
         processor
             .push_frame(
@@ -92,15 +94,15 @@ impl FrameHandler for LLMUserAggregator {
             FrameInner::System(SystemFrame::VADUserStartedSpeaking { .. }) => {
                 self.state.lock().unwrap().user_speaking = true;
                 processor.push_frame(frame, direction).await?;
-
+                // Broadcast interruption so bot stops immediately
                 if processor.interruptions_allowed() {
-                    log::debug!("LLMUserAggregator: user started speaking — broadcasting interruption");
                     processor.broadcast_interruption().await?;
                 }
             }
 
             FrameInner::System(SystemFrame::VADUserStoppedSpeaking { .. }) => {
                 self.state.lock().unwrap().user_speaking = false;
+                // Push VAD frame first so downstream sees it before LLMContextFrame
                 processor.push_frame(frame, direction).await?;
                 // Path A: transcripts already arrived — flush now
                 self.flush_and_trigger(processor).await?;
@@ -112,32 +114,22 @@ impl FrameHandler for LLMUserAggregator {
                     return Ok(());
                 }
 
-                let user_speaking = {
+                let should_trigger = {
                     let mut state = self.state.lock().unwrap();
-                    if !state.aggregation.is_empty() {
+                    if state.aggregation.is_empty() {
+                        state.aggregation = text;
+                    } else {
                         state.aggregation.push(' ');
+                        state.aggregation.push_str(&text);
                     }
-                    state.aggregation.push_str(&text);
-                    log::debug!("LLMUserAggregator: accumulated '{}'", text);
-                    state.user_speaking
+                    // Path B: transcript arrived after VAD stop
+                    !state.user_speaking
                 };
 
-                // Transcript proves user spoke — interrupt even if VAD missed.
-                // Duplicate interruptions are idempotent downstream.
-                if processor.interruptions_allowed() {
-                    processor.broadcast_interruption().await?;
-                }
-
-                if !user_speaking {
-                    // Path B: VAD already stopped — trigger immediately
-                    log::debug!("LLMUserAggregator: late transcript, triggering now");
+                if should_trigger {
                     self.flush_and_trigger(processor).await?;
                 }
-            }
-
-            FrameInner::System(SystemFrame::Interruption) => {
-                self.state.lock().unwrap().aggregation.clear();
-                processor.push_frame(frame, direction).await?;
+                // Transcription consumed — not forwarded
             }
 
             _ => {
