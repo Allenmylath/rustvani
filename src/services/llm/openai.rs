@@ -1,20 +1,16 @@
 //! OpenAI LLM service (chat completions, SSE streaming, function calling).
 //!
-//! POST to https://api.openai.com/v1/chat/completions with stream=true.
-//! Auth: Authorization: Bearer {api_key}
-//!
-//! When the model returns tool_calls instead of text:
-//!   1. Accumulate streamed argument fragments
-//!   2. Push FunctionCallStart downstream
-//!   3. Execute each function via the FunctionRegistry
-//!   4. Push FunctionCallInProgress/FunctionCallResult downstream
-//!   5. Append assistant + tool_result messages to context
-//!   6. Re-invoke inference with updated context
+//! Supports:
+//!   - Plain text inference
+//!   - Tool/function calling with SSE delta accumulation
+//!   - Re-invocation loop (model calls tool → execute → re-invoke)
+//!   - Dhara transition hooks for conversation flow management
 //!
 //! Pipeline position:
 //!   LLMUserAggregator → OpenAILLMHandler → LLMAssistantAggregator
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -33,6 +29,10 @@ use crate::frames::{
 };
 
 use super::function_registry::FunctionRegistry;
+
+/// Hook called after all tool calls in a batch complete, before re-invoking
+/// inference. Used by DharaManager to apply node transitions.
+pub type TransitionHook = Arc<dyn Fn(&Arc<Mutex<LLMContext>>) + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -137,7 +137,7 @@ struct ChunkToolCallFunction {
 }
 
 // ---------------------------------------------------------------------------
-// Partial tool call accumulator
+// Tool call accumulator
 // ---------------------------------------------------------------------------
 
 struct PartialToolCall {
@@ -169,37 +169,65 @@ pub struct OpenAILLMHandler {
     config: OpenAILLMConfig,
     client: Client,
     adapter: OpenAILLMAdapter,
-    registry: FunctionRegistry,
+    registry: Arc<Mutex<FunctionRegistry>>,
+    /// Optional hook called after tool calls complete, before re-invoking.
+    /// Used by DharaManager for node transitions.
+    transition_hook: Option<TransitionHook>,
 }
 
 impl OpenAILLMHandler {
+    /// Create a handler with an empty, owned registry (no tools).
     pub fn new(config: OpenAILLMConfig) -> Self {
         Self {
             config,
             client: Client::new(),
             adapter: OpenAILLMAdapter::new(),
-            registry: FunctionRegistry::new(),
+            registry: Arc::new(Mutex::new(FunctionRegistry::new())),
+            transition_hook: None,
         }
     }
 
-    /// Create a handler with a pre-built function registry.
+    /// Create a handler with a pre-built registry (simple tool calling, no dhara).
     pub fn with_registry(config: OpenAILLMConfig, registry: FunctionRegistry) -> Self {
         Self {
             config,
             client: Client::new(),
             adapter: OpenAILLMAdapter::new(),
-            registry,
+            registry: Arc::new(Mutex::new(registry)),
+            transition_hook: None,
         }
+    }
+
+    /// Create a handler with a shared registry (used by DharaManager).
+    ///
+    /// The `Arc<Mutex<FunctionRegistry>>` is shared with DharaManager,
+    /// which swaps its contents on node transitions.
+    pub fn with_shared_registry(
+        config: OpenAILLMConfig,
+        registry: Arc<Mutex<FunctionRegistry>>,
+    ) -> Self {
+        Self {
+            config,
+            client: Client::new(),
+            adapter: OpenAILLMAdapter::new(),
+            registry,
+            transition_hook: None,
+        }
+    }
+
+    /// Set the transition hook (called after tool calls, before re-invoke).
+    pub fn set_transition_hook(&mut self, hook: TransitionHook) {
+        self.transition_hook = Some(hook);
     }
 
     pub fn into_processor(self) -> FrameProcessor {
         FrameProcessor::new("OpenAILLM", Box::new(self), false)
     }
 
-    /// Run a single SSE stream. Returns the outcome.
+    /// Run a single SSE stream.
     async fn run_stream(
         &self,
-        context: &std::sync::Arc<std::sync::Mutex<LLMContext>>,
+        context: &Arc<Mutex<LLMContext>>,
         processor: &FrameProcessor,
     ) -> Result<InferenceOutcome> {
         let (api_messages, tools, tool_choice) = {
@@ -314,10 +342,10 @@ impl OpenAILLMHandler {
         }
     }
 
-    /// Full inference with tool call execution and re-invocation loop.
+    /// Full inference with tool execution and re-invocation loop.
     async fn run_inference(
         &self,
-        context: std::sync::Arc<std::sync::Mutex<LLMContext>>,
+        context: Arc<Mutex<LLMContext>>,
         processor: &FrameProcessor,
     ) -> Result<()> {
         let mut round = 0;
@@ -347,7 +375,13 @@ impl OpenAILLMHandler {
                             FrameDirection::Downstream,
                         ).await?;
 
-                        let result = if let Some(handler) = self.registry.get(&tc.function_name) {
+                        // Look up handler in the shared registry
+                        let handler = {
+                            let reg = self.registry.lock().unwrap();
+                            reg.get(&tc.function_name).cloned()
+                        };
+
+                        let result = if let Some(handler) = handler {
                             log::info!("OpenAILLM: executing '{}' (id={})", tc.function_name, tc.id);
                             handler(tc.arguments.clone()).await
                         } else {
@@ -368,6 +402,15 @@ impl OpenAILLMHandler {
                     }
 
                     processor.push_frame(Frame::function_call_end(), FrameDirection::Downstream).await?;
+
+                    // --- Transition hook ---
+                    // Called after all tool results are appended to context,
+                    // before re-invoking inference. DharaManager uses this to
+                    // swap registry and update context for the next node.
+                    if let Some(hook) = &self.transition_hook {
+                        hook(&context);
+                    }
+
                     log::info!("OpenAILLM: re-invoking inference (round {})", round + 1);
                 }
             }
