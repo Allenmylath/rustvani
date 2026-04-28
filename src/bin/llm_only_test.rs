@@ -19,8 +19,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rustvani::{
     shared_context, system_clock, ControlFrame, DataFrame, Frame, FrameDirection,
-    FrameInner, FrameKind, LLMAssistantAggregator, PipelineParams, PipelineTask, SystemFrame,
+    FrameInner, FrameKind, LLMAssistantAggregator, PipelineParams, PipelineTask,
 };
+use rustvani::context::Message;
 use rustvani::observer::{BaseObserver, FrameProcessed, FramePushed};
 use rustvani::services::{SarvamLLMConfig, SarvamLLMHandler};
 
@@ -157,6 +158,30 @@ impl BaseObserver for FrameLogger {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: display a Message enum variant
+// ---------------------------------------------------------------------------
+
+fn display_message(msg: &Message) {
+    match msg {
+        Message::System { content } => println!("[system]     {}", content),
+        Message::User { content } => println!("[user]       {}", content),
+        Message::Assistant { content, tool_calls } => {
+            if let Some(text) = content {
+                println!("[assistant]  {}", text);
+            }
+            if let Some(calls) = tool_calls {
+                for tc in calls {
+                    println!("[tool_call]  {}({}) id={}", tc.function_name, tc.arguments, tc.id);
+                }
+            }
+        }
+        Message::ToolResult { tool_call_id, content } => {
+            println!("[tool_result] id={} → {}", tool_call_id, content);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -178,7 +203,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let context = shared_context(Some(
         "You are a concise assistant. Answer in one or two sentences.".to_string(),
     ));
-    context.lock().unwrap().add_message("user", &question);
+    context.lock().unwrap().add_user_message(&question);
 
     let task = PipelineTask::new(
         vec![
@@ -210,7 +235,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== final context ===");
     for msg in &context.lock().unwrap().messages {
-        println!("[{}]  {}", msg.role, msg.content);
+        display_message(msg);
     }
 
     Ok(())
