@@ -2,7 +2,6 @@
 //!
 //! POST to https://api.openai.com/v1/chat/completions with stream=true.
 //! Auth: Authorization: Bearer {api_key}
-//! Tool/function calls are not handled — text output only.
 //!
 //! Pipeline position:
 //!   LLMUserAggregator → OpenAILLMHandler → LLMAssistantAggregator
@@ -21,7 +20,10 @@ use futures::StreamExt;
 use log;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::adapters::base::LLMAdapter;
+use crate::adapters::openai::OpenAILLMAdapter;
 use crate::context::LLMContext;
 use crate::error::{PipecatError, Result};
 use crate::frames::{
@@ -74,7 +76,8 @@ impl Default for OpenAILLMConfig {
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
-    messages: Vec<crate::context::Message>,
+    /// Messages as provider-formatted JSON (produced by the adapter).
+    messages: Vec<Value>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -90,15 +93,19 @@ struct ChatRequest {
     max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     service_tier: Option<String>,
+    /// Tool definitions. Omitted when no tools are configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
+    /// Tool choice. Omitted when no tools are configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
 }
 
 #[derive(Deserialize)]
 struct ChatChunk {
     choices: Vec<ChunkChoice>,
-    // usage is only present on the final chunk when stream_options.include_usage=true.
-    // We don't request it for now, so this is always None.
     #[allow(dead_code)]
-    usage: Option<serde_json::Value>,
+    usage: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -111,7 +118,6 @@ struct ChunkChoice {
 #[derive(Deserialize)]
 struct ChunkDelta {
     content: Option<String>,
-    // role is present on the first chunk only ("assistant"). Ignored.
     #[allow(dead_code)]
     role: Option<String>,
 }
@@ -123,6 +129,7 @@ struct ChunkDelta {
 pub struct OpenAILLMHandler {
     config: OpenAILLMConfig,
     client: Client,
+    adapter: OpenAILLMAdapter,
 }
 
 impl OpenAILLMHandler {
@@ -130,6 +137,7 @@ impl OpenAILLMHandler {
         Self {
             config,
             client: Client::new(),
+            adapter: OpenAILLMAdapter::new(),
         }
     }
 
@@ -143,20 +151,37 @@ impl OpenAILLMHandler {
         context: std::sync::Arc<std::sync::Mutex<LLMContext>>,
         processor: &FrameProcessor,
     ) -> Result<()> {
-        let messages = context.lock().unwrap().to_api_messages();
+        // Lock context, extract what we need, release lock immediately
+        let (api_messages, tools, tool_choice) = {
+            let ctx = context.lock().unwrap();
+            let messages = ctx.to_api_messages();
+
+            // Convert through the adapter
+            let converted = self.adapter.convert_messages(&messages);
+
+            let tools = ctx.tools.as_ref().map(|t| {
+                self.adapter.to_provider_tools_format(t)
+            });
+
+            let tool_choice = ctx.tool_choice.as_ref().map(|tc| {
+                self.adapter.to_provider_tool_choice(tc)
+            });
+
+            (converted, tools, tool_choice)
+        };
 
         let url = format!("{}/chat/completions", self.config.base_url);
 
         log::info!(
             "OpenAILLM: {} messages → {} (model={})",
-            messages.len(),
+            api_messages.len(),
             url,
             self.config.model,
         );
 
         let body = ChatRequest {
             model: self.config.model.clone(),
-            messages,
+            messages: api_messages,
             stream: true,
             temperature: self.config.temperature,
             top_p: self.config.top_p,
@@ -165,6 +190,8 @@ impl OpenAILLMHandler {
             seed: self.config.seed,
             max_completion_tokens: self.config.max_completion_tokens,
             service_tier: self.config.service_tier.clone(),
+            tools,
+            tool_choice,
         };
 
         let response = self
@@ -189,7 +216,7 @@ impl OpenAILLMHandler {
             )));
         }
 
-        // --- SSE line-by-line parsing (identical pattern to sarvam.rs) ---
+        // --- SSE line-by-line parsing ---
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
 
