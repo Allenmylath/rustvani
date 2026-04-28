@@ -15,7 +15,6 @@ pub mod ravi;
 pub mod adapters;
 
 pub use clock::{BaseClock, SystemClock, system_clock};
-pub use context::{shared_context, LLMContext};
 pub use error::{PipecatError, Result};
 pub use frames::{
     AudioRawData, ControlFrame, DataFrame, DataFrameData, ErrorFrameData, Frame, FrameDirection,
