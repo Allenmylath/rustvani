@@ -705,7 +705,6 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     let pg_tool = Arc::new(
         NeonPostgresTool::new(
             NeonPostgresConfig::new(&app_state.database_url)
-                .with_read_only(true)
                 .with_statement_timeout_ms(8_000),
         )
     );
