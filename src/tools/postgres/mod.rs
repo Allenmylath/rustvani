@@ -620,8 +620,7 @@ impl NeonPostgresTool {
                 },
                 "required": ["result_set_id", "filters"],
                 "additionalProperties": false
-            }))
-            .with_strict(true),
+            })),
             FunctionSchema::new(
                 "pg_vector_search",
                 "pgvector similarity search. Returns results ordered by distance. \
