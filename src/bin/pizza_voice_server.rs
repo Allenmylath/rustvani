@@ -55,7 +55,7 @@ use rustvani::services::{
     SarvamTtsConfig, SarvamTtsHandler,
 };
 use rustvani::services::llm::function_registry::FunctionRegistry;
-use rustvani::tools::NeonPostgresTool;
+use rustvani::tools::{BuiltinTool, NeonPostgresTool};
 use rustvani::tools::postgres::NeonPostgresConfig;
 use rustvani::transport::websocket::{WebSocketParams, WebSocketTransport};
 use rustvani::transport::TransportParams;
