@@ -355,20 +355,20 @@ fn menu_node(pg_schemas: Vec<FunctionSchema>) -> NodeConfig {
     NodeConfig::new("menu")
         .with_system_prompt(
             "You are a pizza ordering assistant at Dhara Pizza. \
-             The menu lives in a Neon database — use pg_schema to understand the tables, \
-             then pg_query to fetch pizza and topping information when the customer asks. \
-             Always query the DB before answering questions about the menu, prices, \
-             dietary requirements, or availability — never guess from training data. \
-             Keep voice responses short. \
-             Sizes: small, medium, large. Extra toppings $1.50 each."
+             The menu lives in a database. Use pg_query to fetch data when needed. \
+             CRITICAL: when a tool call returns a result_set ID and item count, \
+             the query SUCCEEDED and the data is already on the customer's screen. \
+             Do NOT retry the query. Just say something like \
+             'The menu is on your screen — what looks good?' \
+             Only retry if you get an explicit error message string. \
+             Keep all voice responses to one or two sentences."
         )
         .with_task_message(
             "Help the customer build their order. \
-             Use pg_query to look up menu items, prices, and dietary info on demand. \
-             Use add_to_order when they choose a pizza, view_order to read back the order, \
-             remove_from_order if they change their mind. \
-             When they are done ordering, use confirm_order. \
-             Keep responses brief — this is a voice conversation."
+             When they ask to see the menu, call pg_query once then verbally invite \
+             them to pick — the data is shown on their screen, do not read it all out. \
+             Use add_to_order when they choose, view_order to recap the order, \
+             remove_from_order to change it, confirm_order when done."
         )
         .with_tools(ToolsSchema::new(tools))
         .with_context_strategy(ContextStrategy::Append)
