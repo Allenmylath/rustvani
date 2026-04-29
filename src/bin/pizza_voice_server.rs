@@ -8,7 +8,7 @@
 //!     → RaviProcessor
 //!     → SarvamStt
 //!     → LLMUserAggregator
-//!     → OpenAILLM (with dhara transition hook + NeonPostgresTool)
+//!     → OpenAILLM (with dhara transition hook + fetch_menu data tool)
 //!     → LLMAssistantAggregator
 //!     → SarvamTts
 //!     → WebSocketTransport.output()
@@ -29,7 +29,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
@@ -56,9 +56,7 @@ use rustvani::services::{
     SarvamSttConfig, SarvamSttHandler,
     SarvamTtsConfig, SarvamTtsHandler,
 };
-use rustvani::services::llm::function_registry::FunctionRegistry;
-use rustvani::tools::{BuiltinTool, NeonPostgresTool};
-use rustvani::tools::postgres::NeonPostgresConfig;
+use rustvani::services::llm::function_registry::{FunctionRegistry, ToolCallOutput};
 use rustvani::transport::websocket::{WebSocketParams, WebSocketTransport};
 use rustvani::transport::TransportParams;
 
@@ -126,9 +124,9 @@ impl OrderState {
 }
 
 // ---------------------------------------------------------------------------
-// OrderWriter — dedicated Neon connection for reads + writes.
+// OrderWriter — dedicated Neon connection for all DB operations.
 //
-// Handles both validation reads (pizza/size/topping lookups at add time)
+// Handles menu reads, validation reads (pizza/size/topping lookups),
 // and confirmed order writes (place_order).
 // ---------------------------------------------------------------------------
 
@@ -160,6 +158,83 @@ impl OrderWriter {
         *self.client.lock().await = Some(client);
         log::info!("OrderWriter: connected to Neon");
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Menu — full menu fetch for the data tool
+    // -----------------------------------------------------------------------
+
+    /// Fetch the complete menu: all available pizzas with sizes/prices,
+    /// plus all available toppings with prices.
+    ///
+    /// Returns structured JSON ready for the UI.
+    async fn fetch_menu(&self) -> Result<Value, String> {
+        let guard = self.client.lock().await;
+        let client = guard.as_ref()
+            .ok_or_else(|| "OrderWriter not initialized".to_string())?;
+
+        // Pizzas with sizes (grouped by pizza name since ORDER BY groups them)
+        let rows = client.query(
+            "SELECT p.name, p.description, p.is_vegetarian, ps.size, ps.price \
+             FROM pizzas p \
+             JOIN pizza_sizes ps ON p.id = ps.pizza_id \
+             WHERE p.is_available = true \
+             ORDER BY p.name, ps.price",
+            &[],
+        ).await.map_err(|e| format!("Menu query failed: {}", e))?;
+
+        let mut pizzas: Vec<Value> = Vec::new();
+
+        for row in &rows {
+            let name: String = row.get(0);
+            let description: Option<String> = row.get(1);
+            let vegetarian: bool = row.get(2);
+            let size: String = row.get(3);
+            let price: f64 = row.get(4);
+
+            let size_entry = json!({"size": size, "price": price});
+
+            // If this is the same pizza as the last entry, append the size
+            let same_pizza = pizzas.last()
+                .and_then(|p| p["name"].as_str())
+                .map(|n| n == name)
+                .unwrap_or(false);
+
+            if same_pizza {
+                if let Some(last) = pizzas.last_mut() {
+                    if let Some(obj) = last.as_object_mut() {
+                        if let Some(Value::Array(sizes)) = obj.get_mut("sizes") {
+                            sizes.push(size_entry);
+                        }
+                    }
+                }
+            } else {
+                pizzas.push(json!({
+                    "name": name,
+                    "description": description.unwrap_or_default(),
+                    "vegetarian": vegetarian,
+                    "sizes": [size_entry],
+                }));
+            }
+        }
+
+        // Toppings
+        let topping_rows = client.query(
+            "SELECT name, price_per_unit FROM toppings WHERE is_available = true ORDER BY name",
+            &[],
+        ).await.map_err(|e| format!("Toppings query failed: {}", e))?;
+
+        let toppings: Vec<Value> = topping_rows.iter().map(|r| {
+            json!({
+                "name": r.get::<_, String>(0),
+                "price": r.get::<_, f64>(1),
+            })
+        }).collect();
+
+        Ok(json!({
+            "pizzas": pizzas,
+            "toppings": toppings,
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -321,8 +396,22 @@ impl OrderWriter {
 }
 
 // ---------------------------------------------------------------------------
-// Tool schemas — pizza-specific
+// Tool schemas
 // ---------------------------------------------------------------------------
+
+fn fetch_menu_schema() -> FunctionSchema {
+    FunctionSchema::new(
+        "fetch_menu",
+        "Display the full pizza menu on the customer's screen. \
+         Shows all available pizzas with sizes and prices, plus available toppings. \
+         Data goes directly to the UI — do NOT read the entire menu aloud."
+    )
+    .with_parameters(json!({
+        "type": "object",
+        "properties": {},
+        "required": []
+    }))
+}
 
 fn browse_menu_schema() -> FunctionSchema {
     FunctionSchema::new("browse_menu", "Customer wants to see the menu and start ordering")
@@ -432,29 +521,21 @@ fn greeting_node() -> NodeConfig {
             "Greet the customer warmly. Ask if they'd like to see the menu. \
              When they say yes, use the browse_menu tool."
         )
-        .with_tools(ToolsSchema::new(vec![browse_menu_schema()]))
+        .with_tools(ToolsSchema::new(vec![
+            browse_menu_schema(),
+            fetch_menu_schema(),
+        ]))
         .with_respond_immediately(true)
 }
 
-fn menu_node(pg_schemas: Vec<FunctionSchema>) -> NodeConfig {
-    // Merge pizza ordering tools with the pg query tools
-    let mut tools = vec![
-        add_to_order_schema(),
-        remove_from_order_schema(),
-        view_order_schema(),
-        confirm_order_schema(),
-    ];
-    tools.extend(pg_schemas);
-
+fn menu_node() -> NodeConfig {
     NodeConfig::new("menu")
         .with_system_prompt(
             "You are a pizza ordering assistant at Dhara Pizza. \
-             The menu lives in a database. Use pg_query to fetch data when needed. \
-             CRITICAL: when a tool call returns a result_set ID and item count, \
-             the query SUCCEEDED and the data is already on the customer's screen. \
-             Do NOT retry the query. Just say something like \
+             CRITICAL: when a tool call returns a result and item count, \
+             the data is already on the customer's screen. \
+             Do NOT read the entire menu aloud — just say something like \
              'The menu is on your screen — what looks good?' \
-             Only retry if you get an explicit error message string. \
              When the customer picks a pizza, use add_to_order — it will \
              validate the name against the database and return the actual \
              price and available options. If validation fails, tell the \
@@ -463,34 +544,37 @@ fn menu_node(pg_schemas: Vec<FunctionSchema>) -> NodeConfig {
         )
         .with_task_message(
             "Help the customer build their order. \
-             When they ask to see the menu, call pg_query once then verbally invite \
-             them to pick — the data is shown on their screen, do not read it all out. \
+             If they want to see the menu again, call fetch_menu — the data \
+             appears on their screen, just invite them to pick. \
              Use add_to_order when they choose (it validates against the DB), \
              view_order to recap the order, \
              remove_from_order to change it, confirm_order when done."
         )
-        .with_tools(ToolsSchema::new(tools))
+        .with_tools(ToolsSchema::new(vec![
+            fetch_menu_schema(),
+            add_to_order_schema(),
+            remove_from_order_schema(),
+            view_order_schema(),
+            confirm_order_schema(),
+        ]))
         .with_context_strategy(ContextStrategy::Append)
         .with_respond_immediately(true)
 }
 
-fn confirm_node(pg_schemas: Vec<FunctionSchema>) -> NodeConfig {
-    let mut tools = vec![
-        view_order_schema(),
-        modify_order_schema(),
-        place_order_schema(),
-    ];
-    tools.extend(pg_schemas);
-
+fn confirm_node() -> NodeConfig {
     NodeConfig::new("confirm")
         .with_task_message(
             "Read back the complete order summary to the customer briefly (use view_order). \
              Ask them to confirm or if they want to make changes. \
              Use modify_order to return to the menu, \
-             or place_order with their delivery address to finalise. \
-             You can use pg_query if you need to re-check any item details."
+             or place_order with their delivery address to finalise."
         )
-        .with_tools(ToolsSchema::new(tools))
+        .with_tools(ToolsSchema::new(vec![
+            fetch_menu_schema(),
+            view_order_schema(),
+            modify_order_schema(),
+            place_order_schema(),
+        ]))
         .with_context_strategy(ContextStrategy::Append)
         .with_respond_immediately(true)
 }
@@ -501,24 +585,72 @@ fn farewell_node() -> NodeConfig {
             "The order has been placed and saved. Thank the customer briefly, \
              mention delivery in 30-45 minutes, and say goodbye warmly. Keep it short."
         )
+        .with_tools(ToolsSchema::new(vec![
+            fetch_menu_schema(),
+        ]))
         .with_context_strategy(ContextStrategy::Append)
         .with_respond_immediately(true)
 }
 
 // ---------------------------------------------------------------------------
-// Handler factories
+// Data tool registration — fetch_menu
 // ---------------------------------------------------------------------------
 
-fn make_browse_menu_handler() -> rustvani::dhara::DharaHandlerFn {
-    Arc::new(|_args: String| {
+/// Register the `fetch_menu` data tool into the function registry.
+///
+/// This is a data tool: the full menu JSON goes to the UI via
+/// `FunctionCallRawResultFrame`, and only a short summary reaches the LLM.
+///
+/// Must be called after every Dhara node transition (the transition hook
+/// replaces the registry, wiping non-Dhara handlers).
+fn register_fetch_menu(registry: &mut FunctionRegistry, writer: Arc<OrderWriter>) {
+    registry.register_data("fetch_menu", move |_args: String| {
+        let writer = writer.clone();
+        async move {
+            match writer.fetch_menu().await {
+                Ok(menu) => {
+                    let pizza_count = menu["pizzas"]
+                        .as_array().map(|a| a.len()).unwrap_or(0);
+                    let topping_count = menu["toppings"]
+                        .as_array().map(|a| a.len()).unwrap_or(0);
+                    ToolCallOutput::with_data(
+                        format!(
+                            "Menu displayed on customer's screen: {} pizzas, {} toppings available. \
+                             Do NOT read the menu aloud — the customer can see it. \
+                             Just say something like 'the menu is on your screen' and help them pick.",
+                            pizza_count, topping_count
+                        ),
+                        menu,
+                    )
+                }
+                Err(e) => ToolCallOutput::summary_only(format!("Error fetching menu: {}", e)),
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Handler factories — Dhara handlers
+// ---------------------------------------------------------------------------
+
+fn make_browse_menu_handler(writer: Arc<OrderWriter>) -> rustvani::dhara::DharaHandlerFn {
+    Arc::new(move |_args: String| {
+        let writer = writer.clone();
         Box::pin(async move {
-            // Signal the LLM to transition to menu node.
-            // The LLM will use pg_query there to fetch the live menu.
-            let result = json!({
-                "status": "menu_ready",
-                "instruction": "Use pg_query on the pizzas and pizza_sizes tables to show the customer the menu."
-            });
-            TransitionResult::transition(result.to_string(), "menu")
+            // Fetch the menu ourselves and include it in the transition result
+            // so the LLM knows we've already fetched it. The fetch_menu data
+            // tool is also available if the customer wants to re-browse later.
+            let instruction = "The menu is being displayed on the customer's screen. \
+                               Say something like 'Here's our menu!' and help them pick. \
+                               Do NOT read the entire menu aloud.";
+
+            TransitionResult::transition(
+                json!({
+                    "status": "menu_ready",
+                    "instruction": instruction,
+                }).to_string(),
+                "menu",
+            )
         })
     })
 }
@@ -543,7 +675,6 @@ fn make_add_to_order_handler(
             let (pizza_id, canonical_name) = match writer.lookup_pizza(&pizza_name).await {
                 Ok(Some((id, name))) => (id, name),
                 Ok(None) => {
-                    // Pizza not found — suggest available options
                     let available = writer.list_pizza_names().await.unwrap_or_default();
                     let result = json!({
                         "status": "error",
@@ -801,57 +932,54 @@ struct ConnectionFlow {
 
 /// Build the Dhara flow for a single connection.
 ///
-/// `pg_tool`     — NeonPostgresTool; schemas go into menu/confirm nodes, and its
-///                 register_all() is re-run after every Dhara node transition so
-///                 that pg_* handlers survive the registry swap.
-/// `order_writer` — shared writer for add_to_order validation + place_order writes.
-fn build_flow(
-    pg_tool: Arc<NeonPostgresTool>,
-    order_writer: Arc<OrderWriter>,
-) -> ConnectionFlow {
-    let pg_schemas = pg_tool.tool_schemas();
-
+/// `order_writer` — shared writer for menu reads, add_to_order validation,
+///                  and place_order writes.
+fn build_flow(order_writer: Arc<OrderWriter>) -> ConnectionFlow {
     let order    = Arc::new(Mutex::new(OrderState::default()));
     let context  = Arc::new(Mutex::new(LLMContext::new(None)));
     let registry = Arc::new(Mutex::new(FunctionRegistry::new()));
 
     let mut dhara = DharaManager::new(context.clone(), registry.clone());
 
-    // greeting — no DB tools
+    // greeting — browse_menu transitions to menu node
     dhara.register_node("greeting", greeting_node(), vec![
-        ("browse_menu", make_browse_menu_handler()),
+        ("browse_menu", make_browse_menu_handler(order_writer.clone())),
     ]);
 
-    // menu — pizza tools + pg tools (schemas only; handlers re-injected via hook)
-    dhara.register_node("menu", menu_node(pg_schemas.clone()), vec![
+    // menu — pizza ordering tools
+    dhara.register_node("menu", menu_node(), vec![
         ("add_to_order",      make_add_to_order_handler(order.clone(), order_writer.clone())),
         ("remove_from_order", make_remove_from_order_handler(order.clone())),
         ("view_order",        make_view_order_handler(order.clone())),
         ("confirm_order",     make_confirm_order_handler(order.clone())),
     ]);
 
-    // confirm — view/modify/place + pg tools (schemas only; handlers re-injected via hook)
-    dhara.register_node("confirm", confirm_node(pg_schemas), vec![
-        ("view_order",  make_view_order_handler(order.clone())),
-        ("modify_order", make_modify_order_handler()),
-        ("place_order", make_place_order_handler(order.clone(), order_writer)),
+    // confirm — view/modify/place
+    dhara.register_node("confirm", confirm_node(), vec![
+        ("view_order",    make_view_order_handler(order.clone())),
+        ("modify_order",  make_modify_order_handler()),
+        ("place_order",   make_place_order_handler(order.clone(), order_writer.clone())),
     ]);
 
-    dhara.register_node_no_tools("farewell", farewell_node());
+    // farewell — no Dhara handlers needed
+    dhara.register_node("farewell", farewell_node(), vec![]);
 
     dhara.set_initial_node("greeting");
 
     // Dhara swaps the shared registry on every node transition, wiping any
     // handlers not registered in that node's list. We wrap the hook to
-    // re-inject pg_* handlers after every swap so they are always present.
+    // re-inject the fetch_menu data tool after every swap.
     let dhara_hook = dhara.create_transition_hook();
-    let pg_for_hook = pg_tool.clone();
+    let writer_for_hook = order_writer.clone();
     let reg_for_hook = registry.clone();
     let transition_hook: rustvani::services::llm::openai::TransitionHook =
         Arc::new(move |ctx| {
             dhara_hook(ctx);
-            pg_for_hook.register_all(&mut reg_for_hook.lock().unwrap());
+            register_fetch_menu(&mut reg_for_hook.lock().unwrap(), writer_for_hook.clone());
         });
+
+    // Also register fetch_menu for the initial node (before any transition)
+    register_fetch_menu(&mut registry.lock().unwrap(), order_writer);
 
     ConnectionFlow { context, registry, transition_hook }
 }
@@ -901,16 +1029,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         },
     );
 
-    // ---- NeonPostgresTool (LLM query path) ----
-    // Cheap to construct — actual Neon connection happens on StartFrame
-    // when on_start() is called by the pipeline.
-    let pg_tool = Arc::new(
-        NeonPostgresTool::new(
-            NeonPostgresConfig::new(&app_state.database_url)
-                .with_statement_timeout_ms(8_000),
-        )
-    );
-    // ---- OrderWriter (read + write path) ----
+    // ---- OrderWriter (single DB connection for all app operations) ----
     let order_writer = Arc::new(OrderWriter::new());
     if let Err(e) = order_writer.init(&app_state.database_url).await {
         log::error!("[conn={}] OrderWriter init failed: {}", conn_id, e);
@@ -918,10 +1037,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     }
 
     // ---- Dhara flow (fresh per connection) ----
-    // pg_tool is passed into build_flow so the transition hook can re-register
-    // pg_* handlers after every Dhara node swap.
-    // order_writer is passed so add_to_order can validate against the DB.
-    let flow = build_flow(pg_tool.clone(), order_writer);
+    let flow = build_flow(order_writer);
 
     // ---- RAVI ----
     let ravi = RaviProcessor::new(RaviParams {
@@ -947,7 +1063,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     let user_agg      = LLMUserAggregator::new(flow.context.clone());
     let assistant_agg = LLMAssistantAggregator::new(flow.context.clone());
 
-    // ---- LLM with Dhara + NeonPostgresTool ----
+    // ---- LLM with Dhara transition hook ----
     let mut llm_handler = OpenAILLMHandler::with_shared_registry(
         OpenAILLMConfig {
             api_key:         app_state.openai_api_key.clone(),
@@ -957,7 +1073,6 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         },
         flow.registry.clone(),
     );
-    llm_handler.add_tool(pg_tool);          // registers pg_* handlers + lifecycle
     llm_handler.set_transition_hook(flow.transition_hook);
     let llm = llm_handler.into_processor();
 
@@ -1033,8 +1148,7 @@ async fn main() {
 
     log::info!("🍕 Dhara Pizza voice server on ws://{}/ws", addr);
     log::info!("Flow: greeting → menu → confirm → farewell");
-    log::info!("DB tools: pg_schema, pg_query, pg_refine (menu + confirm nodes)");
-    log::info!("Write: OrderWriter (place_order → orders + order_items)");
+    log::info!("Tools: fetch_menu (data), add/remove/view/confirm/modify/place (Dhara)");
 
     let listener = tokio::net::TcpListener::bind(&addr).await
         .unwrap_or_else(|e| panic!("Failed to bind {}: {}", addr, e));
