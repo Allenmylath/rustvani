@@ -33,9 +33,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use log;
+use native_tls::TlsConnector;
+use postgres_native_tls::MakeTlsConnector;
 use serde_json::{json, Value};
 use tokio::sync::OnceCell;
-use tokio_postgres::{types::ToSql, Client, NoTls, Row};
+use tokio_postgres::{types::ToSql, Client, Row};
 use tokio_util::sync::CancellationToken;
 
 use cache::{
@@ -112,9 +114,7 @@ pub struct NeonPostgresTool {
     result_cache: Arc<Mutex<ResultSetCache>>,
 
     // --- Lifecycle management ---
-    /// Stored on on_start(), used to cancel background tasks on stop.
     cancel_token: OnceCell<CancellationToken>,
-    /// Lifecycle state for Drop warnings.
     state: Mutex<ToolLifecycleState>,
 }
 
@@ -663,19 +663,23 @@ impl BuiltinTool for NeonPostgresTool {
     async fn on_start(&self, cancel: CancellationToken) -> Result<()> {
         log::info!("NeonPostgresTool: connecting to Neon...");
 
-        // Store the cancel token for on_stop / on_cancel
         self.cancel_token.set(cancel.clone()).map_err(|_| {
             PipecatError::pipeline("NeonPostgresTool: on_start called twice")
         })?;
 
-        // Connect
+        // Build TLS connector (native-tls delegates to OpenSSL on Linux,
+        // Secure Transport on macOS — trusts system CA store, works with Neon)
+        let connector = TlsConnector::builder()
+            .build()
+            .map_err(|e| PipecatError::pipeline(format!("Neon TLS build failed: {}", e)))?;
+        let tls = MakeTlsConnector::new(connector);
+
         let (client, connection) = tokio_postgres::connect(
-            &self.config.connection_url, NoTls,
+            &self.config.connection_url, tls,
         )
         .await
         .map_err(|e| PipecatError::pipeline(format!("Neon connect failed: {}", e)))?;
 
-        // Spawn connection task with cancellation
         tokio::spawn(async move {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -689,7 +693,6 @@ impl BuiltinTool for NeonPostgresTool {
             }
         });
 
-        // Set statement timeout
         if let Some(ms) = self.config.statement_timeout_ms {
             client
                 .execute(&format!("SET statement_timeout = '{}'", ms), &[])
@@ -697,7 +700,6 @@ impl BuiltinTool for NeonPostgresTool {
                 .map_err(|e| PipecatError::pipeline(format!("SET timeout failed: {}", e)))?;
         }
 
-        // Introspect schema
         let schema = Self::introspect_schema(&client, &self.config.schemas)
             .await
             .map_err(|e| PipecatError::pipeline(format!("Schema introspection failed: {}", e)))?;
@@ -708,7 +710,6 @@ impl BuiltinTool for NeonPostgresTool {
             schema.tables.keys().cloned().collect::<Vec<_>>().join(", ")
         );
 
-        // Store in OnceCells
         self.client.set(client).map_err(|_| {
             PipecatError::pipeline("NeonPostgresTool: client already set")
         })?;
@@ -729,12 +730,10 @@ impl BuiltinTool for NeonPostgresTool {
 
         log::info!("NeonPostgresTool: stopping...");
 
-        // 1. Cancel background tasks via token
         if let Some(token) = self.cancel_token.get() {
             token.cancel();
         }
 
-        // 2. Clear result set cache
         {
             let mut cache = self.result_cache.lock().unwrap();
             let count = cache.len();
@@ -744,10 +743,6 @@ impl BuiltinTool for NeonPostgresTool {
             }
         }
 
-        // 3. Note: Client and SchemaCache are in OnceCells — they can't be
-        //    cleared, but the Arc refs will be dropped when the tool is dropped.
-        //    The connection task exits via CancellationToken select!.
-
         self.set_state(ToolLifecycleState::Stopped);
         log::info!("NeonPostgresTool: stopped");
         Ok(())
@@ -755,15 +750,7 @@ impl BuiltinTool for NeonPostgresTool {
 
     async fn on_cancel(&self) -> Result<()> {
         log::warn!("NeonPostgresTool: cancel requested");
-
-        // TODO: When using connection pooling, cancel in-flight queries here:
-        //   if let Some(client) = self.client.get() {
-        //       client.cancel_token().cancel_query(NoTls).await.ok();
-        //   }
-
         self.set_state(ToolLifecycleState::Cancelled);
-
-        // Default: on_cancel calls on_stop
         self.on_stop().await
     }
 
@@ -791,11 +778,9 @@ impl Drop for NeonPostgresTool {
             ToolLifecycleState::Started => {
                 log::warn!(
                     "NeonPostgresTool: dropped while still in '{}' state! \
-                     on_stop() was never called. This likely means EndFrame \
-                     was not handled. Resources may leak.",
+                     on_stop() was never called. Resources may leak.",
                     state
                 );
-                // Best effort: cancel the token synchronously
                 if let Some(token) = self.cancel_token.get() {
                     token.cancel();
                 }
