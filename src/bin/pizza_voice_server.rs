@@ -599,13 +599,17 @@ struct ConnectionFlow {
 
 /// Build the Dhara flow for a single connection.
 ///
-/// `pg_schemas`  — schemas from `NeonPostgresTool` to include in menu/confirm nodes.
+/// `pg_tool`     — NeonPostgresTool; schemas go into menu/confirm nodes, and its
+///                 register_all() is re-run after every Dhara node transition so
+///                 that pg_* handlers survive the registry swap.
 /// `order_writer` — shared writer for the `place_order` handler.
 fn build_flow(
-    pg_schemas: Vec<FunctionSchema>,
+    pg_tool: Arc<NeonPostgresTool>,
     order_writer: Arc<OrderWriter>,
 ) -> ConnectionFlow {
-    let order   = Arc::new(Mutex::new(OrderState::default()));
+    let pg_schemas = pg_tool.tool_schemas();
+
+    let order    = Arc::new(Mutex::new(OrderState::default()));
     let context  = Arc::new(Mutex::new(LLMContext::new(None)));
     let registry = Arc::new(Mutex::new(FunctionRegistry::new()));
 
@@ -616,30 +620,38 @@ fn build_flow(
         ("browse_menu", make_browse_menu_handler()),
     ]);
 
-    // menu — pizza tools + pg tools
+    // menu — pizza tools + pg tools (schemas only; handlers re-injected via hook)
     dhara.register_node("menu", menu_node(pg_schemas.clone()), vec![
-        ("add_to_order",        make_add_to_order_handler(order.clone())),
-        ("remove_from_order",   make_remove_from_order_handler(order.clone())),
-        ("view_order",          make_view_order_handler(order.clone())),
-        ("confirm_order",       make_confirm_order_handler(order.clone())),
-        // pg_* handlers are registered by NeonPostgresTool.register_all() on the
-        // shared registry — DharaManager will find them by name at call time.
+        ("add_to_order",      make_add_to_order_handler(order.clone())),
+        ("remove_from_order", make_remove_from_order_handler(order.clone())),
+        ("view_order",        make_view_order_handler(order.clone())),
+        ("confirm_order",     make_confirm_order_handler(order.clone())),
     ]);
 
-    // confirm — view/modify/place + pg tools
+    // confirm — view/modify/place + pg tools (schemas only; handlers re-injected via hook)
     dhara.register_node("confirm", confirm_node(pg_schemas), vec![
-        ("view_order",    make_view_order_handler(order.clone())),
-        ("modify_order",  make_modify_order_handler()),
-        ("place_order",   make_place_order_handler(order.clone(), order_writer)),
+        ("view_order",  make_view_order_handler(order.clone())),
+        ("modify_order", make_modify_order_handler()),
+        ("place_order", make_place_order_handler(order.clone(), order_writer)),
     ]);
 
     dhara.register_node_no_tools("farewell", farewell_node());
 
     dhara.set_initial_node("greeting");
 
-    let hook = dhara.create_transition_hook();
+    // Dhara swaps the shared registry on every node transition, wiping any
+    // handlers not registered in that node's list. We wrap the hook to
+    // re-inject pg_* handlers after every swap so they are always present.
+    let dhara_hook = dhara.create_transition_hook();
+    let pg_for_hook = pg_tool.clone();
+    let reg_for_hook = registry.clone();
+    let transition_hook: rustvani::services::llm::openai::TransitionHook =
+        Arc::new(move |ctx| {
+            dhara_hook(ctx);
+            pg_for_hook.register_all(&mut reg_for_hook.lock().unwrap());
+        });
 
-    ConnectionFlow { context, registry, transition_hook: hook }
+    ConnectionFlow { context, registry, transition_hook }
 }
 
 // ---------------------------------------------------------------------------
@@ -697,8 +709,6 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
                 .with_statement_timeout_ms(8_000),
         )
     );
-    let pg_schemas = pg_tool.tool_schemas();
-
     // ---- OrderWriter (write path) ----
     let order_writer = Arc::new(OrderWriter::new());
     if let Err(e) = order_writer.init(&app_state.database_url).await {
@@ -707,7 +717,9 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     }
 
     // ---- Dhara flow (fresh per connection) ----
-    let flow = build_flow(pg_schemas, order_writer);
+    // pg_tool is passed into build_flow so the transition hook can re-register
+    // pg_* handlers after every Dhara node swap.
+    let flow = build_flow(pg_tool.clone(), order_writer);
 
     // ---- RAVI ----
     let ravi = RaviProcessor::new(RaviParams {
