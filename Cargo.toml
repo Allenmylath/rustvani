@@ -51,6 +51,7 @@ path = "src/bin/pizza_voice_server.rs"
 # Dependencies
 # ---------------------------------------------------------------------------
 
+[dependencies]
 tokio           = { version = "1",        features = ["full"] }
 tokio-util      = { version = "0.7",      features = ["rt"] }
 async-trait     = "0.1"
