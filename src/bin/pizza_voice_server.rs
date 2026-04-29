@@ -30,7 +30,8 @@ use axum::{
 };
 use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio_postgres::NoTls;
+use native_tls::TlsConnector;
+use postgres_native_tls::MakeTlsConnector;
 use tower_http::cors::CorsLayer;
 
 use rustvani::{
@@ -147,7 +148,9 @@ impl OrderWriter {
 
     /// Connect to Neon. Must be called before `write_order`.
     async fn init(&self, db_url: &str) -> Result<(), String> {
-        let (client, connection) = tokio_postgres::connect(db_url, NoTls)
+        let connector = TlsConnector::builder().build().map_err(|e| format!("TLS build: {}", e))?;
+        let tls = MakeTlsConnector::new(connector);
+        let (client, connection) = tokio_postgres::connect(db_url, tls)
             .await
             .map_err(|e| format!("OrderWriter: connect failed: {}", e))?;
 
