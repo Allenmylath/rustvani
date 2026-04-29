@@ -633,9 +633,8 @@ fn register_fetch_menu(registry: &mut FunctionRegistry, writer: Arc<OrderWriter>
 // Handler factories — Dhara handlers
 // ---------------------------------------------------------------------------
 
-fn make_browse_menu_handler(writer: Arc<OrderWriter>) -> rustvani::dhara::DharaHandlerFn {
+fn make_browse_menu_handler() -> rustvani::dhara::DharaHandlerFn {
     Arc::new(move |_args: String| {
-        let writer = writer.clone();
         Box::pin(async move {
             // Fetch the menu ourselves and include it in the transition result
             // so the LLM knows we've already fetched it. The fetch_menu data
@@ -943,7 +942,7 @@ fn build_flow(order_writer: Arc<OrderWriter>) -> ConnectionFlow {
 
     // greeting — browse_menu transitions to menu node
     dhara.register_node("greeting", greeting_node(), vec![
-        ("browse_menu", make_browse_menu_handler(order_writer.clone())),
+        ("browse_menu", make_browse_menu_handler()),
     ]);
 
     // menu — pizza ordering tools
@@ -962,7 +961,7 @@ fn build_flow(order_writer: Arc<OrderWriter>) -> ConnectionFlow {
     ]);
 
     // farewell — no Dhara handlers needed
-    dhara.register_node("farewell", farewell_node(), vec![]);
+    dhara.register_node_no_tools("farewell", farewell_node());
 
     dhara.set_initial_node("greeting");
 
