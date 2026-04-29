@@ -639,8 +639,7 @@ impl NeonPostgresTool {
                 },
                 "required": ["table", "vector_column", "query_vector", "top_k"],
                 "additionalProperties": false
-            }))
-            .with_strict(true),
+            })),
         ]
     }
 }
