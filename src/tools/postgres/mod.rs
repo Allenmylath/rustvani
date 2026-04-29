@@ -303,16 +303,24 @@ impl NeonPostgresTool {
                     return ToolCallOutput::summary_only("Error: multiple statements not allowed");
                 }
 
+                log::info!("pg_query SQL: {}", query);
+
                 let rows = if read_only {
                     let _ = db.execute("SET TRANSACTION READ ONLY", &[]).await;
                     match db.query(query, &[]).await {
                         Ok(r) => r,
-                        Err(e) => return ToolCallOutput::summary_only(format!("Query error: {}", e)),
+                        Err(e) => {
+                            log::error!("pg_query error (read_only): {}", e);
+                            return ToolCallOutput::summary_only(format!("Query error: {}", e));
+                        }
                     }
                 } else {
                     match db.query(query, &[]).await {
                         Ok(r) => r,
-                        Err(e) => return ToolCallOutput::summary_only(format!("Query error: {}", e)),
+                        Err(e) => {
+                            log::error!("pg_query error: {}", e);
+                            return ToolCallOutput::summary_only(format!("Query error: {}", e));
+                        }
                     }
                 };
 
