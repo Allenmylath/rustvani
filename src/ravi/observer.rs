@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
+use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::frames::{
@@ -23,6 +24,9 @@ pub struct RaviObserverParams {
     pub user_transcription_enabled: bool,
     pub user_mute_enabled:          bool,
     pub bot_transcription_enabled:  bool,
+    /// Forward function call frames (start/end, in-progress, result, raw result)
+    /// to the client as `server-message` events.
+    pub function_call_enabled:      bool,
 }
 
 impl Default for RaviObserverParams {
@@ -35,6 +39,7 @@ impl Default for RaviObserverParams {
             user_transcription_enabled: true,
             user_mute_enabled:          true,
             bot_transcription_enabled:  false,
+            function_call_enabled:      true,
         }
     }
 }
@@ -96,6 +101,7 @@ impl BaseObserver for RaviObserver {
         }
 
         match &frame.inner {
+            // ---- Bot speaking ----
             FrameInner::System(SystemFrame::BotStartedSpeaking)
                 if self.params.bot_speaking_enabled =>
             {
@@ -106,6 +112,8 @@ impl BaseObserver for RaviObserver {
             {
                 self.send(models::msg_bot_stopped_speaking()).await;
             }
+
+            // ---- User speaking ----
             FrameInner::System(SystemFrame::UserStartedSpeaking { .. })
                 if self.params.user_speaking_enabled =>
             {
@@ -116,6 +124,8 @@ impl BaseObserver for RaviObserver {
             {
                 self.send(models::msg_user_stopped_speaking()).await;
             }
+
+            // ---- User transcription ----
             FrameInner::Data(DataFrame::Transcription(t))
                 if self.params.user_transcription_enabled =>
             {
@@ -127,6 +137,8 @@ impl BaseObserver for RaviObserver {
                 );
                 self.send(json).await;
             }
+
+            // ---- LLM response boundaries ----
             FrameInner::Control(ControlFrame::LLMFullResponseStart)
                 if self.params.bot_llm_enabled =>
             {
@@ -148,6 +160,8 @@ impl BaseObserver for RaviObserver {
                 }
                 self.send(models::msg_bot_llm_stopped()).await;
             }
+
+            // ---- LLM text tokens ----
             FrameInner::Data(DataFrame::LLMText(text))
                 if self.params.bot_llm_enabled =>
             {
@@ -164,6 +178,69 @@ impl BaseObserver for RaviObserver {
                     }
                 }
             }
+
+            // ---- Function call: batch start ----
+            FrameInner::Control(ControlFrame::FunctionCallStart)
+                if self.params.function_call_enabled =>
+            {
+                self.send(models::msg_server_message(json!({
+                    "type": "function-call-start",
+                }))).await;
+            }
+
+            // ---- Function call: batch end ----
+            FrameInner::Control(ControlFrame::FunctionCallEnd)
+                if self.params.function_call_enabled =>
+            {
+                self.send(models::msg_server_message(json!({
+                    "type": "function-call-end",
+                }))).await;
+            }
+
+            // ---- Function call: in progress (tool invocation) ----
+            FrameInner::Data(DataFrame::FunctionCallInProgress(data))
+                if self.params.function_call_enabled =>
+            {
+                // Parse arguments as JSON if possible, fall back to string
+                let args_value = serde_json::from_str::<serde_json::Value>(&data.arguments)
+                    .unwrap_or_else(|_| serde_json::Value::String(data.arguments.clone()));
+
+                self.send(models::msg_server_message(json!({
+                    "type":          "function-call-in-progress",
+                    "id":            data.id,
+                    "function_name": data.function_name,
+                    "arguments":     args_value,
+                }))).await;
+            }
+
+            // ---- Function call: result summary (what LLM sees) ----
+            FrameInner::Data(DataFrame::FunctionCallResult(data))
+                if self.params.function_call_enabled =>
+            {
+                // Parse result as JSON if possible, fall back to string
+                let result_value = serde_json::from_str::<serde_json::Value>(&data.result)
+                    .unwrap_or_else(|_| serde_json::Value::String(data.result.clone()));
+
+                self.send(models::msg_server_message(json!({
+                    "type":          "function-call-result",
+                    "id":            data.id,
+                    "function_name": data.function_name,
+                    "result":        result_value,
+                }))).await;
+            }
+
+            // ---- Function call: raw structured data (LLM never sees this) ----
+            FrameInner::Data(DataFrame::FunctionCallRawResult(data))
+                if self.params.function_call_enabled =>
+            {
+                self.send(models::msg_server_message(json!({
+                    "type":          "function-call-raw-result",
+                    "id":            data.id,
+                    "function_name": data.function_name,
+                    "data":          data.raw_data,
+                }))).await;
+            }
+
             _ => {}
         }
     }
