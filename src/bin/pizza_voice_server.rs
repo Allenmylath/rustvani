@@ -19,6 +19,7 @@
 //!   SARVAM_API_KEY   — required (STT + TTS)
 //!   OPENAI_API_KEY   — required (LLM)
 
+use std::error::Error;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -88,9 +89,11 @@ struct AppState {
 
 #[derive(Debug, Clone)]
 struct OrderItem {
+    pizza_id: i32,
     pizza:    String,
     size:     String,
     toppings: Vec<String>,
+    line_price: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,15 +103,7 @@ struct OrderState {
 
 impl OrderState {
     fn total_price(&self) -> f64 {
-        self.items.iter().map(|item| {
-            let base = match item.size.as_str() {
-                "small"  => 8.99,
-                "medium" => 12.99,
-                "large"  => 15.99,
-                _        => 12.99,
-            };
-            base + (item.toppings.len() as f64 * 1.50)
-        }).sum()
+        self.items.iter().map(|item| item.line_price).sum()
     }
 
     fn summary(&self) -> String {
@@ -121,18 +116,20 @@ impl OrderState {
             } else {
                 item.toppings.join(", ")
             };
-            format!("{}. {} {} with {}", i + 1, item.size, item.pizza, toppings)
+            format!(
+                "{}. {} {} with {} — ${:.2}",
+                i + 1, item.size, item.pizza, toppings, item.line_price
+            )
         }).collect();
         format!("{}\nTotal: ${:.2}", items.join("\n"), self.total_price())
     }
 }
 
 // ---------------------------------------------------------------------------
-// OrderWriter — dedicated Neon connection for writing confirmed orders.
+// OrderWriter — dedicated Neon connection for reads + writes.
 //
-// Intentionally separate from NeonPostgresTool so write transactions don't
-// interfere with LLM query traffic, and so the write path is simple and
-// auditable without touching the tool abstraction.
+// Handles both validation reads (pizza/size/topping lookups at add time)
+// and confirmed order writes (place_order).
 // ---------------------------------------------------------------------------
 
 struct OrderWriter {
@@ -146,7 +143,7 @@ impl OrderWriter {
         }
     }
 
-    /// Connect to Neon. Must be called before `write_order`.
+    /// Connect to Neon. Must be called before any reads or writes.
     async fn init(&self, db_url: &str) -> Result<(), String> {
         let connector = TlsConnector::builder().build().map_err(|e| format!("TLS build: {}", e))?;
         let tls = MakeTlsConnector::new(connector);
@@ -165,8 +162,112 @@ impl OrderWriter {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Read methods — used at add_to_order time for validation
+    // -----------------------------------------------------------------------
+
+    /// Lookup a pizza by name (case-insensitive, fuzzy via ILIKE).
+    ///
+    /// Returns (id, canonical_name) or None if not found.
+    async fn lookup_pizza(&self, name: &str) -> Result<Option<(i32, String)>, String> {
+        let guard = self.client.lock().await;
+        let client = guard.as_ref()
+            .ok_or_else(|| "OrderWriter not initialized".to_string())?;
+
+        let pattern = format!("%{}%", name.trim());
+        let row = client.query_opt(
+            "SELECT id, name FROM pizzas WHERE LOWER(name) ILIKE LOWER($1) AND is_available = true LIMIT 1",
+            &[&pattern],
+        ).await.map_err(|e| format!("Pizza lookup failed: {}", e))?;
+
+        Ok(row.map(|r| (r.get::<_, i32>(0), r.get::<_, String>(1))))
+    }
+
+    /// Get all available pizza names (for suggestions when lookup fails).
+    async fn list_pizza_names(&self) -> Result<Vec<String>, String> {
+        let guard = self.client.lock().await;
+        let client = guard.as_ref()
+            .ok_or_else(|| "OrderWriter not initialized".to_string())?;
+
+        let rows = client.query("SELECT name FROM pizzas WHERE is_available = true ORDER BY name", &[])
+            .await
+            .map_err(|e| format!("List pizzas failed: {}", e))?;
+
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    /// Get available sizes and prices for a pizza.
+    ///
+    /// Returns vec of (size_name, price).
+    async fn get_sizes_for_pizza(&self, pizza_id: i32) -> Result<Vec<(String, f64)>, String> {
+        let guard = self.client.lock().await;
+        let client = guard.as_ref()
+            .ok_or_else(|| "OrderWriter not initialized".to_string())?;
+
+        let rows = client.query(
+            "SELECT size, price FROM pizza_sizes WHERE pizza_id = $1 ORDER BY price",
+            &[&pizza_id],
+        ).await.map_err(|e| format!("Size lookup failed: {}", e))?;
+
+        Ok(rows.iter().map(|r| {
+            (r.get::<_, String>(0), r.get::<_, f64>(1))
+        }).collect())
+    }
+
+    /// Validate topping names against the toppings table.
+    ///
+    /// Returns (valid_toppings, invalid_toppings) with canonical names.
+    async fn validate_toppings(
+        &self,
+        topping_names: &[String],
+    ) -> Result<(Vec<(String, f64)>, Vec<String>), String> {
+        if topping_names.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+
+        let guard = self.client.lock().await;
+        let client = guard.as_ref()
+            .ok_or_else(|| "OrderWriter not initialized".to_string())?;
+
+        let mut valid = Vec::new();
+        let mut invalid = Vec::new();
+
+        for name in topping_names {
+            let pattern = format!("%{}%", name.trim());
+            let row = client.query_opt(
+                "SELECT name, price_per_unit FROM toppings WHERE LOWER(name) ILIKE LOWER($1) AND is_available = true LIMIT 1",
+                &[&pattern],
+            ).await.map_err(|e| format!("Topping lookup failed: {}", e))?;
+
+            match row {
+                Some(r) => valid.push((r.get::<_, String>(0), r.get::<_, f64>(1))),
+                None => invalid.push(name.clone()),
+            }
+        }
+
+        Ok((valid, invalid))
+    }
+
+    /// Get all available topping names (for suggestions).
+    async fn list_topping_names(&self) -> Result<Vec<String>, String> {
+        let guard = self.client.lock().await;
+        let client = guard.as_ref()
+            .ok_or_else(|| "OrderWriter not initialized".to_string())?;
+
+        let rows = client.query("SELECT name FROM toppings WHERE is_available = true ORDER BY name", &[])
+            .await
+            .map_err(|e| format!("List toppings failed: {}", e))?;
+
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // Write methods — used at place_order time
+    // -----------------------------------------------------------------------
+
     /// Write a confirmed order inside a transaction.
     ///
+    /// All pizza_ids and prices are pre-validated — no lookups needed.
     /// Returns the human-readable order ID (e.g. "DP-00042").
     async fn write_order(&self, address: &str, order: &OrderState) -> Result<String, String> {
         let mut guard = self.client.lock().await;
@@ -188,37 +289,27 @@ impl OrderWriter {
 
         let order_id: i32 = order_row.get(0);
 
-        // INSERT one order_items row per item
+        // INSERT one order_items row per item — pizza_id is pre-validated
         for item in &order.items {
-            let line_price = match item.size.as_str() {
-                "small"  => 8.99f64,
-                "medium" => 12.99,
-                "large"  => 15.99,
-                _        => 12.99,
-            } + (item.toppings.len() as f64 * 1.50);
-
-            // Resolve pizza_id (best-effort — 0 if name not found)
-            let pizza_id: i32 = tx.query_opt(
-                "SELECT id FROM pizzas WHERE name = $1",
-                &[&item.pizza],
-            ).await
-            .map_err(|e| format!("Pizza lookup failed: {}", e))?
-            .map(|r| r.get::<_, i32>(0))
-            .unwrap_or(0);
-
             tx.execute(
                 "INSERT INTO order_items \
                     (order_id, pizza_id, pizza_name, size, extra_toppings, line_price) \
                  VALUES ($1, $2, $3, $4, $5, $6)",
                 &[
                     &order_id,
-                    &pizza_id,
+                    &item.pizza_id,
                     &item.pizza,
                     &item.size,
-                    &item.toppings,   // Vec<String> → TEXT[]
-                    &line_price,
+                    &item.toppings,
+                    &item.line_price,
                 ],
-            ).await.map_err(|e| format!("Insert order item failed: {}", e))?;
+            ).await.map_err(|e| {
+                // Surface the full postgres error detail
+                let detail = e.source()
+                    .map(|s| format!(" (detail: {})", s))
+                    .unwrap_or_default();
+                format!("Insert order item failed: {}{}", e, detail)
+            })?;
         }
 
         tx.commit().await
@@ -243,29 +334,32 @@ fn browse_menu_schema() -> FunctionSchema {
 }
 
 fn add_to_order_schema() -> FunctionSchema {
-    // Pizza name is no longer a hardcoded enum — LLM must use the name
-    // exactly as returned by pg_query on the pizzas table.
-    FunctionSchema::new("add_to_order", "Add a pizza to the customer's order")
-        .with_parameters(json!({
-            "type": "object",
-            "properties": {
-                "pizza": {
-                    "type": "string",
-                    "description": "Pizza name exactly as returned from the pizzas table"
-                },
-                "size": {
-                    "type": "string",
-                    "enum": ["small", "medium", "large"],
-                    "description": "Size of the pizza"
-                },
-                "toppings": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Extra topping names, exactly as in the toppings table"
-                }
+    FunctionSchema::new(
+        "add_to_order",
+        "Add a pizza to the customer's order. Validates the pizza name, size, \
+         and toppings against the database. Returns the validated details \
+         including canonical name, actual price, and available options."
+    )
+    .with_parameters(json!({
+        "type": "object",
+        "properties": {
+            "pizza": {
+                "type": "string",
+                "description": "Pizza name (fuzzy matched against database)"
             },
-            "required": ["pizza", "size"]
-        }))
+            "size": {
+                "type": "string",
+                "enum": ["small", "medium", "large"],
+                "description": "Size of the pizza"
+            },
+            "toppings": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Extra topping names (fuzzy matched against database)"
+            }
+        },
+        "required": ["pizza", "size"]
+    }))
 }
 
 fn remove_from_order_schema() -> FunctionSchema {
@@ -361,13 +455,18 @@ fn menu_node(pg_schemas: Vec<FunctionSchema>) -> NodeConfig {
              Do NOT retry the query. Just say something like \
              'The menu is on your screen — what looks good?' \
              Only retry if you get an explicit error message string. \
+             When the customer picks a pizza, use add_to_order — it will \
+             validate the name against the database and return the actual \
+             price and available options. If validation fails, tell the \
+             customer what went wrong and suggest alternatives. \
              Keep all voice responses to one or two sentences."
         )
         .with_task_message(
             "Help the customer build their order. \
              When they ask to see the menu, call pg_query once then verbally invite \
              them to pick — the data is shown on their screen, do not read it all out. \
-             Use add_to_order when they choose, view_order to recap the order, \
+             Use add_to_order when they choose (it validates against the DB), \
+             view_order to recap the order, \
              remove_from_order to change it, confirm_order when done."
         )
         .with_tools(ToolsSchema::new(tools))
@@ -424,30 +523,133 @@ fn make_browse_menu_handler() -> rustvani::dhara::DharaHandlerFn {
     })
 }
 
-fn make_add_to_order_handler(order: Arc<Mutex<OrderState>>) -> rustvani::dhara::DharaHandlerFn {
+fn make_add_to_order_handler(
+    order: Arc<Mutex<OrderState>>,
+    writer: Arc<OrderWriter>,
+) -> rustvani::dhara::DharaHandlerFn {
     Arc::new(move |args: String| {
         let order = order.clone();
+        let writer = writer.clone();
         Box::pin(async move {
             let parsed: serde_json::Value = serde_json::from_str(&args).unwrap_or_default();
-            let pizza = parsed["pizza"].as_str().unwrap_or("Unknown").to_string();
+            let pizza_name = parsed["pizza"].as_str().unwrap_or("").to_string();
             let size = parsed["size"].as_str().unwrap_or("medium").to_string();
-            let toppings: Vec<String> = parsed["toppings"]
+            let topping_names: Vec<String> = parsed["toppings"]
                 .as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
 
-            let mut state = order.lock().unwrap();
-            state.items.push(OrderItem {
-                pizza: pizza.clone(),
-                size: size.clone(),
-                toppings: toppings.clone(),
-            });
+            // 1. Validate pizza name against DB
+            let (pizza_id, canonical_name) = match writer.lookup_pizza(&pizza_name).await {
+                Ok(Some((id, name))) => (id, name),
+                Ok(None) => {
+                    // Pizza not found — suggest available options
+                    let available = writer.list_pizza_names().await.unwrap_or_default();
+                    let result = json!({
+                        "status": "error",
+                        "error": format!("Pizza '{}' not found in our menu", pizza_name),
+                        "available_pizzas": available,
+                        "instruction": "Tell the customer we don't have that pizza and suggest the available options."
+                    });
+                    return TransitionResult::stay(result.to_string());
+                }
+                Err(e) => {
+                    let result = json!({
+                        "status": "error",
+                        "error": format!("Database error looking up pizza: {}", e),
+                    });
+                    return TransitionResult::stay(result.to_string());
+                }
+            };
 
+            // 2. Validate size and get price from DB
+            let sizes = match writer.get_sizes_for_pizza(pizza_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let result = json!({
+                        "status": "error",
+                        "error": format!("Could not look up sizes: {}", e),
+                    });
+                    return TransitionResult::stay(result.to_string());
+                }
+            };
+
+            let size_lower = size.to_lowercase();
+            let size_match = sizes.iter().find(|(s, _)| s.to_lowercase() == size_lower);
+
+            let (canonical_size, base_price) = match size_match {
+                Some((s, p)) => (s.clone(), *p),
+                None => {
+                    let available: Vec<String> = sizes.iter()
+                        .map(|(s, p)| format!("{} (${:.2})", s, p))
+                        .collect();
+                    let result = json!({
+                        "status": "error",
+                        "error": format!("Size '{}' not available for {}", size, canonical_name),
+                        "available_sizes": available,
+                        "instruction": "Tell the customer that size isn't available and list the options with prices."
+                    });
+                    return TransitionResult::stay(result.to_string());
+                }
+            };
+
+            // 3. Validate toppings against DB
+            let (valid_toppings, invalid_toppings) = match writer.validate_toppings(&topping_names).await {
+                Ok(result) => result,
+                Err(e) => {
+                    let result = json!({
+                        "status": "error",
+                        "error": format!("Could not validate toppings: {}", e),
+                    });
+                    return TransitionResult::stay(result.to_string());
+                }
+            };
+
+            // If some toppings are invalid, report them
+            if !invalid_toppings.is_empty() {
+                let available = writer.list_topping_names().await.unwrap_or_default();
+                let result = json!({
+                    "status": "error",
+                    "error": format!("These toppings are not available: {}", invalid_toppings.join(", ")),
+                    "valid_toppings_added": valid_toppings.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                    "available_toppings": available,
+                    "instruction": "Tell the customer which toppings we don't have and suggest alternatives. \
+                                    The valid toppings listed were NOT added yet — ask the customer if they \
+                                    want to proceed with just the valid ones, or pick different toppings."
+                });
+                return TransitionResult::stay(result.to_string());
+            }
+
+            // 4. Calculate line price
+            let topping_total: f64 = valid_toppings.iter().map(|(_, p)| p).sum();
+            let line_price = base_price + topping_total;
+
+            let canonical_topping_names: Vec<String> = valid_toppings.iter()
+                .map(|(n, _)| n.clone())
+                .collect();
+
+            // 5. Add validated item to order
+            {
+                let mut state = order.lock().unwrap();
+                state.items.push(OrderItem {
+                    pizza_id,
+                    pizza: canonical_name.clone(),
+                    size: canonical_size.clone(),
+                    toppings: canonical_topping_names.clone(),
+                    line_price,
+                });
+            }
+
+            let state = order.lock().unwrap();
             let result = json!({
                 "status": "added",
-                "pizza": pizza,
-                "size": size,
-                "toppings": toppings,
+                "pizza_id": pizza_id,
+                "pizza": canonical_name,
+                "size": canonical_size,
+                "base_price": format!("${:.2}", base_price),
+                "toppings": canonical_topping_names,
+                "topping_total": format!("${:.2}", topping_total),
+                "line_price": format!("${:.2}", line_price),
                 "order_summary": state.summary(),
             });
             TransitionResult::stay(result.to_string())
@@ -467,7 +669,7 @@ fn make_remove_from_order_handler(order: Arc<Mutex<OrderState>>) -> rustvani::dh
                 let removed = state.items.remove(num - 1);
                 json!({
                     "status": "removed",
-                    "removed": format!("{} {}", removed.size, removed.pizza),
+                    "removed": format!("{} {} (${:.2})", removed.size, removed.pizza, removed.line_price),
                     "order_summary": state.summary(),
                 })
             } else {
@@ -602,7 +804,7 @@ struct ConnectionFlow {
 /// `pg_tool`     — NeonPostgresTool; schemas go into menu/confirm nodes, and its
 ///                 register_all() is re-run after every Dhara node transition so
 ///                 that pg_* handlers survive the registry swap.
-/// `order_writer` — shared writer for the `place_order` handler.
+/// `order_writer` — shared writer for add_to_order validation + place_order writes.
 fn build_flow(
     pg_tool: Arc<NeonPostgresTool>,
     order_writer: Arc<OrderWriter>,
@@ -622,7 +824,7 @@ fn build_flow(
 
     // menu — pizza tools + pg tools (schemas only; handlers re-injected via hook)
     dhara.register_node("menu", menu_node(pg_schemas.clone()), vec![
-        ("add_to_order",      make_add_to_order_handler(order.clone())),
+        ("add_to_order",      make_add_to_order_handler(order.clone(), order_writer.clone())),
         ("remove_from_order", make_remove_from_order_handler(order.clone())),
         ("view_order",        make_view_order_handler(order.clone())),
         ("confirm_order",     make_confirm_order_handler(order.clone())),
@@ -708,7 +910,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
                 .with_statement_timeout_ms(8_000),
         )
     );
-    // ---- OrderWriter (write path) ----
+    // ---- OrderWriter (read + write path) ----
     let order_writer = Arc::new(OrderWriter::new());
     if let Err(e) = order_writer.init(&app_state.database_url).await {
         log::error!("[conn={}] OrderWriter init failed: {}", conn_id, e);
@@ -718,6 +920,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     // ---- Dhara flow (fresh per connection) ----
     // pg_tool is passed into build_flow so the transition hook can re-register
     // pg_* handlers after every Dhara node swap.
+    // order_writer is passed so add_to_order can validate against the DB.
     let flow = build_flow(pg_tool.clone(), order_writer);
 
     // ---- RAVI ----
