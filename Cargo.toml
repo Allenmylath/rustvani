@@ -43,11 +43,14 @@ path = "src/bin/sarvam_tts_test.rs"
 name = "websocket_server_piper"
 path = "src/bin/websocket_server_piper.rs"
 
+[[bin]]
+name = "pizza_voice_server"
+path = "src/bin/pizza_voice_server.rs"
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
 
-[dependencies]
 tokio           = { version = "1",        features = ["full"] }
 tokio-util      = { version = "0.7",      features = ["rt"] }
 async-trait     = "0.1"
@@ -82,7 +85,9 @@ base64          = "0.22.1"
 reqwest         = { version = "0.12", features = ["json", "stream", "native-tls"] }
 
 # Postgres (Neon DB tool)
-tokio-postgres  = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+tokio-postgres      = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+postgres-native-tls = "0.5"
+native-tls          = "0.2"
 chrono          = { version = "0.4", features = ["serde"] }
 uuid            = { version = "1",   features = ["serde"] }
 
