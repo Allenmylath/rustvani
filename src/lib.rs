@@ -14,6 +14,7 @@ pub mod audio_process;
 pub mod ravi;
 pub mod adapters;
 pub mod dhara;
+pub mod tools;
 
 pub use clock::{BaseClock, SystemClock, system_clock};
 pub use error::{PipecatError, Result};

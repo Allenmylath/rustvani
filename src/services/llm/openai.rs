@@ -5,9 +5,16 @@
 //!   - Tool/function calling with SSE delta accumulation
 //!   - Re-invocation loop (model calls tool → execute → re-invoke)
 //!   - Dhara transition hooks for conversation flow management
+//!   - Built-in tool lifecycle (on_start / on_stop / on_cancel)
 //!
 //! Pipeline position:
 //!   LLMUserAggregator → OpenAILLMHandler → LLMAssistantAggregator
+//!
+//! Lifecycle:
+//!   StartFrame  → initialise cacheable tools (pg connects, caches schema)
+//!   frames flow → inference + tool execution
+//!   EndFrame    → graceful shutdown (flush caches, return connections)
+//!   CancelFrame → cancel token fires, then on_cancel → on_stop
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,15 +25,18 @@ use log;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::adapters::base::LLMAdapter;
 use crate::adapters::openai::OpenAILLMAdapter;
 use crate::context::{LLMContext, ToolCall};
 use crate::error::{PipecatError, Result};
 use crate::frames::{
-    DataFrame, Frame, FrameDirection, FunctionCallData, FunctionCallRawResultData,
-    FunctionCallResultData, FrameHandler, FrameInner, FrameProcessor,
+    ControlFrame, DataFrame, Frame, FrameDirection, FunctionCallData,
+    FunctionCallRawResultData, FunctionCallResultData, FrameHandler, FrameInner,
+    FrameProcessor, SystemFrame,
 };
+use crate::tools::BuiltinTool;
 
 use super::function_registry::{FunctionRegistry, RegistryHandler};
 
@@ -173,6 +183,10 @@ pub struct OpenAILLMHandler {
     /// Optional hook called after tool calls complete, before re-invoking.
     /// Used by DharaManager for node transitions.
     transition_hook: Option<TransitionHook>,
+    /// Built-in tools attached to this handler.
+    tools: Vec<Arc<dyn BuiltinTool>>,
+    /// Cancellation token — cancelled on CancelFrame, cascades to all tools.
+    cancel_token: CancellationToken,
 }
 
 impl OpenAILLMHandler {
@@ -184,6 +198,8 @@ impl OpenAILLMHandler {
             adapter: OpenAILLMAdapter::new(),
             registry: Arc::new(Mutex::new(FunctionRegistry::new())),
             transition_hook: None,
+            tools: Vec::new(),
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -195,6 +211,8 @@ impl OpenAILLMHandler {
             adapter: OpenAILLMAdapter::new(),
             registry: Arc::new(Mutex::new(registry)),
             transition_hook: None,
+            tools: Vec::new(),
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -212,6 +230,8 @@ impl OpenAILLMHandler {
             adapter: OpenAILLMAdapter::new(),
             registry,
             transition_hook: None,
+            tools: Vec::new(),
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -220,9 +240,93 @@ impl OpenAILLMHandler {
         self.transition_hook = Some(hook);
     }
 
+    /// Attach a built-in tool.
+    ///
+    /// Registers the tool's handlers into the shared registry immediately.
+    /// Handlers capture `Arc<OnceCell<...>>` refs — the actual resources
+    /// (connections, caches) are populated later in `on_start()` when
+    /// `StartFrame` flows through.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let pg = Arc::new(NeonPostgresTool::from_env());
+    /// handler.add_tool(pg);
+    /// ```
+    pub fn add_tool(&mut self, tool: Arc<dyn BuiltinTool>) {
+        log::info!("OpenAILLM: attaching tool '{}'", tool.name());
+        tool.register_all(&mut self.registry.lock().unwrap());
+        self.tools.push(tool);
+    }
+
+    /// Get the tool schemas from all attached tools.
+    ///
+    /// Convenience for building `ToolsSchema` at pipeline setup:
+    /// ```rust,ignore
+    /// let schemas = handler.collect_tool_schemas();
+    /// let tools = ToolsSchema::new(schemas);
+    /// ```
+    pub fn collect_tool_schemas(&self) -> Vec<crate::adapters::schemas::FunctionSchema> {
+        self.tools.iter().flat_map(|t| t.tool_schemas()).collect()
+    }
+
     pub fn into_processor(self) -> FrameProcessor {
         FrameProcessor::new("OpenAILLM", Box::new(self), false)
     }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle helpers
+    // -----------------------------------------------------------------------
+
+    /// Initialise all cacheable tools. Called on StartFrame.
+    async fn start_tools(&self) {
+        for tool in &self.tools {
+            if tool.is_cacheable() {
+                let child = self.cancel_token.child_token();
+                log::info!("OpenAILLM: starting tool '{}'...", tool.name());
+                if let Err(e) = tool.on_start(child).await {
+                    log::error!(
+                        "OpenAILLM: tool '{}' failed to start: {}",
+                        tool.name(), e
+                    );
+                }
+            }
+        }
+    }
+
+    /// Gracefully stop all tools. Called on EndFrame.
+    async fn stop_tools(&self) {
+        for tool in &self.tools {
+            log::debug!("OpenAILLM: stopping tool '{}'...", tool.name());
+            if let Err(e) = tool.on_stop().await {
+                log::error!(
+                    "OpenAILLM: tool '{}' failed to stop: {}",
+                    tool.name(), e
+                );
+            }
+        }
+    }
+
+    /// Cancel all tools. Called on CancelFrame.
+    async fn cancel_tools(&self) {
+        // 1. Trip the cancellation token — background tasks exit via select!
+        self.cancel_token.cancel();
+
+        // 2. Give each tool a chance to do tool-specific cancellation
+        //    (e.g. cancel in-flight postgres queries), then on_stop()
+        for tool in &self.tools {
+            log::debug!("OpenAILLM: cancelling tool '{}'...", tool.name());
+            if let Err(e) = tool.on_cancel().await {
+                log::error!(
+                    "OpenAILLM: tool '{}' cancel failed: {}",
+                    tool.name(), e
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // SSE streaming
+    // -----------------------------------------------------------------------
 
     /// Run a single SSE stream.
     async fn run_stream(
@@ -240,7 +344,10 @@ impl OpenAILLMHandler {
         };
 
         let url = format!("{}/chat/completions", self.config.base_url);
-        log::info!("OpenAILLM: {} messages -> {} (model={})", api_messages.len(), url, self.config.model);
+        log::info!(
+            "OpenAILLM: {} messages -> {} (model={})",
+            api_messages.len(), url, self.config.model
+        );
 
         let body = ChatRequest {
             model: self.config.model.clone(),
@@ -269,7 +376,9 @@ impl OpenAILLMHandler {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(PipecatError::pipeline(format!("OpenAILLM: HTTP {} — {}", status, body)));
+            return Err(PipecatError::pipeline(
+                format!("OpenAILLM: HTTP {} — {}", status, body),
+            ));
         }
 
         let mut stream = response.bytes_stream();
@@ -286,7 +395,9 @@ impl OpenAILLMHandler {
                 let line = buffer[..pos].trim_end_matches('\r').trim().to_string();
                 buffer = buffer[pos + 1..].to_string();
 
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
 
                 let data = match line.strip_prefix("data: ") {
                     Some(d) => d,
@@ -312,18 +423,30 @@ impl OpenAILLMHandler {
                             if let Some(tool_calls) = &choice.delta.tool_calls {
                                 for tc in tool_calls {
                                     let entry = tool_accum.entry(tc.index).or_insert_with(|| {
-                                        PartialToolCall { id: String::new(), name: String::new(), arguments: String::new() }
+                                        PartialToolCall {
+                                            id: String::new(),
+                                            name: String::new(),
+                                            arguments: String::new(),
+                                        }
                                     });
-                                    if let Some(id) = &tc.id { entry.id = id.clone(); }
+                                    if let Some(id) = &tc.id {
+                                        entry.id = id.clone();
+                                    }
                                     if let Some(func) = &tc.function {
-                                        if let Some(name) = &func.name { entry.name = name.clone(); }
-                                        if let Some(args) = &func.arguments { entry.arguments.push_str(args); }
+                                        if let Some(name) = &func.name {
+                                            entry.name = name.clone();
+                                        }
+                                        if let Some(args) = &func.arguments {
+                                            entry.arguments.push_str(args);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    Err(e) => { log::warn!("OpenAILLM: chunk parse error: {} — raw: {}", e, data); }
+                    Err(e) => {
+                        log::warn!("OpenAILLM: chunk parse error: {} — raw: {}", e, data);
+                    }
                 }
             }
         }
@@ -333,14 +456,24 @@ impl OpenAILLMHandler {
         } else {
             let mut calls: Vec<(u32, PartialToolCall)> = tool_accum.into_iter().collect();
             calls.sort_by_key(|(idx, _)| *idx);
-            let tool_calls: Vec<ToolCall> = calls.into_iter().map(|(_, tc)| tc.into_tool_call()).collect();
-            log::info!("OpenAILLM: model requested {} tool call(s): [{}]",
+            let tool_calls: Vec<ToolCall> =
+                calls.into_iter().map(|(_, tc)| tc.into_tool_call()).collect();
+            log::info!(
+                "OpenAILLM: model requested {} tool call(s): [{}]",
                 tool_calls.len(),
-                tool_calls.iter().map(|tc| tc.function_name.as_str()).collect::<Vec<_>>().join(", ")
+                tool_calls
+                    .iter()
+                    .map(|tc| tc.function_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             Ok(InferenceOutcome::ToolCalls(tool_calls))
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Inference with tool execution loop
+    // -----------------------------------------------------------------------
 
     /// Full inference with tool execution and re-invocation loop.
     async fn run_inference(
@@ -352,7 +485,10 @@ impl OpenAILLMHandler {
 
         loop {
             if round >= self.config.max_tool_rounds {
-                log::warn!("OpenAILLM: max tool rounds ({}) reached", self.config.max_tool_rounds);
+                log::warn!(
+                    "OpenAILLM: max tool rounds ({}) reached",
+                    self.config.max_tool_rounds
+                );
                 break;
             }
             round += 1;
@@ -361,19 +497,26 @@ impl OpenAILLMHandler {
                 InferenceOutcome::Text => break,
                 InferenceOutcome::ToolCalls(tool_calls) => {
                     // Append assistant message with tool_calls
-                    context.lock().unwrap().add_assistant_tool_calls(None, tool_calls.clone());
+                    context
+                        .lock()
+                        .unwrap()
+                        .add_assistant_tool_calls(None, tool_calls.clone());
 
-                    processor.push_frame(Frame::function_call_start(), FrameDirection::Downstream).await?;
+                    processor
+                        .push_frame(Frame::function_call_start(), FrameDirection::Downstream)
+                        .await?;
 
                     for tc in &tool_calls {
-                        processor.push_frame(
-                            Frame::function_call_in_progress(FunctionCallData {
-                                id: tc.id.clone(),
-                                function_name: tc.function_name.clone(),
-                                arguments: tc.arguments.clone(),
-                            }),
-                            FrameDirection::Downstream,
-                        ).await?;
+                        processor
+                            .push_frame(
+                                Frame::function_call_in_progress(FunctionCallData {
+                                    id: tc.id.clone(),
+                                    function_name: tc.function_name.clone(),
+                                    arguments: tc.arguments.clone(),
+                                }),
+                                FrameDirection::Downstream,
+                            )
+                            .await?;
 
                         // Look up handler in the shared registry
                         let handler = {
@@ -381,61 +524,74 @@ impl OpenAILLMHandler {
                             reg.get(&tc.function_name).cloned()
                         };
 
-                        // Execute handler and resolve to (summary, Option<raw_data>)
-                        // based on which breed registered the function.
+                        // Execute handler — resolve to (summary, Option<raw_data>)
                         let (summary, raw_data) = match handler {
                             Some(RegistryHandler::Simple(f)) => {
-                                log::info!("OpenAILLM: executing simple '{}' (id={})", tc.function_name, tc.id);
+                                log::info!(
+                                    "OpenAILLM: executing simple '{}' (id={})",
+                                    tc.function_name, tc.id
+                                );
                                 let result = f(tc.arguments.clone()).await;
                                 (result, None)
                             }
                             Some(RegistryHandler::Data(f)) => {
-                                log::info!("OpenAILLM: executing data '{}' (id={})", tc.function_name, tc.id);
+                                log::info!(
+                                    "OpenAILLM: executing data '{}' (id={})",
+                                    tc.function_name, tc.id
+                                );
                                 let output = f(tc.arguments.clone()).await;
                                 (output.summary, output.full_data)
                             }
                             None => {
-                                log::warn!("OpenAILLM: no handler for '{}'", tc.function_name);
+                                log::warn!(
+                                    "OpenAILLM: no handler for '{}'",
+                                    tc.function_name
+                                );
                                 (
-                                    format!("{{\"error\": \"function '{}' is not registered\"}}", tc.function_name),
+                                    format!(
+                                        "{{\"error\": \"function '{}' is not registered\"}}",
+                                        tc.function_name
+                                    ),
                                     None,
                                 )
                             }
                         };
 
-                        // If the data handler returned a full payload, emit it
-                        // as a raw result frame downstream. The LLM never sees this.
+                        // Raw data frame downstream (UI/logging) — LLM never sees this
                         if let Some(data) = raw_data {
-                            processor.push_frame(
-                                Frame::function_call_raw_result(FunctionCallRawResultData {
-                                    id: tc.id.clone(),
-                                    function_name: tc.function_name.clone(),
-                                    raw_data: data,
-                                }),
-                                FrameDirection::Downstream,
-                            ).await?;
+                            processor
+                                .push_frame(
+                                    Frame::function_call_raw_result(FunctionCallRawResultData {
+                                        id: tc.id.clone(),
+                                        function_name: tc.function_name.clone(),
+                                        raw_data: data,
+                                    }),
+                                    FrameDirection::Downstream,
+                                )
+                                .await?;
                         }
 
-                        // Summary result frame — LLM sees this on next round.
-                        processor.push_frame(
-                            Frame::function_call_result(FunctionCallResultData {
-                                id: tc.id.clone(),
-                                function_name: tc.function_name.clone(),
-                                result: summary.clone(),
-                            }),
-                            FrameDirection::Downstream,
-                        ).await?;
+                        // Summary result frame — LLM sees this on next round
+                        processor
+                            .push_frame(
+                                Frame::function_call_result(FunctionCallResultData {
+                                    id: tc.id.clone(),
+                                    function_name: tc.function_name.clone(),
+                                    result: summary.clone(),
+                                }),
+                                FrameDirection::Downstream,
+                            )
+                            .await?;
 
-                        // Only the summary goes into LLM context.
+                        // Only summary goes into LLM context
                         context.lock().unwrap().add_tool_result(&tc.id, &summary);
                     }
 
-                    processor.push_frame(Frame::function_call_end(), FrameDirection::Downstream).await?;
+                    processor
+                        .push_frame(Frame::function_call_end(), FrameDirection::Downstream)
+                        .await?;
 
                     // --- Transition hook ---
-                    // Called after all tool results are appended to context,
-                    // before re-invoking inference. DharaManager uses this to
-                    // swap registry and update context for the next node.
                     if let Some(hook) = &self.transition_hook {
                         hook(&context);
                     }
@@ -462,19 +618,61 @@ impl FrameHandler for OpenAILLMHandler {
         direction: FrameDirection,
     ) -> Result<()> {
         match &frame.inner {
+            // ----- Lifecycle: StartFrame -----
+            // Initialise cacheable tools (connect, cache schemas, etc.)
+            FrameInner::System(SystemFrame::Start(_)) => {
+                log::info!("OpenAILLM: StartFrame — initialising tools...");
+                self.start_tools().await;
+                processor.push_frame(frame, direction).await?;
+            }
+
+            // ----- Lifecycle: EndFrame -----
+            // Graceful shutdown — flush caches, return connections
+            FrameInner::Control(ControlFrame::End { .. }) => {
+                log::info!("OpenAILLM: EndFrame — stopping tools...");
+                self.stop_tools().await;
+                processor.push_frame(frame, direction).await?;
+            }
+
+            // ----- Lifecycle: CancelFrame -----
+            // Abrupt shutdown — cancel in-flight work, then stop
+            FrameInner::System(SystemFrame::Cancel { .. }) => {
+                log::warn!("OpenAILLM: CancelFrame — cancelling tools...");
+                self.cancel_tools().await;
+                processor.push_frame(frame, direction).await?;
+            }
+
+            // ----- Inference trigger -----
             FrameInner::Data(DataFrame::LLMContextFrame(context)) => {
                 let context = context.clone();
-                processor.push_frame(Frame::llm_full_response_start(), FrameDirection::Downstream).await?;
+                processor
+                    .push_frame(
+                        Frame::llm_full_response_start(),
+                        FrameDirection::Downstream,
+                    )
+                    .await?;
                 if let Err(e) = self.run_inference(context, processor).await {
                     log::error!("OpenAILLM: inference error: {}", e);
                     processor.push_error(e.to_string(), false).await?;
                 }
-                processor.push_frame(Frame::llm_full_response_end(), FrameDirection::Downstream).await?;
+                processor
+                    .push_frame(
+                        Frame::llm_full_response_end(),
+                        FrameDirection::Downstream,
+                    )
+                    .await?;
             }
-            _ => { processor.push_frame(frame, direction).await?; }
+
+            // ----- Pass-through -----
+            _ => {
+                processor.push_frame(frame, direction).await?;
+            }
         }
+
         Ok(())
     }
 
-    fn can_generate_metrics(&self) -> bool { true }
+    fn can_generate_metrics(&self) -> bool {
+        true
+    }
 }
