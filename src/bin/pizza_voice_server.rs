@@ -200,7 +200,7 @@ impl OrderWriter {
 
         // Pizzas with sizes (grouped by pizza name since ORDER BY groups them)
         let rows = client.query(
-            "SELECT p.name, p.description, p.is_vegetarian, ps.size, ps.price \
+            "SELECT p.name, p.description, p.is_vegetarian, p.image_url, ps.size, ps.price \
              FROM pizzas p \
              JOIN pizza_sizes ps ON p.id = ps.pizza_id \
              WHERE p.is_available = true \
@@ -214,8 +214,9 @@ impl OrderWriter {
             let name: String = row.get(0);
             let description: Option<String> = row.get(1);
             let vegetarian: bool = row.get(2);
-            let size: String = row.get(3);
-            let price: f64 = row.get(4);
+            let image_url: Option<String> = row.get(3);
+            let size: String = row.get(4);
+            let price: f64 = row.get(5);
 
             let size_entry = json!({"size": size, "price": price});
 
@@ -238,6 +239,7 @@ impl OrderWriter {
                     "name": name,
                     "description": description.unwrap_or_default(),
                     "vegetarian": vegetarian,
+                    "image_url": image_url,
                     "sizes": [size_entry],
                 }));
             }
@@ -275,14 +277,14 @@ impl OrderWriter {
             None => return Ok(None),
         };
 
-        // Get description and vegetarian flag (separate lock scope)
-        let (description, vegetarian) = {
+        // Get description, vegetarian flag, and image_url (separate lock scope)
+        let (description, vegetarian, image_url) = {
             let guard = self.client.lock().await;
             let client = guard.as_ref()
                 .ok_or_else(|| "OrderWriter not initialized".to_string())?;
 
             let row = client.query_opt(
-                "SELECT description, is_vegetarian FROM pizzas WHERE id = $1",
+                "SELECT description, is_vegetarian, image_url FROM pizzas WHERE id = $1",
                 &[&pizza_id],
             ).await.map_err(|e| format!("Pizza detail query failed: {}", e))?;
 
@@ -290,6 +292,7 @@ impl OrderWriter {
                 Some(r) => (
                     r.get::<_, Option<String>>(0).unwrap_or_default(),
                     r.get::<_, bool>(1),
+                    r.get::<_, Option<String>>(2),
                 ),
                 None => return Ok(None),
             }
@@ -301,6 +304,7 @@ impl OrderWriter {
             "name": canonical_name,
             "description": description,
             "vegetarian": vegetarian,
+            "image_url": image_url,
             "sizes": sizes.iter().map(|(s, p)| json!({"size": s, "price": p})).collect::<Vec<_>>(),
         })))
     }
@@ -739,21 +743,49 @@ async fn push_ravi_msg(push: &DeferredPush, data: Value) {
 // Handler factories — Dhara handlers
 // ---------------------------------------------------------------------------
 
-fn make_browse_menu_handler() -> rustvani::dhara::DharaHandlerFn {
+fn make_browse_menu_handler(
+    writer: Arc<OrderWriter>,
+    push: DeferredPush,
+) -> rustvani::dhara::DharaHandlerFn {
     Arc::new(move |_args: String| {
+        let writer = writer.clone();
+        let push = push.clone();
         Box::pin(async move {
-            // Fetch the menu ourselves and include it in the transition result
-            // so the LLM knows we've already fetched it. The fetch_menu data
-            // tool is also available if the customer wants to re-browse later.
-            let instruction = "The menu is being displayed on the customer's screen. \
-                               Say something like 'Here's our menu!' and help them pick. \
-                               Do NOT read the entire menu aloud.";
+            // Fetch menu from DB and push directly to client UI
+            let menu_result = match writer.fetch_menu().await {
+                Ok(menu) => {
+                    let pizza_count = menu["pizzas"]
+                        .as_array().map(|a| a.len()).unwrap_or(0);
+                    let topping_count = menu["toppings"]
+                        .as_array().map(|a| a.len()).unwrap_or(0);
+
+                    // Push full menu to client as server-message
+                    push_ravi_msg(&push, json!({
+                        "type": "menu",
+                        "data": menu,
+                    })).await;
+
+                    json!({
+                        "status": "menu_displayed",
+                        "pizza_count": pizza_count,
+                        "topping_count": topping_count,
+                        "instruction": "The menu is now on the customer's screen. \
+                                        Say something like 'Here's our menu!' and help them pick. \
+                                        Do NOT read the entire menu aloud.",
+                    })
+                }
+                Err(e) => {
+                    log::error!("browse_menu: fetch_menu failed: {}", e);
+                    json!({
+                        "status": "error",
+                        "error": format!("Could not load menu: {}", e),
+                        "instruction": "Apologize and ask the customer to try again.",
+                    })
+                }
+            };
 
             TransitionResult::transition(
-                json!({
-                    "status": "menu_ready",
-                    "instruction": instruction,
-                }).to_string(),
+                menu_result.to_string(),
                 "menu",
             )
         })
@@ -1127,9 +1159,9 @@ fn build_flow(order_writer: Arc<OrderWriter>) -> ConnectionFlow {
 
     let mut dhara = DharaManager::new(context.clone(), registry.clone());
 
-    // greeting — browse_menu transitions to menu node
+    // greeting — browse_menu fetches + pushes menu, then transitions to menu node
     dhara.register_node("greeting", greeting_node(), vec![
-        ("browse_menu", make_browse_menu_handler()),
+        ("browse_menu", make_browse_menu_handler(order_writer.clone(), push_tx.clone())),
     ]);
 
     // menu — pizza ordering tools + fetch_item_detail
