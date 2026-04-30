@@ -910,22 +910,27 @@ fn make_remove_from_order_handler(
             let parsed: serde_json::Value = serde_json::from_str(&args).unwrap_or_default();
             let num = parsed["item_number"].as_u64().unwrap_or(0) as usize;
 
-            let mut state = order.lock().unwrap();
-            let result = if num >= 1 && num <= state.items.len() {
-                let removed = state.items.remove(num - 1);
-                let r = json!({
-                    "status": "removed",
-                    "removed": format!("{} {} (${:.2})", removed.size, removed.pizza, removed.line_price),
-                    "order_summary": state.summary(),
-                });
-                // Push updated cart to client UI
-                let cart_data = state.cart_payload();
-                drop(state); // release lock before await
-                push_ravi_msg(&push, cart_data).await;
-                r
-            } else {
-                json!({"status": "error", "error": format!("No item #{}", num)})
-            };
+            // Scope the MutexGuard so it's dropped before any .await
+            let (result, cart_data) = {
+                let mut state = order.lock().unwrap();
+                if num >= 1 && num <= state.items.len() {
+                    let removed = state.items.remove(num - 1);
+                    let r = json!({
+                        "status": "removed",
+                        "removed": format!("{} {} (${:.2})", removed.size, removed.pizza, removed.line_price),
+                        "order_summary": state.summary(),
+                    });
+                    (r, Some(state.cart_payload()))
+                } else {
+                    (json!({"status": "error", "error": format!("No item #{}", num)}), None)
+                }
+            }; // guard dropped here
+
+            // Push cart update outside the lock
+            if let Some(cart) = cart_data {
+                push_ravi_msg(&push, cart).await;
+            }
+
             TransitionResult::stay(result.to_string())
         })
     })
