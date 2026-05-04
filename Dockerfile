@@ -67,7 +67,6 @@ COPY Cargo.lock .
 COPY src/ src/
 COPY tests/ tests/
 COPY examples/ examples/
-COPY piper-models/ piper-models/
 COPY assets/ assets/
 
 # VAD model expected at working directory root by default
