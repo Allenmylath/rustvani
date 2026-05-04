@@ -10,7 +10,7 @@
 
 ```
 User speaks → VAD → STT → LLM → TTS → User hears
-              32ms   ~     ~     ~      ← end-to-end, not minutes
+              500ms   ~     ~     ~      ← end-to-end, not minutes
 ```
 
 ---
