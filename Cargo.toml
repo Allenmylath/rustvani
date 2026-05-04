@@ -47,6 +47,10 @@ path = "src/bin/websocket_server_piper.rs"
 name = "pizza_voice_server"
 path = "src/bin/pizza_voice_server.rs"
 
+[[bin]]
+name = "agent_text_demo"
+path = "src/bin/agent_text_demo.rs"
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
@@ -90,7 +94,8 @@ tokio-postgres      = { version = "0.7", features = ["with-serde_json-1", "with-
 postgres-native-tls = "0.5"
 native-tls          = "0.2"
 chrono          = { version = "0.4", features = ["serde"] }
-uuid            = { version = "1",   features = ["serde"] }
+uuid            = { version = "1",   features = ["serde", "v4"] }
+dotenvy         = "0.15"
 
 # ---------------------------------------------------------------------------
 # Dev dependencies

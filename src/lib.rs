@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod services;
 pub mod clock;
 pub mod context;
