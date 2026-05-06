@@ -24,7 +24,7 @@ rustvani keeps Pipecat's architecture and fixes the runtime:
 | | Pipecat (Python) | rustvani (Rust) |
 |---|---|---|
 | Runtime | asyncio + threads | Tokio (work-stealing, zero-cost futures) |
-| VAD inference | Blocks event loop or GIL-bound thread | `spawn_blocking` on true OS threads |
+| VAD inference | Threadpool executor | `spawn_blocking` on true OS threads |
 | Memory per session | ~80–150 MB | ~8–15 MB |
 | Frame dispatch | Dynamic dict lookups, vtable overhead | Monomorphized generics, enum dispatch |
 | Cold start | 2–5s (interpreter + imports) | <100ms (static binary) |
