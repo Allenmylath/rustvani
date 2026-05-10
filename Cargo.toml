@@ -1,7 +1,9 @@
 [package]
 name = "rustvani"
 version = "0.1.0"
-edition = "2021"
+edition = "2026"
+license = "BSD-2-Clause"
+license-file = "LICENSE"
 
 # ---------------------------------------------------------------------------
 # Binaries
