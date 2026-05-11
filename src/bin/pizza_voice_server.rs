@@ -10,14 +10,15 @@
 //!     → LLMUserAggregator
 //!     → OpenAILLM (with dhara transition hook + fetch_menu data tool)
 //!     → LLMAssistantAggregator
-//!     → SarvamTts
+//!     → DeepgramTts
 //!     → WebSocketTransport.output()
 //!
 //! Environment variables:
 //!   PORT             — listen port (default: 10000)
 //!   DATABASE_URL     — required (Neon connection string)
-//!   SARVAM_API_KEY   — required (STT + TTS)
+//!   SARVAM_API_KEY   — required (STT)
 //!   OPENAI_API_KEY   — required (LLM)
+//!   DEEPGRAM_API_KEY — required (TTS)
 
 use std::error::Error;
 use std::sync::{Arc, Mutex};
@@ -54,7 +55,7 @@ use rustvani::ravi::{
 use rustvani::services::{
     OpenAILLMConfig, OpenAILLMHandler,
     SarvamSttConfig, SarvamSttHandler,
-    SarvamTtsConfig, SarvamTtsHandler,
+    DeepgramTtsConfig, DeepgramTtsHandler,
 };
 use rustvani::frames::{Frame, FrameDirection};
 use rustvani::ravi::models as ravi_models;
@@ -85,9 +86,10 @@ fn next_conn_id() -> u64 {
 
 #[derive(Clone)]
 struct AppState {
-    database_url:    String,
-    sarvam_api_key:  String,
-    openai_api_key:  String,
+    database_url:     String,
+    sarvam_api_key:   String,
+    openai_api_key:   String,
+    deepgram_api_key: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,13 +1298,10 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     llm_handler.set_transition_hook(flow.transition_hook);
     let llm = llm_handler.into_processor();
 
-    // ---- TTS ----
-    let tts = match SarvamTtsHandler::new(SarvamTtsConfig {
-        api_key:  app_state.sarvam_api_key.clone(),
-        model:    "bulbul:v3".to_string(),
-        voice:    "aditya".to_string(),
-        language: "en-IN".to_string(),
-        ..SarvamTtsConfig::default()
+    // ---- TTS (Deepgram) ----
+    let tts = match DeepgramTtsHandler::new(DeepgramTtsConfig {
+        api_key: app_state.deepgram_api_key.clone(),
+        ..DeepgramTtsConfig::default()
     }) {
         Ok(t) => t.into_processor(),
         Err(e) => {
@@ -1359,7 +1358,10 @@ async fn main() {
     let openai_api_key = std::env::var("OPENAI_API_KEY")
         .expect("OPENAI_API_KEY env var not set");
 
-    let app_state = AppState { database_url, sarvam_api_key, openai_api_key };
+    let deepgram_api_key = std::env::var("DEEPGRAM_API_KEY")
+        .expect("DEEPGRAM_API_KEY env var not set");
+
+    let app_state = AppState { database_url, sarvam_api_key, openai_api_key, deepgram_api_key };
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
