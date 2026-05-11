@@ -32,6 +32,7 @@ pub use services::{
     SarvamLLMConfig, SarvamLLMHandler,
     SarvamSttConfig, SarvamSttHandler,
     SarvamTtsConfig, SarvamTtsHandler,
+    DeepgramTtsConfig, DeepgramTtsHandler,
     PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler,
     OpenAILLMConfig, OpenAILLMHandler, FunctionRegistry,
 };
