@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use rustvani::{
     system_clock, AudioRawData, DataFrame, Frame, FrameDirection, FrameHandler,
     FrameInner, FrameKind, FrameProcessor, PipelineParams, PipelineTask,
-    Result, SileroVad, VadParams,
+    Result, SileroVadNative, VadParams,
 };
 use rustvani::services::{SarvamSttConfig, SarvamSttHandler};
 use rustvani::transport::{BaseTransport, TransportParams};
@@ -110,7 +110,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // VAD
     let vad_analyzer = Arc::new(
-        SileroVad::new(16_000).map_err(|e| format!("VAD init: {}", e))?
+        SileroVadNative::new(16_000).map_err(|e| format!("VAD init: {}", e))?
     );
 
     // Transport

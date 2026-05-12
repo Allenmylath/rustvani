@@ -5,7 +5,7 @@ use async_trait::async_trait;
 /// Mirrors Python's `VADAnalyzer` abstract base class.
 /// Implement this to swap in WebRTC VAD, energy-based detection, etc.
 ///
-/// `SileroVad` is the default implementation.
+/// `SileroVadNative` is the default implementation.
 #[async_trait]
 pub trait VadAnalyzer: Send + Sync {
     /// Number of PCM frames required per inference call.

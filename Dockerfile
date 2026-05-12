@@ -71,6 +71,7 @@ COPY assets/ assets/
 
 # VAD model expected at working directory root by default
 COPY src/vad/data/silero.onnx silero.onnx
+COPY src/vad/data/silero_vad_16k.bin data/silero_vad_16k.bin
 
 # ---------------------------------------------------------------------------
 # Build release + compile tests

@@ -12,7 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rustvani::{
     system_clock, Frame, FrameDirection, FrameHandler, FrameInner,
-    FrameProcessor, PipelineParams, PipelineTask, Result, VadParams, SileroVad,
+    FrameProcessor, PipelineParams, PipelineTask, Result, VadParams, SileroVadNative,
     DataFrame,
 };
 use rustvani::transport::{BaseTransport, TransportParams};
@@ -91,7 +91,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // VAD — same config as pipeline_test
     let vad_analyzer = Arc::new(
-        SileroVad::new(16_000).map_err(|e| format!("VAD init failed: {}", e))?
+        SileroVadNative::new(16_000).map_err(|e| format!("VAD init failed: {}", e))?
     );
 
     let transport = Arc::new(BaseTransport::new("Test", TransportParams {

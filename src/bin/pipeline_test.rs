@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use rustvani::{
     system_clock, AudioRawData, Frame, FrameDirection, FrameHandler, FrameKind,
-    FrameProcessor, PipelineParams, PipelineTask, Result, VadParams, SileroVad,
+    FrameProcessor, PipelineParams, PipelineTask, Result, VadParams, SileroVadNative,
 };
 use rustvani::transport::{BaseTransport, TransportParams};
 
@@ -98,7 +98,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let pcm_bytes = read_wav_pcm(WAV_PATH)?;
 
     let vad_analyzer = Arc::new(
-        SileroVad::new(16_000).map_err(|e| format!("VAD init failed: {}", e))?
+        SileroVadNative::new(16_000).map_err(|e| format!("VAD init failed: {}", e))?
     );
 
     let params = TransportParams {

@@ -3,14 +3,12 @@
 //! `VadProcessor` is a [`FrameHandler`] that:
 //! 1. Receives `InputAudioRaw` frames from the transport.
 //! 2. Accumulates PCM until a full Silero inference window is ready.
-//! 3. Runs Silero inference on `spawn_blocking` (true OS thread).
+//! 3. Runs inference via the configured `VadAnalyzer` backend.
 //! 4. Advances the state machine with the result.
 //! 5. Emits `VADUserStartedSpeaking` / `VADUserStoppedSpeaking` on transitions.
 //!
-//! Sits between transport input and STT in the pipeline:
-//! ```text
-//! transport.input() → VadProcessor → stt → llm → tts → transport.output()
-//! ```
+//! Supports both `SileroVadNative` (pure Rust) and `SileroVadOrt` (ONNX Runtime)
+//! via the `VadAnalyzer` trait.
 
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,20 +21,19 @@ use crate::frames::{
     Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor, SystemFrame,
 };
 
+use super::analyzer::VadAnalyzer;
 use super::params::VadParams;
-use super::silero::SileroVad;
 use super::state::{StateMachine, VadState};
+use super::{VadBackend, create_vad};
 
 // ---------------------------------------------------------------------------
 // VadProcessorState — shared between handler and async tasks
 // ---------------------------------------------------------------------------
 
 struct VadProcessorState {
-    machine:  StateMachine,
-    model:    SileroVad,
-    /// Start secs used in VADUserStartedSpeaking frame.
+    machine:    StateMachine,
+    model:      Arc<dyn VadAnalyzer>,
     start_secs: f32,
-    /// Stop secs used in VADUserStoppedSpeaking frame.
     stop_secs:  f32,
 }
 
@@ -50,12 +47,16 @@ pub struct VadProcessor {
 }
 
 impl VadProcessor {
-    /// Create a new VAD processor.
+    /// Create a new VAD processor with the specified backend.
     ///
     /// `sample_rate` must be 8000 or 16000.
-    /// Returns an error if the Silero model fails to load.
-    pub fn new(sample_rate: u32, params: VadParams) -> Result<Self> {
-        let model = SileroVad::new(sample_rate)
+    /// `backend` selects Native (pure Rust) or Ort (ONNX Runtime).
+    pub fn new(
+        sample_rate: u32,
+        params: VadParams,
+        backend: VadBackend,
+    ) -> Result<Self> {
+        let model = create_vad(backend, sample_rate)
             .map_err(|e| crate::error::PipecatError::pipeline(e))?;
 
         let start_secs = params.start_secs;
@@ -70,6 +71,11 @@ impl VadProcessor {
                 stop_secs,
             })),
         })
+    }
+
+    /// Create with default backend (Native).
+    pub fn with_defaults(sample_rate: u32, params: VadParams) -> Result<Self> {
+        Self::new(sample_rate, params, VadBackend::default())
     }
 
     /// Build a `FrameProcessor` wrapping this handler.
@@ -103,18 +109,13 @@ impl FrameHandler for VadProcessor {
                 };
 
                 if let Some(window) = window_opt {
-                    // Run inference off the async executor.
+                    // Clone model out of the lock — Arc::clone is cheap.
                     let model = {
                         self.state.lock().unwrap().model.clone()
                     };
 
-                    let confidence = match model.infer_async(window.clone()).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            log::error!("VadProcessor: inference error: {}", e);
-                            return Ok(());
-                        }
-                    };
+                    // Run inference outside the lock.
+                    let confidence = model.voice_confidence(window.clone()).await;
 
                     // Advance state machine — get previous and new state.
                     let (prev_state, new_state, start_secs, stop_secs) = {

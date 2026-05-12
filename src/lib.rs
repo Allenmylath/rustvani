@@ -37,5 +37,5 @@ pub use services::{
     OpenAILLMConfig, OpenAILLMHandler, FunctionRegistry,
 };
 pub use transport::{BaseInputTransport, BaseOutputTransport, BaseTransport, TransportParams};
-pub use vad::{SileroVad, VadAnalyzer, VadParams, VadState};
+pub use vad::{SileroVadNative, SileroVadOrt, VadAnalyzer, VadBackend, VadParams, VadState};
 

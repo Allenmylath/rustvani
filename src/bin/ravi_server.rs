@@ -27,7 +27,7 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 use rustvani::{
-    shared_context, system_clock, SileroVad, VadParams,
+    shared_context, system_clock, SileroVadNative, VadParams,
     PipelineParams, PipelineTask, FunctionRegistry,
 };
 use rustvani::adapters::schemas::{FunctionSchema, ToolsSchema};
@@ -152,7 +152,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     log::info!("[conn={}] connected", conn_id);
 
     // ---- VAD ----
-    let vad_analyzer = match SileroVad::new(16_000) {
+    let vad_analyzer = match SileroVadNative::new(16_000) {
         Ok(v) => Arc::new(v),
         Err(e) => {
             log::error!("[conn={}] VAD init failed: {}", conn_id, e);
