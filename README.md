@@ -434,7 +434,7 @@ The frame flow, interrupt semantics, aggregator logic, and pipeline nesting all 
 
 ## License
 
-rustvani has not yet declared a license for its original Rust code.
+Rustvani runs on BSD2 [LICENSE](LICENSE).
 
 Portions of this project are derived from [Pipecat](https://github.com/pipecat-ai/pipecat) by Daily and retain Pipecat's BSD-2-Clause license notice. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
