@@ -4,10 +4,10 @@
 //! in memory (~7 MB) with fused dequant+SIMD in the matmul inner loop.
 //! Small weights (conv, pool, classifier) are dequantized to f32 at init.
 //!
-//! Binary: 7.1 MB xz-compressed (embedded at compile time).
+//! Binary: 7.2 MB gzip-compressed (embedded at compile time).
 //! RAM: ~15 MB total (7 MB INT8 + 2 MB f32 + 6 MB scratch).
 
-use std::io::Cursor;
+use std::io::Read;
 
 const D: usize = 384;
 const HEADS: usize = 6;
@@ -22,7 +22,7 @@ const CLS_SMALL: usize = 64;
 const LN_EPS: f32 = 1e-5;
 const ATTN_SCALE: f32 = 0.353_553_39;
 
-const WEIGHTS_XZ: &[u8] = include_bytes!("smart_turn_weights.bin.xz");
+const WEIGHTS_GZ: &[u8] = include_bytes!("smart_turn_weights.bin.gz");
 
 // ── Quantized weight block (INT8 in memory) ─────────────────────────────
 
@@ -106,9 +106,9 @@ pub struct SmartTurnEngine {
 
 impl SmartTurnEngine {
     pub fn new() -> Result<Self, String> {
-        let mut reader = Cursor::new(WEIGHTS_XZ);
+        let mut decoder = flate2::read::GzDecoder::new(&WEIGHTS_GZ[..]);
         let mut raw = Vec::new();
-        lzma_rs::xz_decompress(&mut reader, &mut raw)
+        decoder.read_to_end(&mut raw)
             .map_err(|e| format!("Decompress failed: {}", e))?;
 
         let mut r = BinReader::new(&raw);
