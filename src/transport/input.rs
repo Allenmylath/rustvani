@@ -307,6 +307,11 @@ async fn run_audio_task(
                                                 "BaseInputTransport: VAD push failed: {}", e
                                             );
                                         }
+                                    } else {
+                                        log::info!(
+                                            "VAD: → Quiet (confidence={:.3}), deferring to SmartTurn",
+                                            confidence
+                                        );
                                     }
                                     vad_quiet_transition = true;
                                 }
@@ -339,11 +344,11 @@ async fn run_audio_task(
                     }
 
                     if vad_quiet_transition {
-                        log::debug!("SmartTurn: VAD quiet — running ML inference");
+                        log::info!("SmartTurn: VAD quiet — running ML inference");
                         let (result, metrics) = ta.analyze_end_of_turn();
 
                         if let Some(ref m) = metrics {
-                            log::debug!(
+                            log::info!(
                                 "SmartTurn: prob={:.3} complete={} time={:.1}ms",
                                 m.probability, m.is_complete, m.e2e_processing_time_ms
                             );
@@ -363,6 +368,8 @@ async fn run_audio_task(
                             let _ = processor
                                 .push_frame(frame, FrameDirection::Downstream)
                                 .await;
+                        } else {
+                            log::info!("SmartTurn: → Incomplete, waiting for more audio");
                         }
                     }
                 }
