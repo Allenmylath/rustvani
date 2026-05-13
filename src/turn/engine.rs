@@ -1,11 +1,14 @@
 //! Pure Rust smart-turn-v3 inference engine — zero external dependencies.
 //!
-//! Weights are embedded at compile time (~31 MB added to binary).
+//! Weights are xz-compressed and embedded at compile time (~16 MB in binary).
+//! Decompressed once on first construction (~31 MB in RAM).
 //!
 //! ```ignore
 //! let engine = SmartTurnEngine::new()?;
 //! let prob = engine.infer(&features_80x800);
 //! ```
+
+use std::io::Cursor;
 
 const D: usize = 384;
 const HEADS: usize = 6;
@@ -21,7 +24,7 @@ const EXPECTED_FLOATS: usize = 8_000_386;
 const LN_EPS: f32 = 1e-5;
 const ATTN_SCALE: f32 = 0.353_553_39; // 1/sqrt(8)
 
-const WEIGHTS_BYTES: &[u8] = include_bytes!("smart_turn_weights.bin");
+const WEIGHTS_XZ: &[u8] = include_bytes!("smart_turn_weights.bin.xz");
 
 struct LayerOffsets {
     aln_w: usize, aln_b: usize,
@@ -50,16 +53,22 @@ pub struct SmartTurnEngine {
 }
 
 impl SmartTurnEngine {
-    /// Create engine from embedded weights.
+    /// Create engine — decompresses embedded weights on first call.
     pub fn new() -> Result<Self, String> {
-        let w: Vec<f32> = WEIGHTS_BYTES
+        // Decompress xz → raw bytes
+        let mut reader = Cursor::new(WEIGHTS_XZ);
+        let mut raw = Vec::with_capacity(EXPECTED_FLOATS * 4);
+        lzma_rs::xz_decompress(&mut reader, &mut raw)
+            .map_err(|e| format!("Failed to decompress weights: {}", e))?;
+
+        let w: Vec<f32> = raw
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
 
         if w.len() < EXPECTED_FLOATS {
             return Err(format!(
-                "Embedded weights too small: {} floats, expected {}",
+                "Decompressed weights too small: {} floats, expected {}",
                 w.len(), EXPECTED_FLOATS
             ));
         }
@@ -98,8 +107,8 @@ impl SmartTurnEngine {
         assert_eq!(o, EXPECTED_FLOATS, "Weight count mismatch");
 
         log::info!(
-            "SmartTurnEngine: loaded {} floats ({:.1} MB) from embedded weights",
-            w.len(), w.len() as f64 * 4.0 / 1024.0 / 1024.0
+            "SmartTurnEngine: decompressed {} → {} floats ({:.1} MB)",
+            WEIGHTS_XZ.len(), w.len(), w.len() as f64 * 4.0 / 1024.0 / 1024.0
         );
 
         Ok(Self {
@@ -129,7 +138,6 @@ impl SmartTurnEngine {
         );
         gelu_inplace(&mut x);
 
-        // Transpose [384, 400] → [400, 384] + positional embeddings
         let pos = &self.w[self.pos_emb..self.pos_emb + SEQ * D];
         let mut seq_data = vec![0.0f32; SEQ * D];
         for s in 0..SEQ {
@@ -216,14 +224,12 @@ impl SmartTurnEngine {
         let out_w = &self.w[l.out_w..l.out_w + D * D];
         let out_b = &self.w[l.out_b..l.out_b + D];
 
-        // LayerNorm
         let mut ln_buf = vec![0.0f32; SEQ * D];
         ln_buf.copy_from_slice(&x[..SEQ * D]);
         for s in 0..SEQ {
             layer_norm_inplace(&mut ln_buf[s * D..(s + 1) * D], aln_w, aln_b);
         }
 
-        // Q, K, V projections + scale
         let mut q = vec![0.0f32; SEQ * D];
         let mut k = vec![0.0f32; SEQ * D];
         let mut v = vec![0.0f32; SEQ * D];
@@ -246,7 +252,6 @@ impl SmartTurnEngine {
             }
         }
 
-        // Multi-head attention
         let mut attn_out = vec![0.0f32; SEQ * D];
         let mut scores = vec![0.0f32; SEQ * SEQ];
 
@@ -273,7 +278,6 @@ impl SmartTurnEngine {
             }
         }
 
-        // Out projection + residual
         for s in 0..SEQ {
             let inp = &attn_out[s * D..(s + 1) * D];
             for n in 0..D {
