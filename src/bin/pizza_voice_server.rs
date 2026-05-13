@@ -62,6 +62,7 @@ use rustvani::ravi::models as ravi_models;
 use rustvani::services::llm::function_registry::{FunctionRegistry, ToolCallOutput};
 use rustvani::transport::websocket::{WebSocketParams, WebSocketTransport};
 use rustvani::transport::TransportParams;
+use rustvani::turn::SmartTurnConfig;
 
 // ---------------------------------------------------------------------------
 // Deferred push sender — set after PipelineTask::new(), used by handlers
@@ -1246,6 +1247,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
                     min_volume: 0.1,
                     ..VadParams::default()
                 },
+                turn_config:              Some(SmartTurnConfig::default()),
                 ..TransportParams::default()
             },
         },
