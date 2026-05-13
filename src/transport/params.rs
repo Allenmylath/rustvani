@@ -1,6 +1,7 @@
 //! Transport configuration parameters.
 
 use std::sync::Arc;
+use crate::turn::SmartTurnConfig;
 use crate::vad::{VadAnalyzer, VadParams};
 
 #[derive(Clone)]
@@ -15,11 +16,12 @@ pub struct TransportParams {
     pub audio_out_sample_rate:    Option<u32>,
     pub audio_out_channels:       u16,
     pub audio_out_bitrate:        u32,
-    /// VAD backend. `None` disables VAD entirely.
     pub vad_analyzer:             Option<Arc<dyn VadAnalyzer>>,
-    /// VAD tuning parameters. Only used when `vad_analyzer` is `Some`.
     pub vad_params:               VadParams,
-    pub audio_out_10ms_chunks:     u32,
+    pub audio_out_10ms_chunks:    u32,
+    /// Smart turn config. `None` disables ML end-of-turn (VAD-only).
+    /// Requires `vad_analyzer` to be set.
+    pub turn_config:              Option<SmartTurnConfig>,
 }
 
 impl std::fmt::Debug for TransportParams {
@@ -37,7 +39,8 @@ impl std::fmt::Debug for TransportParams {
             .field("audio_out_bitrate",         &self.audio_out_bitrate)
             .field("vad_analyzer",              &self.vad_analyzer.as_ref().map(|_| "Some(...)"))
             .field("vad_params",                &self.vad_params)
-            .field("audio_out_10ms_chunks", &self.audio_out_10ms_chunks)
+            .field("audio_out_10ms_chunks",     &self.audio_out_10ms_chunks)
+            .field("turn_config",               &self.turn_config.as_ref().map(|_| "Some(...)"))
             .finish()
     }
 }
@@ -58,6 +61,7 @@ impl Default for TransportParams {
             vad_analyzer:             None,
             vad_params:               VadParams::default(),
             audio_out_10ms_chunks:    4,
+            turn_config:              None,
         }
     }
 }
