@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use log;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::error::Result;
 use crate::frames::{
@@ -66,15 +67,62 @@ impl BaseOutputTransport {
         self.state.bot_speaking.load(Ordering::Relaxed)
     }
 
+    /// Check if the output channel is alive (not closed).
+    fn is_output_alive(&self) -> bool {
+        let guard = self.state.audio_out_tx.lock().unwrap();
+        match guard.as_ref() {
+            Some(tx) => !tx.is_closed(),
+            None => false,
+        }
+    }
+
+    /// Clear the dead sender and audio buffer when the channel closes.
+    fn clear_dead_output(&self) {
+        let mut tx_guard = self.state.audio_out_tx.lock().unwrap();
+        *tx_guard = None;
+        drop(tx_guard);
+
+        let mut buf = self.state.audio_buffer.lock().unwrap();
+        buf.clear();
+        // Force shrink if buffer grew large
+        if buf.capacity() > 65536 {
+            *buf = Vec::with_capacity(8192);
+        }
+        drop(buf);
+
+        self.state.bot_speaking.store(false, Ordering::Relaxed);
+    }
+
+    /// Send a message to the output channel.
+    /// Returns `true` if the channel is still alive after the attempt.
+    fn try_send_output(&self, msg: OutputMessage) -> bool {
+        let tx = {
+            let guard = self.state.audio_out_tx.lock().unwrap();
+            guard.clone()
+        };
+
+        let Some(tx) = tx else {
+            return false;
+        };
+
+        match tx.try_send(msg) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                log::warn!("BaseOutputTransport: output channel full — dropping message");
+                true // Channel alive but backpressured
+            }
+            Err(TrySendError::Closed(_)) => {
+                log::warn!("BaseOutputTransport: output channel closed — WebSocket disconnected");
+                self.clear_dead_output();
+                false
+            }
+        }
+    }
+
     /// Send a text (JSON) message to the client without going through the
     /// frame pipeline — used by RAVI server message / response frames.
     fn send_text(&self, payload: &str) {
-        let tx = self.state.audio_out_tx.lock().unwrap().clone();
-        if let Some(tx) = tx {
-            if tx.try_send(OutputMessage::Text(payload.to_string())).is_err() {
-                log::warn!("BaseOutputTransport: text output channel full — dropping RAVI message");
-            }
-        }
+        self.try_send_output(OutputMessage::Text(payload.to_string()));
     }
 }
 
@@ -93,6 +141,13 @@ impl FrameHandler for BaseOutputTransport {
         match &frame.inner {
             // ---- Audio output ----
             FrameInner::Data(DataFrame::OutputAudioRaw(audio)) => {
+                // Early exit: don't buffer audio if output is dead
+                if !self.is_output_alive() {
+                    log::debug!("BaseOutputTransport: output dead, dropping audio frame");
+                    processor.push_frame(frame, direction).await?;
+                    return Ok(());
+                }
+
                 let channels = audio.num_channels.max(1) as u32;
                 let multiplier = self.state.params.audio_out_10ms_chunks.max(1);
                 let base_10ms = (audio.sample_rate / 100) * channels * 2;
@@ -126,6 +181,19 @@ impl FrameHandler for BaseOutputTransport {
                 let chunks: Vec<Vec<u8>> = {
                     let mut buf = self.state.audio_buffer.lock().unwrap();
                     buf.extend_from_slice(&audio.audio);
+
+                    // Safety cap: if buffer grew way beyond chunk_size, something is wrong
+                    let max_buffered = chunk_size * 50; // ~500ms max backlog
+                    if buf.len() > max_buffered {
+                        log::warn!(
+                            "BaseOutputTransport: audio buffer exceeded {}B, draining {}B",
+                            max_buffered,
+                            buf.len() - max_buffered
+                        );
+                        let drain = buf.len() - max_buffered;
+                        buf.drain(..drain);
+                    }
+
                     let mut out = Vec::with_capacity(buf.len() / chunk_size + 1);
                     while buf.len() >= chunk_size {
                         out.push(buf.drain(..chunk_size).collect());
@@ -133,12 +201,17 @@ impl FrameHandler for BaseOutputTransport {
                     out
                 };
 
-                let tx = self.state.audio_out_tx.lock().unwrap().clone();
-                if let Some(tx) = tx {
-                    for chunk in chunks {
-                        if tx.try_send(OutputMessage::Audio(chunk)).is_err() {
-                            log::warn!("BaseOutputTransport: audio_out channel full — dropping chunk");
-                        }
+                for chunk in chunks {
+                    if !self.try_send_output(OutputMessage::Audio(chunk)) {
+                        break; // Channel died mid-send, stop wasting CPU
+                    }
+                }
+
+                // Shrink buffer if it grew too large and is now empty
+                {
+                    let mut buf = self.state.audio_buffer.lock().unwrap();
+                    if buf.is_empty() && buf.capacity() > 65536 {
+                        *buf = Vec::with_capacity(8192);
                     }
                 }
 
@@ -146,9 +219,6 @@ impl FrameHandler for BaseOutputTransport {
             }
 
             // ---- RAVI outbound messages ----
-            // These are system frames so they bypass the ordered data queue.
-            // Serialize → text channel → WebSocket sends them to the client.
-
             FrameInner::System(SystemFrame::RaviServerMessage { payload }) => {
                 log::trace!("BaseOutputTransport: sending RAVI server message");
                 self.send_text(payload);
@@ -165,10 +235,7 @@ impl FrameHandler for BaseOutputTransport {
             FrameInner::System(SystemFrame::Interruption) => {
                 self.state.audio_buffer.lock().unwrap().clear();
 
-                let tx = self.state.audio_out_tx.lock().unwrap().clone();
-                if let Some(tx) = tx {
-                    let _ = tx.try_send(OutputMessage::Interruption);
-                }
+                self.try_send_output(OutputMessage::Interruption);
 
                 if self.state.bot_speaking.swap(false, Ordering::Relaxed) {
                     log::debug!("BaseOutputTransport: bot stopped speaking (interruption)");
