@@ -16,6 +16,7 @@ pub mod ravi;
 pub mod adapters;
 pub mod dhara;
 pub mod tools;
+pub mod turn;
 
 pub use clock::{BaseClock, SystemClock, system_clock};
 pub use error::{PipecatError, Result};

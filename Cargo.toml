@@ -68,6 +68,8 @@ log             = "0.4"
 env_logger      = "0.11"
 nnnoiseless     = "0.1"
 rubato          = "0.14"
+rustfft         = "6"
+lzma-rs         = "0.3"
 
 # ONNX Runtime — for Silero VAD
 ort = { version = "=2.0.0-rc.10", features = ["ndarray", "download-binaries"] }

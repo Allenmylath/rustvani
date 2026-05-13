@@ -12,6 +12,7 @@ use crate::frames::{
     AudioRawData, ControlFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,
     SystemFrame,
 };
+use crate::turn::{EndOfTurnState, SmartTurnAnalyzer};
 use crate::vad::{StateMachine, VadState};
 
 use super::params::TransportParams;
@@ -29,7 +30,8 @@ struct InputTransportState {
     audio_tx:   mpsc::Sender<AudioRawData>,
     audio_rx:   std::sync::Mutex<Option<mpsc::Receiver<AudioRawData>>>,
     audio_task: std::sync::Mutex<Option<JoinHandle<()>>>,
-    vad_machine: std::sync::Mutex<Option<StateMachine>>,
+    vad_machine:    std::sync::Mutex<Option<StateMachine>>,
+    turn_analyzer:  std::sync::Mutex<Option<SmartTurnAnalyzer>>,
 }
 
 pub struct BaseInputTransport {
@@ -50,7 +52,8 @@ impl BaseInputTransport {
                 audio_tx,
                 audio_rx:    std::sync::Mutex::new(Some(audio_rx)),
                 audio_task:  std::sync::Mutex::new(None),
-                vad_machine: std::sync::Mutex::new(None),
+                vad_machine:   std::sync::Mutex::new(None),
+                turn_analyzer: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -93,6 +96,32 @@ impl BaseInputTransport {
             log::warn!("BaseInputTransport: no VAD analyzer configured");
         }
 
+        if let Some(config) = &self.state.params.turn_config {
+            if self.state.params.vad_analyzer.is_none() {
+                log::warn!(
+                    "BaseInputTransport: turn_config set but no vad_analyzer — skipping"
+                );
+            } else {
+                match SmartTurnAnalyzer::new(config) {
+                    Ok(mut analyzer) => {
+                        analyzer.set_sample_rate(sr);
+                        analyzer.update_vad_start_secs(
+                            self.state.params.vad_params.start_secs as f64,
+                        );
+                        *self.state.turn_analyzer.lock().unwrap() = Some(analyzer);
+                        log::info!("BaseInputTransport: smart turn analyzer initialized");
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "BaseInputTransport: failed to create smart turn analyzer: {} \
+                             — falling back to VAD-only",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         if self.state.params.audio_in_stream_on_start {
             self.spawn_audio_task(processor.clone());
         }
@@ -128,6 +157,9 @@ impl BaseInputTransport {
         if let Some(handle) = self.state.audio_task.lock().unwrap().take() {
             handle.abort();
             log::debug!("BaseInputTransport: audio task aborted");
+        }
+        if let Some(ta) = self.state.turn_analyzer.lock().unwrap().as_mut() {
+            ta.clear();
         }
     }
 }
@@ -190,6 +222,14 @@ async fn run_audio_task(
     let mut chunk_count = 0u64;
     log::info!("BaseInputTransport: audio task started");
 
+    let mut turn_analyzer = state.turn_analyzer.lock().unwrap().take();
+    let has_smart_turn = turn_analyzer.is_some();
+    if has_smart_turn {
+        log::info!("BaseInputTransport: smart turn active in audio task");
+    }
+
+    let mut last_is_speech = false;
+
     loop {
         match tokio::time::timeout(AUDIO_TIMEOUT, rx.recv()).await {
             Ok(Some(data)) => {
@@ -210,6 +250,9 @@ async fn run_audio_task(
                     }
                 }
 
+                // ── VAD processing ──
+                let mut vad_quiet_transition = false;
+
                 if let Some(analyzer) = &state.params.vad_analyzer {
                     let window_opt = {
                         let mut machine = state.vad_machine.lock().unwrap();
@@ -218,6 +261,7 @@ async fn run_audio_task(
 
                     if let Some(window) = window_opt {
                         let confidence = analyzer.voice_confidence(window.clone()).await;
+                        last_is_speech = confidence >= state.params.vad_params.confidence;
 
                         let new_vad_state = {
                             let mut machine = state.vad_machine.lock().unwrap();
@@ -248,21 +292,84 @@ async fn run_audio_task(
                                     }
                                 }
                                 VadState::Quiet if was_speaking => {
-                                    log::info!("VAD: → Quiet (confidence={:.3})", confidence);
-                                    state.emitted_speaking.store(false, Ordering::Relaxed);
-                                    let frame = Frame::vad_user_stopped_speaking(
-                                        state.params.vad_params.stop_secs,
-                                        ts,
-                                    );
-                                    if let Err(e) = processor
-                                        .push_frame(frame, FrameDirection::Downstream)
-                                        .await
-                                    {
-                                        log::error!("BaseInputTransport: VAD push failed: {}", e);
+                                    if !has_smart_turn {
+                                        log::info!("VAD: → Quiet (confidence={:.3})", confidence);
+                                        state.emitted_speaking.store(false, Ordering::Relaxed);
+                                        let frame = Frame::vad_user_stopped_speaking(
+                                            state.params.vad_params.stop_secs,
+                                            ts,
+                                        );
+                                        if let Err(e) = processor
+                                            .push_frame(frame, FrameDirection::Downstream)
+                                            .await
+                                        {
+                                            log::error!(
+                                                "BaseInputTransport: VAD push failed: {}", e
+                                            );
+                                        }
+                                    } else {
+                                        log::info!(
+                                            "VAD: → Quiet (confidence={:.3}), deferring to SmartTurn",
+                                            confidence
+                                        );
                                     }
+                                    vad_quiet_transition = true;
                                 }
                                 _ => {}
                             }
+                        }
+                    }
+                }
+
+                // ── Smart turn processing ──
+                if let Some(ta) = &mut turn_analyzer {
+                    let turn_state = ta.append_audio(&data.audio, last_is_speech);
+
+                    if turn_state == EndOfTurnState::Complete {
+                        if state.emitted_speaking.swap(false, Ordering::Relaxed) {
+                            log::info!("SmartTurn: → Complete (silence timeout)");
+                            let ts = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs_f64();
+                            let frame = Frame::vad_user_stopped_speaking(
+                                state.params.vad_params.stop_secs,
+                                ts,
+                            );
+                            let _ = processor
+                                .push_frame(frame, FrameDirection::Downstream)
+                                .await;
+                        }
+                        continue;
+                    }
+
+                    if vad_quiet_transition {
+                        log::info!("SmartTurn: VAD quiet — running ML inference");
+                        let (result, metrics) = ta.analyze_end_of_turn();
+
+                        if let Some(ref m) = metrics {
+                            log::info!(
+                                "SmartTurn: prob={:.3} complete={} time={:.1}ms",
+                                m.probability, m.is_complete, m.e2e_processing_time_ms
+                            );
+                        }
+
+                        if result == EndOfTurnState::Complete {
+                            log::info!("SmartTurn: → Complete (ML prediction)");
+                            state.emitted_speaking.store(false, Ordering::Relaxed);
+                            let ts = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs_f64();
+                            let frame = Frame::vad_user_stopped_speaking(
+                                state.params.vad_params.stop_secs,
+                                ts,
+                            );
+                            let _ = processor
+                                .push_frame(frame, FrameDirection::Downstream)
+                                .await;
+                        } else {
+                            log::info!("SmartTurn: → Incomplete, waiting for more audio");
                         }
                     }
                 }
@@ -295,6 +402,10 @@ async fn run_audio_task(
                             e
                         );
                     }
+                }
+
+                if let Some(ta) = &mut turn_analyzer {
+                    ta.clear();
                 }
             }
         }
