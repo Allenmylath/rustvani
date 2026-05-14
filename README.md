@@ -99,7 +99,9 @@ src/
 ## Features
 
 ### Voice Activity Detection
-- **Silero VAD** via ONNX Runtime (`ort` crate) — same model as Pipecat
+- **Silero VAD** — two backends:
+  - **Native** (default): pure Rust engine with zero ONNX Runtime dependency, ~17 MB footprint, 16kHz only. Loads weights from a flat binary (`silero_vad_16k.bin`).
+  - **ONNX Runtime** (`ort` crate): supports 8kHz + 16kHz, same model as Pipecat
 - 4-state machine: `Quiet → Starting → Speaking → Stopping → Quiet`
 - Configurable confidence threshold, start/stop durations, minimum volume
 - Volume calculation using dBFS approximation of EBU R128
@@ -386,7 +388,7 @@ rustvani is in active development. The core pipeline, frame system, and all list
 
 **Working:**
 - Full pipeline lifecycle (start, interruption, cancel, end)
-- Silero VAD with state machine
+- Silero VAD (native Rust + ONNX) with state machine
 - Sarvam STT/TTS/LLM integration
 - OpenAI LLM with function calling + re-invocation loop
 - Piper TTS (local ONNX)
