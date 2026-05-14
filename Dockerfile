@@ -1,19 +1,15 @@
-# rustvani — Test & Run Dockerfile
+# rustvani — EU Volt Interview Bot Dockerfile
 #
-# Kept the original Fedora 40 base + ONNX runtime setup that builds reliably.
-# Added missing test directories and a flexible entrypoint.
+# Fedora 40 base + ONNX runtime for Silero VAD.
 #
 # Build:
-#   docker build -t rustvani .
+#   docker build -t rustvani-interview .
 #
-# Run tests:
-#   docker run --rm -e MODE=test rustvani
-#
-# Run agent text demo (mount your .env with OPENAI_API_KEY):
-#   docker run --rm --env-file .env -e MODE=demo rustvani
+# Run server (mount .env with SARVAM_API_KEY, OPENAI_API_KEY, DEEPGRAM_API_KEY):
+#   docker run --rm --env-file .env -p 10000:10000 rustvani-interview
 #
 # Run any binary:
-#   docker run --rm --env-file .env -e MODE=agent_text_demo rustvani
+#   docker run --rm --env-file .env -e MODE=agent_text_demo rustvani-interview
 
 FROM fedora:40
 
@@ -24,15 +20,8 @@ ENV MODE=${MODE}
 # System dependencies
 # ---------------------------------------------------------------------------
 RUN dnf install -y \
-    curl \
-    wget \
-    gcc \
-    gcc-c++ \
-    make \
-    pkg-config \
-    openssl-devel \
-    ca-certificates \
-    espeak-ng \
+        curl wget gcc gcc-c++ make pkg-config \
+        openssl-devel ca-certificates espeak-ng \
     && dnf clean all
 
 # ---------------------------------------------------------------------------
@@ -43,13 +32,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # ---------------------------------------------------------------------------
-# ONNX Runtime (matches the ort crate's expected layout)
+# ONNX Runtime (Silero VAD)
 # ---------------------------------------------------------------------------
 RUN wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz \
-    -O /tmp/ort.tgz \
+        -O /tmp/ort.tgz \
     && mkdir -p /opt/onnxruntime \
     && tar -xzf /tmp/ort.tgz -C /opt/onnxruntime --strip-components=1 \
     && rm /tmp/ort.tgz
+
 ENV ORT_LIB_LOCATION=/opt/onnxruntime
 ENV ORT_SKIP_DOWNLOAD=1
 ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib
@@ -59,29 +49,24 @@ ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib
 # ---------------------------------------------------------------------------
 WORKDIR /app
 
-# Copy manifests
-COPY Cargo.toml .
-COPY Cargo.lock .
-
-# Copy all source, tests, and assets
+COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-COPY tests/ tests/
 COPY examples/ examples/
 COPY assets/ assets/
 
-# VAD model expected at working directory root by default
+# VAD models at expected paths
 COPY src/vad/data/silero.onnx silero.onnx
 COPY src/vad/data/silero_vad_16k.bin data/silero_vad_16k.bin
 
 # ---------------------------------------------------------------------------
-# Build release + compile tests
+# Build
 # ---------------------------------------------------------------------------
-RUN cargo build --release
-RUN cargo test --no-run
+RUN cargo build --release --bin interview_voice_server
 
 # ---------------------------------------------------------------------------
-# Entrypoint — test / demo / any binary
+# Entrypoint
 # ---------------------------------------------------------------------------
-RUN printf '#!/bin/bash\nset -e\n\nif [ "$MODE" = "test" ]; then\n  echo "=== rustvani test mode ==="\n  exec cargo test -- --test-threads=1 --nocapture\n\nelif [ "$MODE" = "demo" ]; then\n  echo "=== rustvani agent_text_demo ==="\n  exec cargo run --release --bin agent_text_demo\n\nelse\n  echo "=== rustvani pizza_voice_server ==="\n  exec /app/target/release/pizza_voice_server\nfi\n' > /entrypoint.sh && chmod +x /entrypoint.sh
+RUN printf '#!/bin/bash\nset -e\n\ncase "$MODE" in\n  demo)\n    echo "=== rustvani agent_text_demo ==="\n    exec cargo run --release --bin agent_text_demo\n    ;;\n  *)\n    echo "=== EU Volt Interview Bot ==="\n    exec /app/target/release/interview_voice_server\n    ;;\nesac\n' > /entrypoint.sh && chmod +x /entrypoint.sh
 
+EXPOSE 10000
 CMD ["/entrypoint.sh"]
