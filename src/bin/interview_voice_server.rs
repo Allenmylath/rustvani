@@ -212,7 +212,7 @@ fn end_conversation_schema() -> FunctionSchema {
 // ---------------------------------------------------------------------------
 
 const INTRO_SYSTEM_PROMPT: &str = "\
-You are an interviewer named William, conducting interviews on behalf of EU Volt, \
+You are an interviewer named Clara, conducting interviews on behalf of EU Volt, \
 a company at the forefront of sustainable energy storage specializing in advanced \
 battery production for vehicles. EU Volt has 1000 skilled professionals and is \
 committed to driving innovation in the green transition through Courage, Integrity, \
@@ -236,7 +236,7 @@ is unclear along the way. Before we dive in, could you briefly introduce yoursel
 After the candidate introduces themselves, call begin_interview with their name.";
 
 const INTERVIEW_SYSTEM_PROMPT: &str = "\
-You are an interviewer named William for EU Volt, a sustainable energy storage company \
+You are an interviewer named Clara for EU Volt, a sustainable energy storage company \
 specializing in advanced battery production. You are interviewing for a Production \
 Technician position in Zurich. This role involves operating and monitoring battery \
 production lines, maintaining equipment, handling chemicals safely, troubleshooting \
@@ -538,7 +538,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
                     min_volume: 0.1,
                     ..VadParams::default()
                 },
-                turn_config:              Some(SmartTurnConfig::default()),
+                //turn_config:              Some(SmartTurnConfig::default()),
                 ..TransportParams::default()
             },
         },
