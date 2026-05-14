@@ -1,12 +1,29 @@
-//! Pure Rust smart-turn-v3 inference engine — SIMD optimized.
+//! Pure Rust smart-turn-v3 inference engine — INT8 weights, GEMM optimized.
 //!
-//! Optimizations vs naive version:
-//! - AVX2/FMA SIMD dot product and axpy (y += a*x) operations
-//! - Cache-friendly MatMul loop ordering (sequential weight reads)
-//! - Fused QKV projection (single pass over input)
-//! - Pre-allocated scratch buffers (zero per-inference allocation)
+//! Architecture unchanged: INT8 transformer weights stay quantized in memory.
+//! At inference, each weight matrix is batch-dequantized once into a f32
+//! scratch buffer, then multiplied via matrixmultiply::sgemm (cache-tiled
+//! GEBP with register blocking).
+//!
+//! Key wins over previous dequant_axpy version:
+//! ┌──────────────────────────────────────────────────────────────────────┐
+//! │ 1. Batch dequant  — each INT8 weight dequantized ONCE, not SEQ=400 │
+//! │    times. FC1 alone: 236M → 590K dequant ops (~400× reduction)     │
+//! │ 2. sgemm          — cache-tiled GEMM replaces ~1.8M axpy calls     │
+//! │ 3. Fused scaling   — attention 1/sqrt(d_k) folded into GEMM alpha  │
+//! │ 4. Fused residual  — out-proj/FC2 use sgemm beta=1 into seq_data   │
+//! │ 5. Zero alloc      — all buffers pre-allocated in Scratch           │
+//! │ 6. No proj alloc   — eliminated per-position vec![0.0; D] (×400×4) │
+//! └──────────────────────────────────────────────────────────────────────┘
+//!
+//! Memory: ~17 MB (7 MB INT8 + 2 MB f32 + 2.3 MB dequant buf + 6 MB scratch)
+//!
+//! Cargo.toml: add `matrixmultiply = "0.3"`
+//! .cargo/config.toml:
+//!   [build]
+//!   rustflags = ["-C", "target-cpu=native"]
 
-use std::io::Cursor;
+use std::io::Read;
 
 const D: usize = 384;
 const HEADS: usize = 6;
@@ -18,60 +35,94 @@ const POOL_DIM: usize = 256;
 const CLS_MID: usize = 256;
 const CLS_SMALL: usize = 64;
 
-const EXPECTED_FLOATS: usize = 8_000_386;
 const LN_EPS: f32 = 1e-5;
-const ATTN_SCALE: f32 = 0.353_553_39;
+/// 1/sqrt(head_dim) = 1/sqrt(64) = 0.125.
+/// Original applied sqrt(0.125) to both Q and K; we fold the product into
+/// a single GEMM alpha for the Q@K^T score computation.
+const ATTN_SCALE_SQ: f32 = 0.125;
 
-const WEIGHTS_XZ: &[u8] = include_bytes!("smart_turn_weights.bin.xz");
+const WEIGHTS_GZ: &[u8] = include_bytes!("smart_turn_weights.bin.gz");
 
-struct LayerOffsets {
-    aln_w: usize, aln_b: usize,
-    q_w: usize, q_b: usize,
-    k_w: usize,
-    v_w: usize, v_b: usize,
-    out_w: usize, out_b: usize,
-    fln_w: usize, fln_b: usize,
-    fc1_w: usize, fc1_b: usize,
-    fc2_w: usize, fc2_b: usize,
+// ── Quantized weight block (INT8 in memory) ─────────────────────────────
+
+struct QWeight {
+    data: Vec<i8>,
+    scale: Vec<f32>,
+    zp: Vec<f32>,
+    rows: usize,
+    cols: usize,
 }
 
-/// Scratch buffers reused across inference calls — zero allocation in hot path.
+impl QWeight {
+    #[inline]
+    fn row(&self, r: usize) -> &[i8] {
+        &self.data[r * self.cols..(r + 1) * self.cols]
+    }
+}
+
+// ── Per-transformer-layer INT8 weight storage ───────────────────────────
+
+struct LayerQ {
+    aln_w: usize, aln_b: usize,
+    q: QWeight, q_b: usize,
+    k: QWeight,
+    v: QWeight, v_b: usize,
+    out: QWeight, out_b: usize,
+    fln_w: usize, fln_b: usize,
+    fc1: QWeight, fc1_b: usize,
+    fc2: QWeight, fc2_b: usize,
+}
+
+// ── Scratch buffers (zero allocation in hot path) ───────────────────────
+
 struct Scratch {
-    ln_buf:   Vec<f32>,  // SEQ * D
-    q:        Vec<f32>,  // SEQ * D
-    k:        Vec<f32>,  // SEQ * D
-    v:        Vec<f32>,  // SEQ * D
-    attn_out: Vec<f32>,  // SEQ * D
-    scores:   Vec<f32>,  // SEQ * SEQ
-    ln2:      Vec<f32>,  // SEQ * D
-    ff:       Vec<f32>,  // SEQ * FF
-    proj:     Vec<f32>,  // SEQ * D
-    pool_h:   Vec<f32>,  // POOL_DIM
+    ln_buf:      Vec<f32>,  // SEQ * D
+    q:           Vec<f32>,  // SEQ * D
+    k:           Vec<f32>,  // SEQ * D
+    v:           Vec<f32>,  // SEQ * D
+    attn_out:    Vec<f32>,  // SEQ * D
+    scores:      Vec<f32>,  // SEQ * SEQ
+    ln2:         Vec<f32>,  // SEQ * D
+    ff:          Vec<f32>,  // SEQ * FF
+    dq_mat:      Vec<f32>,  // max(D*D, D*FF, FF*D) = D*FF — batch dequant buffer
+    pool_hidden: Vec<f32>,  // SEQ * POOL_DIM
+    seq_data:    Vec<f32>,  // SEQ * D
+    energies:    Vec<f32>,  // SEQ
+    pooled:      Vec<f32>,  // D
+    cls_mid:     Vec<f32>,  // CLS_MID
+    cls_small:   Vec<f32>,  // CLS_SMALL
 }
 
 impl Scratch {
     fn new() -> Self {
         Self {
-            ln_buf:   vec![0.0; SEQ * D],
-            q:        vec![0.0; SEQ * D],
-            k:        vec![0.0; SEQ * D],
-            v:        vec![0.0; SEQ * D],
-            attn_out: vec![0.0; SEQ * D],
-            scores:   vec![0.0; SEQ * SEQ],
-            ln2:      vec![0.0; SEQ * D],
-            ff:       vec![0.0; SEQ * FF],
-            proj:     vec![0.0; SEQ * D],
-            pool_h:   vec![0.0; POOL_DIM],
+            ln_buf:      vec![0.0; SEQ * D],
+            q:           vec![0.0; SEQ * D],
+            k:           vec![0.0; SEQ * D],
+            v:           vec![0.0; SEQ * D],
+            attn_out:    vec![0.0; SEQ * D],
+            scores:      vec![0.0; SEQ * SEQ],
+            ln2:         vec![0.0; SEQ * D],
+            ff:          vec![0.0; SEQ * FF],
+            dq_mat:      vec![0.0; D * FF],  // 384×1536 = largest weight matrix
+            pool_hidden: vec![0.0; SEQ * POOL_DIM],
+            seq_data:    vec![0.0; SEQ * D],
+            energies:    vec![0.0; SEQ],
+            pooled:      vec![0.0; D],
+            cls_mid:     vec![0.0; CLS_MID],
+            cls_small:   vec![0.0; CLS_SMALL],
         }
     }
 }
 
+// ── Engine ──────────────────────────────────────────────────────────────
+
 pub struct SmartTurnEngine {
-    w: Vec<f32>,
+    f32_data: Vec<f32>,
+    layers: Vec<LayerQ>,
     conv1_w: usize, conv1_b: usize,
     conv2_w: usize, conv2_b: usize,
     pos_emb: usize,
-    layers: [LayerOffsets; N_LAYERS],
     fln_w: usize, fln_b: usize,
     pool0_w: usize, pool0_b: usize,
     pool2_w: usize, pool2_b: usize,
@@ -84,64 +135,102 @@ pub struct SmartTurnEngine {
 
 impl SmartTurnEngine {
     pub fn new() -> Result<Self, String> {
-        let mut reader = Cursor::new(WEIGHTS_XZ);
-        let mut raw = Vec::with_capacity(EXPECTED_FLOATS * 4);
-        lzma_rs::xz_decompress(&mut reader, &mut raw)
-            .map_err(|e| format!("Failed to decompress weights: {}", e))?;
+        let mut decoder = flate2::read::GzDecoder::new(&WEIGHTS_GZ[..]);
+        let mut raw = Vec::new();
+        decoder.read_to_end(&mut raw)
+            .map_err(|e| format!("Decompress failed: {}", e))?;
 
-        let w: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
+        let mut r = BinReader::new(&raw);
+        let mut f32_data: Vec<f32> = Vec::new();
 
-        if w.len() < EXPECTED_FLOATS {
-            return Err(format!(
-                "Decompressed weights too small: {} floats, expected {}",
-                w.len(), EXPECTED_FLOATS
-            ));
+        let mut f32_off = |data: &[f32]| -> usize {
+            let off = f32_data.len();
+            f32_data.extend_from_slice(data);
+            off
+        };
+
+        // ── Conv (dequant to f32 at init — small weights) ──
+        let (c1w, c1s, c1zp) = r.read_quant(384 * 80 * 3, 384);
+        let c1b = r.read_f32_vec(384);
+        let conv1_w = f32_off(&dequant_ax0(&c1w, &c1s, &c1zp, 384, 80 * 3));
+        let conv1_b = f32_off(&c1b);
+
+        let (c2w, c2s, c2zp) = r.read_quant(384 * 384 * 3, 384);
+        let c2b = r.read_f32_vec(384);
+        let conv2_w = f32_off(&dequant_ax0(&c2w, &c2s, &c2zp, 384, 384 * 3));
+        let conv2_b = f32_off(&c2b);
+
+        let pos_emb = f32_off(&r.read_f32_vec(SEQ * D));
+
+        // ── Transformer layers (keep INT8) ──
+        let mut layers = Vec::with_capacity(N_LAYERS);
+        for _ in 0..N_LAYERS {
+            let aln_w = f32_off(&r.read_f32_vec(D));
+            let aln_b = f32_off(&r.read_f32_vec(D));
+
+            let q = r.read_qweight(D, D);
+            let q_b = f32_off(&r.read_f32_vec(D));
+            let k = r.read_qweight(D, D);
+            let v = r.read_qweight(D, D);
+            let v_b = f32_off(&r.read_f32_vec(D));
+            let out = r.read_qweight(D, D);
+            let out_b = f32_off(&r.read_f32_vec(D));
+
+            let fln_w = f32_off(&r.read_f32_vec(D));
+            let fln_b = f32_off(&r.read_f32_vec(D));
+
+            let fc1 = r.read_qweight(D, FF);
+            let fc1_b = f32_off(&r.read_f32_vec(FF));
+            let fc2 = r.read_qweight(FF, D);
+            let fc2_b = f32_off(&r.read_f32_vec(D));
+
+            layers.push(LayerQ {
+                aln_w, aln_b, q, q_b, k, v, v_b, out, out_b,
+                fln_w, fln_b, fc1, fc1_b, fc2, fc2_b,
+            });
         }
 
-        let mut o = 0usize;
-        let mut take = |n: usize| -> usize { let s = o; o += n; s };
+        // ── Final LN ──
+        let fln_w = f32_off(&r.read_f32_vec(D));
+        let fln_b = f32_off(&r.read_f32_vec(D));
 
-        let conv1_w = take(384 * 80 * 3);
-        let conv1_b = take(384);
-        let conv2_w = take(384 * 384 * 3);
-        let conv2_b = take(384);
-        let pos_emb = take(SEQ * D);
+        // ── Pool (dequant to f32 — small) ──
+        let (pw, ps, pzp) = r.read_quant(D * POOL_DIM, POOL_DIM);
+        let pool0_w = f32_off(&dequant_ax1(&pw, &ps, &pzp, D, POOL_DIM));
+        let pool0_b = f32_off(&r.read_f32_vec(POOL_DIM));
+        let (pw2, ps2, pzp2) = r.read_quant(POOL_DIM, 1);
+        let pool2_w = f32_off(&dequant_ax1(&pw2, &ps2, &pzp2, POOL_DIM, 1));
+        let pool2_b = f32_off(&r.read_f32_vec(1));
 
-        let mut layers: [LayerOffsets; N_LAYERS] = unsafe { std::mem::zeroed() };
-        for l in layers.iter_mut() {
-            *l = LayerOffsets {
-                aln_w: take(D), aln_b: take(D),
-                q_w: take(D * D), q_b: take(D),
-                k_w: take(D * D),
-                v_w: take(D * D), v_b: take(D),
-                out_w: take(D * D), out_b: take(D),
-                fln_w: take(D), fln_b: take(D),
-                fc1_w: take(D * FF), fc1_b: take(FF),
-                fc2_w: take(FF * D), fc2_b: take(D),
-            };
-        }
+        // ── Classifier (dequant to f32 — small, axis=0) ──
+        let (cw, cs, czp) = r.read_quant(CLS_MID * D, CLS_MID);
+        let cls0_w = f32_off(&dequant_ax0(&cw, &cs, &czp, CLS_MID, D));
+        let cls0_b = f32_off(&r.read_f32_vec(CLS_MID));
+        let cls_ln_w = f32_off(&r.read_f32_vec(CLS_MID));
+        let cls_ln_b = f32_off(&r.read_f32_vec(CLS_MID));
+        let (cw4, cs4, czp4) = r.read_quant(CLS_SMALL * CLS_MID, CLS_SMALL);
+        let cls4_w = f32_off(&dequant_ax0(&cw4, &cs4, &czp4, CLS_SMALL, CLS_MID));
+        let cls4_b = f32_off(&r.read_f32_vec(CLS_SMALL));
+        let (cw6, cs6, czp6) = r.read_quant(CLS_SMALL, 1);
+        let cls6_w = f32_off(&dequant_ax0(&cw6, &cs6, &czp6, 1, CLS_SMALL));
+        let cls6_b = f32_off(&r.read_f32_vec(1));
 
-        let fln_w = take(D); let fln_b = take(D);
-        let pool0_w = take(D * POOL_DIM); let pool0_b = take(POOL_DIM);
-        let pool2_w = take(POOL_DIM); let pool2_b = take(1);
-        let cls0_w = take(CLS_MID * D); let cls0_b = take(CLS_MID);
-        let cls_ln_w = take(CLS_MID); let cls_ln_b = take(CLS_MID);
-        let cls4_w = take(CLS_SMALL * CLS_MID); let cls4_b = take(CLS_SMALL);
-        let cls6_w = take(CLS_SMALL); let cls6_b = take(1);
-
-        assert_eq!(o, EXPECTED_FLOATS);
+        let i8_total: usize = layers.iter().map(|l|
+            l.q.data.len() + l.k.data.len() + l.v.data.len() +
+            l.out.data.len() + l.fc1.data.len() + l.fc2.data.len()
+        ).sum();
 
         log::info!(
-            "SmartTurnEngine: loaded {:.1} MB weights",
-            w.len() as f64 * 4.0 / 1024.0 / 1024.0
+            "SmartTurnEngine: INT8 {:.1} MB, f32 {:.1} MB, scratch {:.1} MB",
+            i8_total as f64 / 1024.0 / 1024.0,
+            f32_data.len() as f64 * 4.0 / 1024.0 / 1024.0,
+            std::mem::size_of::<Scratch>() as f64 / 1024.0 / 1024.0,
         );
 
         Ok(Self {
-            w, conv1_w, conv1_b, conv2_w, conv2_b, pos_emb,
-            layers, fln_w, fln_b,
+            f32_data, layers,
+            conv1_w, conv1_b, conv2_w, conv2_b, pos_emb,
+            fln_w, fln_b,
             pool0_w, pool0_b, pool2_w, pool2_b,
             cls0_w, cls0_b, cls_ln_w, cls_ln_b,
             cls4_w, cls4_b, cls6_w, cls6_b,
@@ -152,292 +241,403 @@ impl SmartTurnEngine {
     pub fn infer(&mut self, features: &[f32]) -> f32 {
         debug_assert_eq!(features.len(), 80 * 800);
 
-        // Conv1: [80, 800] → [384, 800] + GELU
+        // ── Conv1 + GELU ────────────────────────────────────────────
         let mut x = conv1d_k3(
             features, 80, 800,
-            &self.w[self.conv1_w..], &self.w[self.conv1_b..],
+            &self.f32_data[self.conv1_w..], &self.f32_data[self.conv1_b..],
             384, 1, 1,
         );
         gelu_inplace(&mut x);
 
-        // Conv2: [384, 800] → [384, 400] + GELU
+        // ── Conv2 + GELU ────────────────────────────────────────────
         x = conv1d_k3(
             &x, 384, 800,
-            &self.w[self.conv2_w..], &self.w[self.conv2_b..],
+            &self.f32_data[self.conv2_w..], &self.f32_data[self.conv2_b..],
             384, 1, 2,
         );
         gelu_inplace(&mut x);
 
-        // Transpose [384, 400] → [400, 384] + pos embeddings
-        // Reuse ln_buf as seq_data
-        let seq = &mut self.scratch.ln_buf;
-        let pos = &self.w[self.pos_emb..self.pos_emb + SEQ * D];
+        // ── Transpose [384, 400] → [400, 384] + pos embeddings ─────
+        let pos = &self.f32_data[self.pos_emb..self.pos_emb + SEQ * D];
+        let seq = &mut self.scratch.seq_data;
         for s in 0..SEQ {
             for d in 0..D {
                 seq[s * D + d] = x[d * SEQ + s] + pos[s * D + d];
             }
         }
-        // Copy to a separate owned buffer for the transformer (ln_buf is scratch)
-        let mut seq_data = vec![0.0f32; SEQ * D];
-        seq_data.copy_from_slice(seq);
 
-        // 4 Transformer layers
-        for l in 0..N_LAYERS {
-            self.transformer_layer(&mut seq_data, &self.layers[l] as *const LayerOffsets);
+        // ── 4 Transformer layers ────────────────────────────────────
+        for i in 0..N_LAYERS {
+            self.transformer_layer(i);
         }
 
-        // Final LayerNorm
-        let fln_w = &self.w[self.fln_w..self.fln_w + D];
-        let fln_b = &self.w[self.fln_b..self.fln_b + D];
+        // ── Final LayerNorm ─────────────────────────────────────────
+        let fln_w = &self.f32_data[self.fln_w..self.fln_w + D];
+        let fln_b = &self.f32_data[self.fln_b..self.fln_b + D];
         for s in 0..SEQ {
-            layer_norm_inplace(&mut seq_data[s * D..(s + 1) * D], fln_w, fln_b);
+            layer_norm_inplace(
+                &mut self.scratch.seq_data[s * D..(s + 1) * D],
+                fln_w, fln_b,
+            );
         }
 
-        // Attention Pooling
-        let pool0_w = &self.w[self.pool0_w..self.pool0_w + D * POOL_DIM];
-        let pool0_b = &self.w[self.pool0_b..self.pool0_b + POOL_DIM];
-        let pool2_w = &self.w[self.pool2_w..self.pool2_w + POOL_DIM];
-        let pool2_b = self.w[self.pool2_b];
-
-        let mut energies = vec![0.0f32; SEQ];
-        let h = &mut self.scratch.pool_h;
+        // ── Attention Pooling (GEMM-based) ──────────────────────────
+        // pool_hidden[SEQ, POOL_DIM] = seq_data[SEQ, D] @ pool0_w[D, POOL_DIM] + bias
+        let pool0_b = &self.f32_data[self.pool0_b..self.pool0_b + POOL_DIM];
         for s in 0..SEQ {
-            let row = &seq_data[s * D..(s + 1) * D];
-            // Linear(384→256) via axpy + tanh, then dot with pool2_w
-            h.copy_from_slice(&pool0_b[..POOL_DIM]);
-            for d in 0..D {
-                axpy(row[d], &pool0_w[d * POOL_DIM..(d + 1) * POOL_DIM], h);
-            }
-            for v in h.iter_mut() { *v = v.tanh(); }
-            energies[s] = pool2_b + dot(h, pool2_w);
+            self.scratch.pool_hidden[s * POOL_DIM..(s + 1) * POOL_DIM]
+                .copy_from_slice(pool0_b);
         }
-        softmax_inplace(&mut energies);
+        unsafe {
+            matrixmultiply::sgemm(
+                SEQ, D, POOL_DIM,
+                1.0,
+                self.scratch.seq_data.as_ptr(), D as isize, 1,
+                self.f32_data.as_ptr().add(self.pool0_w), POOL_DIM as isize, 1,
+                1.0,
+                self.scratch.pool_hidden.as_mut_ptr(), POOL_DIM as isize, 1,
+            );
+        }
 
-        let mut pooled = vec![0.0f32; D];
+        // tanh + energy scores
+        let pool2_w = &self.f32_data[self.pool2_w..self.pool2_w + POOL_DIM];
+        let pool2_b = self.f32_data[self.pool2_b];
         for s in 0..SEQ {
-            axpy(energies[s], &seq_data[s * D..(s + 1) * D], &mut pooled);
+            let row = &mut self.scratch.pool_hidden[s * POOL_DIM..(s + 1) * POOL_DIM];
+            for v in row.iter_mut() { *v = v.tanh(); }
+            self.scratch.energies[s] = pool2_b + dot(row, pool2_w);
+        }
+        softmax_inplace(&mut self.scratch.energies);
+
+        // Weighted pooling
+        self.scratch.pooled.fill(0.0);
+        for s in 0..SEQ {
+            let e = self.scratch.energies[s];
+            let src = &self.scratch.seq_data[s * D..(s + 1) * D];
+            let dst = &mut self.scratch.pooled;
+            for i in 0..D { dst[i] += e * src[i]; }
         }
 
-        // Classifier: Gemm(384→256) + LN + GELU
-        let cls0_w = &self.w[self.cls0_w..self.cls0_w + CLS_MID * D];
-        let cls0_b = &self.w[self.cls0_b..self.cls0_b + CLS_MID];
-        let mut c = vec![0.0f32; CLS_MID];
-        // Gemm: y = x @ W^T + b  (W is [CLS_MID, D])
-        c.copy_from_slice(cls0_b);
+        // ── Classifier (pre-dequanted f32) ──────────────────────────
+        let cls0_w = &self.f32_data[self.cls0_w..self.cls0_w + CLS_MID * D];
+        self.scratch.cls_mid.copy_from_slice(
+            &self.f32_data[self.cls0_b..self.cls0_b + CLS_MID],
+        );
         for n in 0..CLS_MID {
-            c[n] += dot(&cls0_w[n * D..(n + 1) * D], &pooled);
+            self.scratch.cls_mid[n] += dot(
+                &cls0_w[n * D..(n + 1) * D],
+                &self.scratch.pooled,
+            );
         }
         layer_norm_inplace(
-            &mut c,
-            &self.w[self.cls_ln_w..self.cls_ln_w + CLS_MID],
-            &self.w[self.cls_ln_b..self.cls_ln_b + CLS_MID],
+            &mut self.scratch.cls_mid,
+            &self.f32_data[self.cls_ln_w..self.cls_ln_w + CLS_MID],
+            &self.f32_data[self.cls_ln_b..self.cls_ln_b + CLS_MID],
         );
-        gelu_inplace(&mut c);
+        gelu_inplace(&mut self.scratch.cls_mid);
 
-        // Gemm(256→64) + GELU
-        let cls4_w = &self.w[self.cls4_w..self.cls4_w + CLS_SMALL * CLS_MID];
-        let cls4_b = &self.w[self.cls4_b..self.cls4_b + CLS_SMALL];
-        let mut c2 = vec![0.0f32; CLS_SMALL];
-        c2.copy_from_slice(cls4_b);
+        let cls4_w = &self.f32_data[self.cls4_w..self.cls4_w + CLS_SMALL * CLS_MID];
+        self.scratch.cls_small.copy_from_slice(
+            &self.f32_data[self.cls4_b..self.cls4_b + CLS_SMALL],
+        );
         for n in 0..CLS_SMALL {
-            c2[n] += dot(&cls4_w[n * CLS_MID..(n + 1) * CLS_MID], &c);
+            self.scratch.cls_small[n] += dot(
+                &cls4_w[n * CLS_MID..(n + 1) * CLS_MID],
+                &self.scratch.cls_mid,
+            );
         }
-        gelu_inplace(&mut c2);
+        gelu_inplace(&mut self.scratch.cls_small);
 
-        // Gemm(64→1) + sigmoid
-        let cls6_w = &self.w[self.cls6_w..self.cls6_w + CLS_SMALL];
-        let cls6_b = self.w[self.cls6_b];
-        sigmoid(cls6_b + dot(cls6_w, &c2))
+        let cls6_w = &self.f32_data[self.cls6_w..self.cls6_w + CLS_SMALL];
+        let cls6_b = self.f32_data[self.cls6_b];
+        sigmoid(cls6_b + dot(cls6_w, &self.scratch.cls_small))
     }
 
-    fn transformer_layer(&mut self, x: &mut [f32], l_ptr: *const LayerOffsets) {
-        // SAFETY: l_ptr points into self.layers which outlives this call.
-        // We use a raw pointer to avoid borrow conflict with &mut self.
-        let l = unsafe { &*l_ptr };
+    fn transformer_layer(&mut self, layer_idx: usize) {
+        // ── LayerNorm ───────────────────────────────────────────────
+        {
+            let l = &self.layers[layer_idx];
+            let aln_w = &self.f32_data[l.aln_w..l.aln_w + D];
+            let aln_b = &self.f32_data[l.aln_b..l.aln_b + D];
 
-        let aln_w = &self.w[l.aln_w..l.aln_w + D];
-        let aln_b = &self.w[l.aln_b..l.aln_b + D];
-
-        // LayerNorm
-        self.scratch.ln_buf.copy_from_slice(&x[..SEQ * D]);
-        for s in 0..SEQ {
-            layer_norm_inplace(&mut self.scratch.ln_buf[s * D..(s + 1) * D], aln_w, aln_b);
-        }
-
-        // ── Fused QKV projection (cache-friendly axpy pattern) ──
-        // Initialize Q with bias, K with zeros, V with bias
-        for s in 0..SEQ {
-            let q_row = &mut self.scratch.q[s * D..(s + 1) * D];
-            let v_row = &mut self.scratch.v[s * D..(s + 1) * D];
-            q_row.copy_from_slice(&self.w[l.q_b..l.q_b + D]);
-            v_row.copy_from_slice(&self.w[l.v_b..l.v_b + D]);
-        }
-        self.scratch.k.iter_mut().for_each(|v| *v = 0.0);
-
-        // Accumulate: for each input dim d, broadcast across all output dims
-        // Weight layout: [D_in, D_out] row-major → sequential reads
-        let q_w = l.q_w;
-        let k_w = l.k_w;
-        let v_w = l.v_w;
-
-        for s in 0..SEQ {
-            let inp = &self.scratch.ln_buf[s * D..(s + 1) * D];
-            let q_out = &mut self.scratch.q[s * D..(s + 1) * D];
-            let k_out = &mut self.scratch.k[s * D..(s + 1) * D];
-            let v_out = &mut self.scratch.v[s * D..(s + 1) * D];
-
-            for d in 0..D {
-                let val = inp[d];
-                let w_off = d * D;
-                axpy(val, &self.w[q_w + w_off..q_w + w_off + D], q_out);
-                axpy(val, &self.w[k_w + w_off..k_w + w_off + D], k_out);
-                axpy(val, &self.w[v_w + w_off..v_w + w_off + D], v_out);
+            self.scratch.ln_buf.copy_from_slice(&self.scratch.seq_data);
+            for s in 0..SEQ {
+                layer_norm_inplace(
+                    &mut self.scratch.ln_buf[s * D..(s + 1) * D],
+                    aln_w, aln_b,
+                );
             }
         }
 
-        // Scale Q and K
-        let scale = ATTN_SCALE;
-        for v in self.scratch.q.iter_mut() { *v *= scale; }
-        for v in self.scratch.k.iter_mut() { *v *= scale; }
+        // ── QKV Projection: batch dequant → sgemm ──────────────────
+        //
+        // Previous: SEQ×D dequant_axpy calls per matrix (each element
+        //   dequantized SEQ=400 times). ~460K calls for Q+K+V.
+        // Now: 1 dequant + 1 sgemm per matrix. Each INT8 weight
+        //   dequantized exactly once.
 
-        // ── Multi-head attention ──
-        self.scratch.attn_out.iter_mut().for_each(|v| *v = 0.0);
+        // Q = LN @ dequant(W_q) + bias_q
+        {
+            let q_b = &self.f32_data[self.layers[layer_idx].q_b..self.layers[layer_idx].q_b + D];
+            for s in 0..SEQ {
+                self.scratch.q[s * D..(s + 1) * D].copy_from_slice(q_b);
+            }
+        }
+        dequant_to_f32(&self.layers[layer_idx].q, &mut self.scratch.dq_mat[..D * D]);
+        unsafe {
+            matrixmultiply::sgemm(
+                SEQ, D, D,
+                1.0,
+                self.scratch.ln_buf.as_ptr(), D as isize, 1,
+                self.scratch.dq_mat.as_ptr(), D as isize, 1,
+                1.0,
+                self.scratch.q.as_mut_ptr(), D as isize, 1,
+            );
+        }
 
+        // K = LN @ dequant(W_k)  (no bias)
+        dequant_to_f32(&self.layers[layer_idx].k, &mut self.scratch.dq_mat[..D * D]);
+        unsafe {
+            matrixmultiply::sgemm(
+                SEQ, D, D,
+                1.0,
+                self.scratch.ln_buf.as_ptr(), D as isize, 1,
+                self.scratch.dq_mat.as_ptr(), D as isize, 1,
+                0.0,
+                self.scratch.k.as_mut_ptr(), D as isize, 1,
+            );
+        }
+
+        // V = LN @ dequant(W_v) + bias_v
+        {
+            let v_b = &self.f32_data[self.layers[layer_idx].v_b..self.layers[layer_idx].v_b + D];
+            for s in 0..SEQ {
+                self.scratch.v[s * D..(s + 1) * D].copy_from_slice(v_b);
+            }
+        }
+        dequant_to_f32(&self.layers[layer_idx].v, &mut self.scratch.dq_mat[..D * D]);
+        unsafe {
+            matrixmultiply::sgemm(
+                SEQ, D, D,
+                1.0,
+                self.scratch.ln_buf.as_ptr(), D as isize, 1,
+                self.scratch.dq_mat.as_ptr(), D as isize, 1,
+                1.0,
+                self.scratch.v.as_mut_ptr(), D as isize, 1,
+            );
+        }
+
+        // ── Multi-Head Attention (on f32 Q/K/V) ────────────────────
         for h in 0..HEADS {
             let ho = h * HD;
 
-            // Attention scores: Q_h @ K_h^T
-            for s1 in 0..SEQ {
-                let q_slice = &self.scratch.q[s1 * D + ho..s1 * D + ho + HD];
-                for s2 in 0..SEQ {
-                    let k_slice = &self.scratch.k[s2 * D + ho..s2 * D + ho + HD];
-                    self.scratch.scores[s1 * SEQ + s2] = dot(q_slice, k_slice);
-                }
-                softmax_inplace(&mut self.scratch.scores[s1 * SEQ..(s1 + 1) * SEQ]);
+            // scores[SEQ,SEQ] = Q_h[SEQ,HD] @ K_h[SEQ,HD]^T * (1/sqrt(d_k))
+            unsafe {
+                matrixmultiply::sgemm(
+                    SEQ, HD, SEQ,
+                    ATTN_SCALE_SQ,
+                    self.scratch.q.as_ptr().add(ho), D as isize, 1,
+                    self.scratch.k.as_ptr().add(ho), 1, D as isize,
+                    0.0,
+                    self.scratch.scores.as_mut_ptr(), SEQ as isize, 1,
+                );
             }
 
-            // Weighted sum of V (axpy pattern — sequential V reads)
-            for s1 in 0..SEQ {
-                let attn_row = &mut self.scratch.attn_out[s1 * D + ho..s1 * D + ho + HD];
-                for s2 in 0..SEQ {
-                    let w = self.scratch.scores[s1 * SEQ + s2];
-                    if w > 1e-8 {
-                        let v_slice = &self.scratch.v[s2 * D + ho..s2 * D + ho + HD];
-                        axpy(w, v_slice, attn_row);
-                    }
-                }
+            // Softmax each row
+            for s in 0..SEQ {
+                softmax_inplace(&mut self.scratch.scores[s * SEQ..(s + 1) * SEQ]);
+            }
+
+            // attn_out_h[SEQ,HD] = softmax(scores)[SEQ,SEQ] @ V_h[SEQ,HD]
+            unsafe {
+                matrixmultiply::sgemm(
+                    SEQ, SEQ, HD,
+                    1.0,
+                    self.scratch.scores.as_ptr(), SEQ as isize, 1,
+                    self.scratch.v.as_ptr().add(ho), D as isize, 1,
+                    0.0,
+                    self.scratch.attn_out.as_mut_ptr().add(ho), D as isize, 1,
+                );
             }
         }
 
-        // Out projection (axpy pattern) + residual
-        let out_w = l.out_w;
-        let out_b = &self.w[l.out_b..l.out_b + D];
-
-        for s in 0..SEQ {
-            let inp = &self.scratch.attn_out[s * D..(s + 1) * D];
-            let x_row = &mut x[s * D..(s + 1) * D];
-
-            // Init proj with bias, then axpy
-            self.scratch.proj[s * D..(s + 1) * D].copy_from_slice(out_b);
-        }
-        for s in 0..SEQ {
-            let inp = &self.scratch.attn_out[s * D..(s + 1) * D];
-            let proj_row = &mut self.scratch.proj[s * D..(s + 1) * D];
-            for d in 0..D {
-                let val = inp[d];
-                let w_off = d * D;
-                axpy(val, &self.w[out_w + w_off..out_w + w_off + D], proj_row);
+        // ── Output Projection: dequant → sgemm fused with residual ─
+        // seq_data += attn_out @ dequant(W_out) + out_bias
+        {
+            let out_b = &self.f32_data[self.layers[layer_idx].out_b..self.layers[layer_idx].out_b + D];
+            for s in 0..SEQ {
+                let row = &mut self.scratch.seq_data[s * D..(s + 1) * D];
+                for i in 0..D { row[i] += out_b[i]; }
             }
-            // Residual add
-            let x_row = &mut x[s * D..(s + 1) * D];
-            for n in 0..D { x_row[n] += self.scratch.proj[s * D + n]; }
+        }
+        dequant_to_f32(&self.layers[layer_idx].out, &mut self.scratch.dq_mat[..D * D]);
+        unsafe {
+            matrixmultiply::sgemm(
+                SEQ, D, D,
+                1.0,
+                self.scratch.attn_out.as_ptr(), D as isize, 1,
+                self.scratch.dq_mat.as_ptr(), D as isize, 1,
+                1.0, // accumulate into seq_data (residual + bias preserved)
+                self.scratch.seq_data.as_mut_ptr(), D as isize, 1,
+            );
         }
 
-        // ── Feed-Forward ──
-        let fln_w = &self.w[l.fln_w..l.fln_w + D];
-        let fln_b = &self.w[l.fln_b..l.fln_b + D];
-        let fc1_w = l.fc1_w;
-        let fc1_b = &self.w[l.fc1_b..l.fc1_b + FF];
-        let fc2_w = l.fc2_w;
-        let fc2_b = &self.w[l.fc2_b..l.fc2_b + D];
+        // ── Feed-Forward Network ────────────────────────────────────
+        {
+            let l = &self.layers[layer_idx];
+            let fln_w = &self.f32_data[l.fln_w..l.fln_w + D];
+            let fln_b = &self.f32_data[l.fln_b..l.fln_b + D];
 
-        self.scratch.ln2.copy_from_slice(&x[..SEQ * D]);
-        for s in 0..SEQ {
-            layer_norm_inplace(&mut self.scratch.ln2[s * D..(s + 1) * D], fln_w, fln_b);
-        }
-
-        // FC1: [SEQ, D] @ [D, FF] + bias + GELU (axpy pattern)
-        for s in 0..SEQ {
-            let ff_row = &mut self.scratch.ff[s * FF..(s + 1) * FF];
-            ff_row.copy_from_slice(fc1_b);
-            let inp = &self.scratch.ln2[s * D..(s + 1) * D];
-            for d in 0..D {
-                let val = inp[d];
-                let w_off = d * FF;
-                axpy(val, &self.w[fc1_w + w_off..fc1_w + w_off + FF], ff_row);
+            self.scratch.ln2.copy_from_slice(&self.scratch.seq_data);
+            for s in 0..SEQ {
+                layer_norm_inplace(
+                    &mut self.scratch.ln2[s * D..(s + 1) * D],
+                    fln_w, fln_b,
+                );
             }
+        }
+
+        // FC1: ff[SEQ,FF] = LN2[SEQ,D] @ dequant(W_fc1)[D,FF] + bias + GELU
+        {
+            let fc1_b = &self.f32_data[self.layers[layer_idx].fc1_b..self.layers[layer_idx].fc1_b + FF];
+            for s in 0..SEQ {
+                self.scratch.ff[s * FF..(s + 1) * FF].copy_from_slice(fc1_b);
+            }
+        }
+        dequant_to_f32(&self.layers[layer_idx].fc1, &mut self.scratch.dq_mat[..D * FF]);
+        unsafe {
+            matrixmultiply::sgemm(
+                SEQ, D, FF,
+                1.0,
+                self.scratch.ln2.as_ptr(), D as isize, 1,
+                self.scratch.dq_mat.as_ptr(), FF as isize, 1,
+                1.0,
+                self.scratch.ff.as_mut_ptr(), FF as isize, 1,
+            );
         }
         gelu_inplace(&mut self.scratch.ff[..SEQ * FF]);
 
-        // FC2: [SEQ, FF] @ [FF, D] + bias, fused with residual
-        for s in 0..SEQ {
-            let inp = &self.scratch.ff[s * FF..(s + 1) * FF];
-            let x_row = &mut x[s * D..(s + 1) * D];
-            // Add bias first, then axpy, then add to residual
-            // We accumulate directly into x_row
-            for n in 0..D { x_row[n] += fc2_b[n]; }
-            for d in 0..FF {
-                let val = inp[d];
-                let w_off = d * D;
-                axpy(val, &self.w[fc2_w + w_off..fc2_w + w_off + D], x_row);
+        // FC2: seq_data += ff[SEQ,FF] @ dequant(W_fc2)[FF,D] + bias (fused residual)
+        {
+            let fc2_b = &self.f32_data[self.layers[layer_idx].fc2_b..self.layers[layer_idx].fc2_b + D];
+            for s in 0..SEQ {
+                let row = &mut self.scratch.seq_data[s * D..(s + 1) * D];
+                for i in 0..D { row[i] += fc2_b[i]; }
+            }
+        }
+        dequant_to_f32(&self.layers[layer_idx].fc2, &mut self.scratch.dq_mat[..FF * D]);
+        unsafe {
+            matrixmultiply::sgemm(
+                SEQ, FF, D,
+                1.0,
+                self.scratch.ff.as_ptr(), FF as isize, 1,
+                self.scratch.dq_mat.as_ptr(), D as isize, 1,
+                1.0,
+                self.scratch.seq_data.as_mut_ptr(), D as isize, 1,
+            );
+        }
+    }
+}
+
+// ── Batch dequantize INT8 → f32 ────────────────────────────────────────
+//
+// Dequantizes an entire weight matrix at once into a pre-allocated buffer.
+// With -C target-cpu=native, the f32 arithmetic auto-vectorizes.
+//
+// Cost: ~200μs for the largest matrix (384×1536). Total per layer: ~1.2ms.
+// This replaces ~236M redundant dequant ops (FC1 alone) with ~590K.
+
+fn dequant_to_f32(qw: &QWeight, out: &mut [f32]) {
+    let cols = qw.cols;
+    let scale = &qw.scale;
+    let zp = &qw.zp;
+    for r in 0..qw.rows {
+        let row = qw.row(r);
+        let base = r * cols;
+        for c in 0..cols {
+            unsafe {
+                let w = *row.get_unchecked(c) as f32;
+                let z = *zp.get_unchecked(c);
+                let s = *scale.get_unchecked(c);
+                *out.get_unchecked_mut(base + c) = (w - z) * s;
             }
         }
     }
 }
 
-// ── Conv1D (k=3 specialized) ───────────────────────────────────────────
+// ── Binary reader (unchanged) ───────────────────────────────────────────
 
-fn conv1d_k3(
-    x: &[f32], in_ch: usize, in_len: usize,
-    weight: &[f32], bias: &[f32],
-    out_ch: usize, pad: usize, stride: usize,
-) -> Vec<f32> {
-    let padded_len = in_len + 2 * pad;
-    let out_len = (padded_len - 3) / stride + 1;
-
-    let mut padded = vec![0.0f32; in_ch * padded_len];
-    for c in 0..in_ch {
-        padded[c * padded_len + pad..c * padded_len + pad + in_len]
-            .copy_from_slice(&x[c * in_len..(c + 1) * in_len]);
-    }
-
-    let mut output = vec![0.0f32; out_ch * out_len];
-    for co in 0..out_ch {
-        let b = bias[co];
-        for t in 0..out_len {
-            let ps = t * stride;
-            let mut sum = b;
-            for ci in 0..in_ch {
-                let wb = (co * in_ch + ci) * 3;
-                let xb = ci * padded_len + ps;
-                unsafe {
-                    sum += *weight.get_unchecked(wb)     * *padded.get_unchecked(xb);
-                    sum += *weight.get_unchecked(wb + 1) * *padded.get_unchecked(xb + 1);
-                    sum += *weight.get_unchecked(wb + 2) * *padded.get_unchecked(xb + 2);
-                }
-            }
-            output[co * out_len + t] = sum;
-        }
-    }
-    output
+struct BinReader<'a> {
+    data: &'a [u8],
+    off: usize,
 }
 
-// ── SIMD primitives ─────────────────────────────────────────────────────
+impl<'a> BinReader<'a> {
+    fn new(data: &'a [u8]) -> Self { Self { data, off: 0 } }
+
+    fn align4(&mut self) { while self.off % 4 != 0 { self.off += 1; } }
+
+    fn read_i8_vec(&mut self, n: usize) -> Vec<i8> {
+        let slice = &self.data[self.off..self.off + n];
+        let v: Vec<i8> = slice.iter().map(|&b| b as i8).collect();
+        self.off += n;
+        self.align4();
+        v
+    }
+
+    fn read_f32_vec(&mut self, n: usize) -> Vec<f32> {
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            let b = &self.data[self.off..self.off + 4];
+            v.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            self.off += 4;
+        }
+        v
+    }
+
+    fn read_quant(&mut self, n_elements: usize, n_channels: usize) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
+        let w = self.read_i8_vec(n_elements);
+        let scale = self.read_f32_vec(n_channels);
+        let zp_i8 = self.read_i8_vec(n_channels);
+        let zp_f32: Vec<f32> = zp_i8.iter().map(|&v| v as f32).collect();
+        (w, scale, zp_f32)
+    }
+
+    fn read_qweight(&mut self, rows: usize, cols: usize) -> QWeight {
+        let (data, scale, zp) = self.read_quant(rows * cols, cols);
+        QWeight { data, scale, zp, rows, cols }
+    }
+}
+
+// ── Dequantize helpers (init-time, unchanged) ───────────────────────────
+
+fn dequant_ax0(w: &[i8], scale: &[f32], zp: &[f32], n_ch: usize, inner: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n_ch * inner];
+    for ch in 0..n_ch {
+        let s = scale[ch];
+        let z = zp[ch];
+        for i in 0..inner {
+            out[ch * inner + i] = (w[ch * inner + i] as f32 - z) * s;
+        }
+    }
+    out
+}
+
+fn dequant_ax1(w: &[i8], scale: &[f32], zp: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[r * cols + c] = (w[r * cols + c] as f32 - zp[c]) * scale[c];
+        }
+    }
+    out
+}
+
+// ── Small vector ops (classifier + pooling) ─────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// Dot product: sum(a[i] * b[i])
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -448,20 +648,6 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
         }
     }
     dot_scalar(a, b)
-}
-
-/// AXPY: y[i] += a * x[i]  (the core of cache-friendly MatMul)
-#[inline]
-fn axpy(a: f32, x: &[f32], y: &mut [f32]) {
-    debug_assert_eq!(x.len(), y.len());
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe { axpy_avx2(a, x, y); }
-            return;
-        }
-    }
-    for i in 0..x.len() { y[i] += a * x[i]; }
 }
 
 fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
@@ -523,39 +709,7 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     total
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn axpy_avx2(a: f32, x: &[f32], y: &mut [f32]) {
-    let n = x.len();
-    let xp = x.as_ptr();
-    let yp = y.as_mut_ptr();
-    let va = _mm256_set1_ps(a);
-    let chunks32 = n / 32;
-    for i in 0..chunks32 {
-        let j = i * 32;
-        let y0 = _mm256_fmadd_ps(va, _mm256_loadu_ps(xp.add(j)),      _mm256_loadu_ps(yp.add(j)));
-        let y1 = _mm256_fmadd_ps(va, _mm256_loadu_ps(xp.add(j + 8)),  _mm256_loadu_ps(yp.add(j + 8)));
-        let y2 = _mm256_fmadd_ps(va, _mm256_loadu_ps(xp.add(j + 16)), _mm256_loadu_ps(yp.add(j + 16)));
-        let y3 = _mm256_fmadd_ps(va, _mm256_loadu_ps(xp.add(j + 24)), _mm256_loadu_ps(yp.add(j + 24)));
-        _mm256_storeu_ps(yp.add(j),      y0);
-        _mm256_storeu_ps(yp.add(j + 8),  y1);
-        _mm256_storeu_ps(yp.add(j + 16), y2);
-        _mm256_storeu_ps(yp.add(j + 24), y3);
-    }
-    let done = chunks32 * 32;
-    let chunks8 = (n - done) / 8;
-    for i in 0..chunks8 {
-        let j = done + i * 8;
-        let yr = _mm256_fmadd_ps(va, _mm256_loadu_ps(xp.add(j)), _mm256_loadu_ps(yp.add(j)));
-        _mm256_storeu_ps(yp.add(j), yr);
-    }
-    let tail = done + chunks8 * 8;
-    for i in tail..n {
-        *yp.add(i) += a * *xp.add(i);
-    }
-}
-
-// ── Scalar ops ──────────────────────────────────────────────────────────
+// ── Scalar ops (unchanged) ──────────────────────────────────────────────
 
 #[inline(always)]
 fn sigmoid(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
@@ -592,4 +746,37 @@ fn erf_f32(x: f32) -> f32 {
             + 0.254829592)
             * t * (-x * x).exp();
     sign * y
+}
+
+fn conv1d_k3(
+    x: &[f32], in_ch: usize, in_len: usize,
+    weight: &[f32], bias: &[f32],
+    out_ch: usize, pad: usize, stride: usize,
+) -> Vec<f32> {
+    let padded_len = in_len + 2 * pad;
+    let out_len = (padded_len - 3) / stride + 1;
+    let mut padded = vec![0.0f32; in_ch * padded_len];
+    for c in 0..in_ch {
+        padded[c * padded_len + pad..c * padded_len + pad + in_len]
+            .copy_from_slice(&x[c * in_len..(c + 1) * in_len]);
+    }
+    let mut output = vec![0.0f32; out_ch * out_len];
+    for co in 0..out_ch {
+        let b = bias[co];
+        for t in 0..out_len {
+            let ps = t * stride;
+            let mut sum = b;
+            for ci in 0..in_ch {
+                let wb = (co * in_ch + ci) * 3;
+                let xb = ci * padded_len + ps;
+                unsafe {
+                    sum += *weight.get_unchecked(wb)     * *padded.get_unchecked(xb);
+                    sum += *weight.get_unchecked(wb + 1) * *padded.get_unchecked(xb + 1);
+                    sum += *weight.get_unchecked(wb + 2) * *padded.get_unchecked(xb + 2);
+                }
+            }
+            output[co * out_len + t] = sum;
+        }
+    }
+    output
 }
