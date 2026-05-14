@@ -4,7 +4,7 @@
 #
 
 app = 'rustvani'
-primary_region = 'ams'
+primary_region = 'bom'
 
 [build]
 
