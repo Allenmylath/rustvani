@@ -3,109 +3,148 @@ name = "rustvani"
 version = "0.1.0"
 edition = "2021"
 license = "BSD-2-Clause"
-license-file = "LICENSE"
+description = "Voice AI framework for Rust — real-time speech pipelines with STT, LLM, TTS, and Dhara conversation flows"
+repository = "https://github.com/Allenmylath/rustvani"
+homepage = "https://github.com/Allenmylath/rustvani"
+documentation = "https://docs.rs/rustvani"
+readme = "README.md"
+keywords = ["voice", "ai", "speech", "pipeline", "conversational-ai"]
+categories = ["multimedia::audio", "asynchronous", "api-bindings"]
+exclude = ["src/bin/*", "dhara/*", "tests/*", "examples/*", ".env*"]
 
 # ---------------------------------------------------------------------------
-# Binaries
+# Features
 # ---------------------------------------------------------------------------
+[features]
+default = ["vad-silero", "transport-websocket", "stt-sarvam", "llm-openai", "tts-deepgram", "dhara"]
 
+# Core VAD
+vad-silero = ["dep:ort", "dep:ndarray"]
+
+# Transport
+transport-websocket = ["dep:axum", "dep:tower-http", "dep:tokio-tungstenite"]
+
+# Services
+stt-sarvam = ["dep:reqwest"]
+llm-openai = ["dep:reqwest"]
+tts-deepgram = ["dep:tokio-tungstenite"]
+tts-sarvam = ["dep:tokio-tungstenite"]
+
+# Dhara conversation flow system
+dhara = ["dep:thiserror"]
+
+# Database tools (optional — not in default)
+db-postgres = ["dep:tokio-postgres", "dep:postgres-native-tls", "dep:native-tls"]
+
+# ---------------------------------------------------------------------------
+# Binaries — excluded from publish, for local dev only
+# ---------------------------------------------------------------------------
 [[bin]]
 name = "pipeline_test"
 path = "src/bin/pipeline_test.rs"
+required-features = ["transport-websocket", "vad-silero"]
 
 [[bin]]
 name = "ravi_server"
 path = "src/bin/ravi_server.rs"
+required-features = ["transport-websocket", "vad-silero"]
 
 [[bin]]
 name = "sarvam_ws_test"
 path = "src/bin/sarvam_ws_test.rs"
+required-features = ["stt-sarvam"]
 
 [[bin]]
 name = "sarvam_test"
 path = "src/bin/sarvam_test.rs"
+required-features = ["stt-sarvam"]
 
 [[bin]]
 name = "sarvam_pipeline_test"
 path = "src/bin/sarvam_pipeline_test.rs"
+required-features = ["stt-sarvam", "transport-websocket", "vad-silero"]
 
 [[bin]]
 name = "llm_only_test"
 path = "src/bin/llm_only_test.rs"
+required-features = ["llm-openai"]
 
 [[bin]]
 name = "websocket_server"
 path = "src/bin/websocket_server.rs"
+required-features = ["transport-websocket", "vad-silero", "stt-sarvam", "llm-openai", "tts-deepgram"]
 
 [[bin]]
 name = "sarvam_tts_test"
 path = "src/bin/sarvam_tts_test.rs"
+required-features = ["tts-sarvam"]
 
 [[bin]]
 name = "websocket_server_piper"
 path = "src/bin/websocket_server_piper.rs"
+required-features = ["transport-websocket", "vad-silero"]
 
 [[bin]]
 name = "pizza_voice_server"
 path = "src/bin/pizza_voice_server.rs"
+required-features = ["transport-websocket", "vad-silero", "stt-sarvam", "llm-openai", "tts-deepgram", "dhara", "db-postgres"]
 
 [[bin]]
 name = "agent_text_demo"
 path = "src/bin/agent_text_demo.rs"
+required-features = ["llm-openai"]
 
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
-
 [dependencies]
-tokio           = { version = "1",        features = ["full"] }
-tokio-util      = { version = "0.7",      features = ["rt"] }
+# Core (always required)
+tokio           = { version = "1",   features = ["full"] }
+tokio-util      = { version = "0.7", features = ["rt"] }
 async-trait     = "0.1"
 async-recursion = "1"
-thiserror       = "1"
 futures         = "0.3"
 log             = "0.4"
-env_logger      = "0.11"
+serde           = { version = "1",   features = ["derive"] }
+serde_json      = "1"
+base64          = "0.22"
+
+# Audio processing (always required for voice pipeline)
+hound           = "3"
 nnnoiseless     = "0.1"
 rubato          = "0.14"
 rustfft         = "6"
 flate2          = "1"
 matrixmultiply  = "0.3"
 
-# ONNX Runtime — for Silero VAD
-ort = { version = "=2.0.0-rc.10", features = ["ndarray", "download-binaries"] }
-ndarray = "0.16"
+# VAD — Silero via ONNX Runtime
+ort             = { version = "=2.0.0-rc.10", features = ["ndarray", "download-binaries"], optional = true }
+ndarray         = { version = "0.16", optional = true }
 
-# Audio
-hound           = "3"
+# Transport — WebSocket (axum server + tungstenite)
+axum            = { version = "0.7", features = ["ws"], optional = true }
+tower-http      = { version = "0.5", features = ["cors"], optional = true }
+tokio-tungstenite = { version = "0.29", features = ["native-tls"], optional = true }
 
-# HTTP server (websocket_server binary)
-axum            = { version = "0.7", features = ["ws"] }
-tower-http      = { version = "0.5", features = ["cors"] }
+# HTTP client (LLM + STT services)
+reqwest         = { version = "0.12", features = ["json", "stream", "native-tls"], optional = true }
 
-# WebSocket client (STT + TTS services)
-tokio-tungstenite = { version = "0.29.0", features = ["native-tls"] }
+# Dhara conversation flow system
+thiserror       = { version = "1", optional = true }
 
-# Serialisation
-serde           = { version = "1.0.228", features = ["derive"] }
-serde_json      = "1.0.149"
-base64          = "0.22.1"
+# Database — Postgres (optional tool)
+tokio-postgres      = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"], optional = true }
+postgres-native-tls = { version = "0.5", optional = true }
+native-tls          = { version = "0.2", optional = true }
 
-# HTTP client (LLM service)
-reqwest         = { version = "0.12", features = ["json", "stream", "native-tls"] }
-
-# Postgres (Neon DB tool)
-tokio-postgres      = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
-postgres-native-tls = "0.5"
-native-tls          = "0.2"
+# Used by db-postgres tools
 chrono          = { version = "0.4", features = ["serde"] }
 uuid            = { version = "1",   features = ["serde", "v4"] }
-dotenvy         = "0.15"
 
 # ---------------------------------------------------------------------------
 # Dev dependencies
 # ---------------------------------------------------------------------------
-
 [dev-dependencies]
 tokio      = { version = "1", features = ["full", "test-util"] }
 env_logger = "0.11"
+dotenvy    = "0.15"

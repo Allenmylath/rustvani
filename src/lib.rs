@@ -1,5 +1,7 @@
+// ---------------------------------------------------------------------------
+// Core modules (always available)
+// ---------------------------------------------------------------------------
 pub mod agents;
-pub mod services;
 pub mod clock;
 pub mod context;
 pub mod error;
@@ -8,16 +10,39 @@ pub mod metrics;
 pub mod observer;
 pub mod pipeline;
 pub mod processors;
-pub mod transport;
 pub mod utils;
-pub mod vad;
 pub mod audio_process;
-pub mod ravi;
 pub mod adapters;
-pub mod dhara;
-pub mod tools;
 pub mod turn;
 
+// ---------------------------------------------------------------------------
+// Feature-gated modules
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "vad-silero")]
+pub mod vad;
+
+#[cfg(feature = "transport-websocket")]
+pub mod transport;
+
+#[cfg(feature = "transport-websocket")]
+pub mod ravi;
+
+#[cfg(feature = "dhara")]
+pub mod dhara;
+
+/// Services — STT, LLM, TTS implementations.
+///
+/// Individual services are gated by their respective features:
+/// `stt-sarvam`, `llm-openai`, `tts-deepgram`, `tts-sarvam`.
+pub mod services;
+
+#[cfg(feature = "db-postgres")]
+pub mod tools;
+
+// ---------------------------------------------------------------------------
+// Core re-exports (always available)
+// ---------------------------------------------------------------------------
 pub use clock::{BaseClock, SystemClock, system_clock};
 pub use error::{PipecatError, Result};
 pub use frames::{
@@ -29,14 +54,33 @@ pub use context::{shared_context, LLMContext, ToolCall};
 pub use pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask};
 pub use processors::llm_user_aggregator::LLMUserAggregator;
 pub use processors::llm_assistant_aggregator::LLMAssistantAggregator;
-pub use services::{
-    SarvamLLMConfig, SarvamLLMHandler,
-    SarvamSttConfig, SarvamSttHandler,
-    SarvamTtsConfig, SarvamTtsHandler,
-    DeepgramTtsConfig, DeepgramTtsHandler,
-    PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler,
-    OpenAILLMConfig, OpenAILLMHandler, FunctionRegistry,
-};
-pub use transport::{BaseInputTransport, BaseOutputTransport, BaseTransport, TransportParams};
+
+// ---------------------------------------------------------------------------
+// Feature-gated re-exports
+// ---------------------------------------------------------------------------
+
+// VAD
+#[cfg(feature = "vad-silero")]
 pub use vad::{SileroVadNative, SileroVadOrt, VadAnalyzer, VadBackend, VadParams, VadState};
 
+// Transport
+#[cfg(feature = "transport-websocket")]
+pub use transport::{BaseInputTransport, BaseOutputTransport, BaseTransport, TransportParams};
+
+// Services — each gated by its feature
+#[cfg(feature = "stt-sarvam")]
+pub use services::{SarvamSttConfig, SarvamSttHandler};
+
+#[cfg(feature = "llm-openai")]
+pub use services::{OpenAILLMConfig, OpenAILLMHandler, FunctionRegistry};
+
+#[cfg(feature = "stt-sarvam")]
+pub use services::{SarvamLLMConfig, SarvamLLMHandler};
+
+#[cfg(feature = "tts-deepgram")]
+pub use services::{DeepgramTtsConfig, DeepgramTtsHandler};
+
+#[cfg(feature = "tts-sarvam")]
+pub use services::{SarvamTtsConfig, SarvamTtsHandler};
+
+pub use services::{PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler};

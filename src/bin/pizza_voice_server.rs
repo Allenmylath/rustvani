@@ -1247,7 +1247,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
                     min_volume: 0.1,
                     ..VadParams::default()
                 },
-                turn_config:              Some(SmartTurnConfig::default()),
+                //turn_config:              Some(SmartTurnConfig::default()),
                 ..TransportParams::default()
             },
         },
