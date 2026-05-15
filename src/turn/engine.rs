@@ -41,7 +41,8 @@ const LN_EPS: f32 = 1e-5;
 /// a single GEMM alpha for the Q@K^T score computation.
 const ATTN_SCALE_SQ: f32 = 0.125;
 
-const WEIGHTS_GZ: &[u8] = include_bytes!("smart_turn_weights.bin.gz");
+pub const DEFAULT_WEIGHTS_PATH: &str =
+    concat!(env!("RUSTVANI_CACHE_DIR"), "/smart_turn_weights.bin.gz");
 
 // ── Quantized weight block (INT8 in memory) ─────────────────────────────
 
@@ -134,8 +135,11 @@ pub struct SmartTurnEngine {
 }
 
 impl SmartTurnEngine {
-    pub fn new() -> Result<Self, String> {
-        let mut decoder = flate2::read::GzDecoder::new(&WEIGHTS_GZ[..]);
+    pub fn new(weights_path: Option<&str>) -> Result<Self, String> {
+        let path = weights_path.unwrap_or(DEFAULT_WEIGHTS_PATH);
+        let weights_bytes = std::fs::read(path)
+            .map_err(|e| format!("Failed to read weights from {}: {}", path, e))?;
+        let mut decoder = flate2::read::GzDecoder::new(&weights_bytes[..]);
         let mut raw = Vec::new();
         decoder.read_to_end(&mut raw)
             .map_err(|e| format!("Decompress failed: {}", e))?;

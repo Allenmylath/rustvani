@@ -10,7 +10,11 @@ documentation = "https://docs.rs/rustvani"
 readme = "README.md"
 keywords = ["voice", "ai", "speech", "pipeline", "conversational-ai"]
 categories = ["multimedia::audio", "asynchronous", "api-bindings"]
-exclude = ["src/bin/*", "dhara/*", "tests/*", "examples/*", ".env*"]
+exclude = [
+    "src/bin/*", "dhara/*", "tests/*", "examples/*", ".env*",
+    "piper-models/*", "assets/*", "src/vad/data/*",
+    "src/turn/smart_turn_weights.bin.gz",
+]
 
 # ---------------------------------------------------------------------------
 # Features

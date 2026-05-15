@@ -3,7 +3,8 @@
 //! Drop-in alternative to the ort-based `SileroVadOrt`.
 //! Loads weights from a flat binary file (extracted from the ONNX model).
 //!
-//! Default path: `data/silero_vad_16k.bin` (relative to working dir).
+//! Default path: `silero_vad_16k.bin` in the rustvani cache directory
+//! (`~/.rustvani/cache/` on Unix, `%LOCALAPPDATA%\rustvani\cache` on Windows).
 //!
 //! Usage:
 //! ```ignore
@@ -15,7 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use super::analyzer::VadAnalyzer;
 
-pub const DEFAULT_WEIGHTS_PATH: &str = "data/silero_vad_16k.bin";
+pub const DEFAULT_WEIGHTS_PATH: &str =
+    concat!(env!("RUSTVANI_CACHE_DIR"), "/silero_vad_16k.bin");
 
 // ─── Engine constants ─────────────────────────────────────────────────
 
@@ -376,7 +378,7 @@ pub struct SileroVadNative {
 }
 
 impl SileroVadNative {
-    /// Load from the default weights path (`data/silero_vad_16k.bin`).
+    /// Load from the default weights path (rustvani cache directory).
     pub fn new(sample_rate: u32) -> Result<Self, String> {
         Self::from_path(sample_rate, DEFAULT_WEIGHTS_PATH)
     }

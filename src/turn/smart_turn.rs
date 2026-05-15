@@ -24,6 +24,10 @@ pub struct SmartTurnConfig {
     pub max_duration_secs: f32,
     pub precision: Precision,
     pub resampler_quality: ResamplerQuality,
+    /// Path to the smart-turn weights file (`smart_turn_weights.bin.gz`).
+    /// If `None`, defaults to the file in the rustvani cache directory
+    /// (`~/.rustvani/cache/` on Unix, `%LOCALAPPDATA%\rustvani\cache` on Windows).
+    pub weights_path: Option<String>,
 }
 
 impl Default for SmartTurnConfig {
@@ -34,6 +38,7 @@ impl Default for SmartTurnConfig {
             max_duration_secs: DEFAULT_MAX_DURATION_SECS,
             precision: Precision::F32,
             resampler_quality: ResamplerQuality::Quick,
+            weights_path: None,
         }
     }
 }
@@ -68,7 +73,7 @@ pub struct SmartTurnAnalyzer {
 
 impl SmartTurnAnalyzer {
     pub fn new(config: &SmartTurnConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let engine = SmartTurnEngine::new()
+        let engine = SmartTurnEngine::new(config.weights_path.as_deref())
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         let feature_extractor = WhisperFeatureExtractor::new(config.precision);
 

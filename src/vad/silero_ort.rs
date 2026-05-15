@@ -12,7 +12,8 @@ use ort::value::Value;
 
 use super::analyzer::VadAnalyzer;
 
-pub const DEFAULT_MODEL_PATH: &str = "silero.onnx";
+pub const DEFAULT_MODEL_PATH: &str =
+    concat!(env!("RUSTVANI_CACHE_DIR"), "/silero.onnx");
 
 // ---------------------------------------------------------------------------
 // SileroVadInner
