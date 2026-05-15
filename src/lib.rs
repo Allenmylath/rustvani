@@ -36,8 +36,6 @@ pub mod dhara;
 /// Individual services are gated by their respective features:
 /// `stt-sarvam`, `llm-openai`, `tts-deepgram`, `tts-sarvam`.
 pub mod services;
-
-#[cfg(feature = "db-postgres")]
 pub mod tools;
 
 // ---------------------------------------------------------------------------
