@@ -1,8 +1,8 @@
 //! EU Volt Interview Bot — voice interview server (Rustvani + Dhara).
 //!
 //! Rust port of the Python Pipecat Gemini Live interviewer.
-//! Uses Dhara conversation flow for structured interview phases:
-//!   intro → interview → farewell
+//! Uses Dhara conversation flow with one node per interview question:
+//!   intro → q1 → q2 → … → q10 → farewell
 //!
 //! Pipeline:
 //!   WebSocketTransport.input()
@@ -61,7 +61,7 @@ use rustvani::transport::TransportParams;
 use rustvani::turn::SmartTurnConfig;
 
 // ---------------------------------------------------------------------------
-// Deferred push sender — set after PipelineTask::new(), used by handlers
+// Deferred push sender
 // ---------------------------------------------------------------------------
 
 type PushSender = tokio::sync::mpsc::Sender<(Frame, FrameDirection)>;
@@ -92,30 +92,10 @@ struct AppState {
 // Interview state — one per connection
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct ScoreBreakdown {
-    technical_knowledge: u32,
-    problem_solving:     u32,
-    safety_awareness:    u32,
-    soft_skills:         u32,
-    cultural_fit:        u32,
-    total_score:         u32,
-}
-
 #[derive(Debug, Clone, Default)]
 struct InterviewState {
     candidate_name:  Option<String>,
     questions_asked: u32,
-}
-
-impl InterviewState {
-    fn summary_for_llm(&self) -> String {
-        format!(
-            "Questions asked so far: {}/10. Candidate name: {}.",
-            self.questions_asked,
-            self.candidate_name.as_deref().unwrap_or("not yet provided"),
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -135,15 +115,132 @@ async fn push_ravi_msg(push: &DeferredPush, data: Value) {
 }
 
 // ---------------------------------------------------------------------------
+// Interview questions — the 10 priority topics
+// ---------------------------------------------------------------------------
+
+struct Question {
+    id:     u32,
+    topic:  &'static str,
+    prompt: &'static str,
+}
+
+const QUESTIONS: &[Question] = &[
+    Question {
+        id: 1,
+        topic: "Relevant experience",
+        prompt: "Ask the candidate: What part of your previous experience do you think \
+                 will be most valuable in this Production Technician role? \
+                 Listen carefully and ask a brief follow-up if their answer is vague.",
+    },
+    Question {
+        id: 2,
+        topic: "HMI troubleshooting",
+        prompt: "Ask the candidate: You encounter an error message on the HMI that halts \
+                 production. How do you approach diagnosing and fixing it? \
+                 Probe for a systematic thought process.",
+    },
+    Question {
+        id: 3,
+        topic: "Chemical handling",
+        prompt: "Ask the candidate: Do you have any experience handling chemicals? \
+                 What chemicals have you worked with, and what safety protocols did you follow? \
+                 Note any red flags around safety awareness.",
+    },
+    Question {
+        id: 4,
+        topic: "Quality deviation",
+        prompt: "Ask the candidate: If you notice a recurring deviation in product quality, \
+                 what steps would you take? \
+                 Look for a structured quality-mindset.",
+    },
+    Question {
+        id: 5,
+        topic: "Conflict resolution under pressure",
+        prompt: "Ask the candidate: Imagine you and another technician disagree on how to \
+                 troubleshoot an HMI error. Production is halted and time is critical. \
+                 How would you approach the situation? \
+                 Evaluate teamwork and communication under stress.",
+    },
+    Question {
+        id: 6,
+        topic: "Chemical spill response",
+        prompt: "Ask the candidate: What do you do if there is a chemical spill in your workplace? \
+                 Check for knowledge of emergency procedures and PPE.",
+    },
+    Question {
+        id: 7,
+        topic: "Reducing downtime",
+        prompt: "Ask the candidate: If you were tasked with reducing downtime by 10 percent, \
+                 what methods or tools would you use? \
+                 Look for process-improvement thinking.",
+    },
+    Question {
+        id: 8,
+        topic: "Stress management",
+        prompt: "Ask the candidate: How do you handle stress when production deadlines are tight? \
+                 Keep the tone empathetic — this is a personal question.",
+    },
+    Question {
+        id: 9,
+        topic: "Salary expectations",
+        prompt: "Ask the candidate: What are your salary expectations for this role? \
+                 Be warm and non-judgmental regardless of the number. \
+                 Note if it is wildly out of range as a red flag.",
+    },
+    Question {
+        id: 10,
+        topic: "Five-year vision",
+        prompt: "Ask the candidate: Where do you see yourself in five years — as a technician, \
+                 specialist, or in leadership? \
+                 This is the final question. After the candidate responds, \
+                 thank them warmly and then call end_conversation with your full scoring.",
+    },
+];
+
+// ---------------------------------------------------------------------------
+// Shared system prompt (injected into every question node)
+// ---------------------------------------------------------------------------
+
+const BASE_SYSTEM_PROMPT: &str = "\
+You are William, a friendly and professional interviewer for EU Volt, a sustainable \
+energy storage company specializing in advanced battery production for vehicles. \
+EU Volt has 1000 skilled professionals and is committed to Courage, Integrity, \
+Collaboration, and Innovation. You are interviewing for a Production Technician \
+position in Zurich.
+
+Keep all responses brief — they are converted to speech. One or two sentences per turn. \
+Do not use special characters. Be conversational, encouraging, and warm. \
+Acknowledge the candidate's answers before moving on. If an answer is unclear or \
+too short, ask a natural follow-up — but do not interrogate. \
+When you are satisfied with the answer (or after one follow-up), call next_question \
+to move on.";
+
+const SCORING_INSTRUCTIONS: &str = "\
+SCORING CRITERIA (use when calling end_conversation):
+
+1. Technical Knowledge (30 points): HMI/PLC experience, production line understanding, \
+   equipment maintenance, battery/chemical production familiarity.
+2. Problem-Solving (25 points): Systematic diagnostics, logical thinking under pressure, \
+   process improvement mindset, quality issue resolution.
+3. Safety Awareness (20 points): Chemical handling protocols, emergency response, PPE usage, \
+   risk assessment.
+4. Soft Skills (15 points): Teamwork, stress management, communication, training ability.
+5. Cultural Fit (10 points): Alignment with EU Volt values, realistic career goals, \
+   sustainability commitment, reasonable salary expectations.
+
+RED FLAGS: No chemical safety knowledge, no relevant technical experience, \
+poor teamwork, unrealistic salary demands, no interest in sustainability.
+
+90-100 Exceptional | 75-89 Good | 60-74 Average | 45-59 Below average | 0-44 Poor fit";
+
+// ---------------------------------------------------------------------------
 // Tool schemas
 // ---------------------------------------------------------------------------
 
 fn begin_interview_schema() -> FunctionSchema {
     FunctionSchema::new(
         "begin_interview",
-        "Transition from introduction to the interview phase. \
-         Call this after the candidate has introduced themselves \
-         and you are ready to start asking interview questions."
+        "Candidate has introduced themselves. Call this to start the first question."
     )
     .with_parameters(json!({
         "type": "object",
@@ -157,47 +254,65 @@ fn begin_interview_schema() -> FunctionSchema {
     }))
 }
 
+fn next_question_schema() -> FunctionSchema {
+    FunctionSchema::new(
+        "next_question",
+        "Move to the next interview question. Call this when you are satisfied \
+         with the candidate's answer to the current question."
+    )
+    .with_parameters(json!({
+        "type": "object",
+        "properties": {
+            "notes": {
+                "type": "string",
+                "description": "Brief internal notes on the candidate's answer to this question"
+            }
+        },
+        "required": []
+    }))
+}
+
 fn end_conversation_schema() -> FunctionSchema {
     FunctionSchema::new(
         "end_conversation",
-        "Gracefully end the interview by providing a score breakdown and summary. \
-         Call this after asking all 10 questions, or if the candidate asks to stop."
+        "End the interview with a full score breakdown. Call after the final question, \
+         or immediately if the candidate asks to stop."
     )
     .with_parameters(json!({
         "type": "object",
         "properties": {
             "technical_knowledge": {
                 "type": "integer",
-                "description": "Score for technical knowledge — HMI/PLC, production lines, equipment. 0 to 30."
+                "description": "Score for technical knowledge (0-30)"
             },
             "problem_solving": {
                 "type": "integer",
-                "description": "Score for problem-solving and troubleshooting abilities. 0 to 25."
+                "description": "Score for problem-solving (0-25)"
             },
             "safety_awareness": {
                 "type": "integer",
-                "description": "Score for safety protocols and chemical handling knowledge. 0 to 20."
+                "description": "Score for safety awareness (0-20)"
             },
             "soft_skills": {
                 "type": "integer",
-                "description": "Score for communication, teamwork, and stress management. 0 to 15."
+                "description": "Score for soft skills (0-15)"
             },
             "cultural_fit": {
                 "type": "integer",
-                "description": "Score for alignment with company values and career goals. 0 to 10."
+                "description": "Score for cultural fit (0-10)"
             },
             "total_score": {
                 "type": "integer",
-                "description": "Total interview score, sum of all categories. 0 to 100."
+                "description": "Total score (0-100)"
             },
             "red_flags": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "List of any red flags identified during the interview"
+                "description": "Any red flags identified"
             },
             "summary": {
                 "type": "string",
-                "description": "Interview summary (max 10 sentences): key topics, strengths, weaknesses, highlights"
+                "description": "Interview summary — key topics, strengths, weaknesses, highlights (max 10 sentences)"
             }
         },
         "required": [
@@ -208,119 +323,57 @@ fn end_conversation_schema() -> FunctionSchema {
 }
 
 // ---------------------------------------------------------------------------
-// System prompts
-// ---------------------------------------------------------------------------
-
-const INTRO_SYSTEM_PROMPT: &str = "\
-You are an interviewer named William, conducting interviews on behalf of EU Volt, \
-a company at the forefront of sustainable energy storage specializing in advanced \
-battery production for vehicles. EU Volt has 1000 skilled professionals and is \
-committed to driving innovation in the green transition through Courage, Integrity, \
-Collaboration, and Innovation.
-
-You are interviewing for a Production Technician position in Zurich.
-
-Keep your responses brief since they will be converted to audio. \
-Be friendly and professional. Do not use special characters in your responses.";
-
-const INTRO_TASK: &str = "\
-Greet the candidate warmly with this introduction: \
-Hi, great to see you and thanks for joining us today. My name is William \
-and I am coordinating this interview on behalf of EU Volt. We are currently \
-expanding our team and looking for skilled production technicians to support \
-our operations. This interview will take around 10 minutes. We will start \
-with a few questions about your background and experience, then move into \
-some technical scenarios and workplace topics. Feel free to ask if anything \
-is unclear along the way. Before we dive in, could you briefly introduce yourself?
-
-After the candidate introduces themselves, call begin_interview with their name.";
-
-const INTERVIEW_SYSTEM_PROMPT: &str = "\
-You are an interviewer named William for EU Volt, a sustainable energy storage company \
-specializing in advanced battery production. You are interviewing for a Production \
-Technician position in Zurich. This role involves operating and monitoring battery \
-production lines, maintaining equipment, handling chemicals safely, troubleshooting \
-HMI errors, training operators, and ensuring quality standards.
-
-Keep your responses brief since they will be converted to audio. Be friendly but professional. \
-Do not use special characters. Ask one question at a time and wait for the response. \
-Be encouraging and positive throughout.
-
-PRIORITY QUESTIONS TO COVER (aim for all 10):
-1. What part of your previous experience will be most valuable in this Production Technician role?
-2. You encounter an error message on the HMI that halts production. How do you diagnose and fix it?
-3. Do you have experience handling chemicals? Which chemicals, and what safety protocols did you follow?
-4. If you notice a recurring deviation in product quality, what steps would you take?
-5. You and another technician disagree on how to troubleshoot an HMI error with production halted. How do you handle it?
-6. What do you do if there is a chemical spill in your workplace?
-7. If tasked with reducing downtime by 10 percent, what methods or tools would you use?
-8. How do you handle stress when production deadlines are tight?
-9. What are your salary expectations for this role?
-10. Where do you see yourself in five years — technician, specialist, or leadership?
-
-IMPORTANT RULES:
-- Keep track of how many questions you have asked
-- After asking all 10 questions (or if the candidate asks to stop), call end_conversation with detailed scoring
-- You can ask follow-up questions if an answer is unclear, but these count toward your total
-- After the final question, thank the candidate, then immediately call end_conversation
-
-SCORING CRITERIA (use when calling end_conversation):
-
-1. Technical Knowledge (30 points): HMI/PLC experience, production line understanding, \
-   equipment maintenance, battery/chemical production familiarity.
-2. Problem-Solving (25 points): Systematic diagnostics, logical thinking under pressure, \
-   process improvement mindset, quality issue resolution.
-3. Safety Awareness (20 points): Chemical handling protocols, emergency response, PPE usage, \
-   risk assessment.
-4. Soft Skills (15 points): Teamwork, stress management, communication, training ability.
-5. Cultural Fit (10 points): Alignment with EU Volt values (Courage, Integrity, Collaboration, \
-   Innovation), realistic career goals, sustainability commitment, reasonable salary expectations.
-
-RED FLAGS to note: No chemical safety knowledge, no relevant technical experience, \
-poor teamwork or conflict resolution, unrealistic salary demands, no interest in sustainability.
-
-SCORING SCALE:
-90-100 Exceptional — strongly recommend hire
-75-89  Good — recommend with minor reservations
-60-74  Average — may require additional training
-45-59  Below average — significant gaps
-0-44   Poor fit — do not recommend";
-
-const INTERVIEW_TASK: &str = "\
-You are now in the interview phase. Begin asking the priority questions. \
-Ask one question at a time, wait for the candidate's response, acknowledge it briefly, \
-then move to the next question. After all questions are covered or the candidate \
-asks to stop, call end_conversation with a complete score breakdown.";
-
-const FAREWELL_TASK: &str = "\
-The interview has been completed and scored. Thank the candidate for their time, \
-let them know they will hear back from the EU Volt recruitment team soon, \
-and say goodbye warmly. Keep it brief — two or three sentences.";
-
-// ---------------------------------------------------------------------------
-// Node configs
+// Node config factories
 // ---------------------------------------------------------------------------
 
 fn intro_node() -> NodeConfig {
     NodeConfig::new("intro")
-        .with_system_prompt(INTRO_SYSTEM_PROMPT)
-        .with_task_message(INTRO_TASK)
+        .with_system_prompt(BASE_SYSTEM_PROMPT)
+        .with_task_message(
+            "Greet the candidate warmly: Hi, great to see you and thanks for joining \
+             us today. My name is William and I am coordinating this interview on behalf \
+             of EU Volt. We are expanding our team and looking for skilled production \
+             technicians. This will take around 10 minutes — a few questions about your \
+             background, then some technical scenarios. Feel free to ask if anything is \
+             unclear. Before we dive in, could you briefly introduce yourself? \
+             Once they introduce themselves, call begin_interview."
+        )
         .with_tools(ToolsSchema::new(vec![begin_interview_schema()]))
         .with_respond_immediately(true)
 }
 
-fn interview_node() -> NodeConfig {
-    NodeConfig::new("interview")
-        .with_system_prompt(INTERVIEW_SYSTEM_PROMPT)
-        .with_task_message(INTERVIEW_TASK)
-        .with_tools(ToolsSchema::new(vec![end_conversation_schema()]))
+/// Build a question node. Every question node carries:
+///   - next_question tool (transitions to the next node)
+///   - end_conversation tool (early exit if candidate requests)
+///
+/// The last question (q10) omits next_question — only end_conversation.
+fn question_node(q: &Question, is_last: bool) -> NodeConfig {
+    let system = format!(
+        "{}\n\nYou are on question {} of 10. Topic: {}.\n\n{}",
+        BASE_SYSTEM_PROMPT, q.id, q.topic, SCORING_INSTRUCTIONS
+    );
+
+    let tools = if is_last {
+        ToolsSchema::new(vec![end_conversation_schema()])
+    } else {
+        ToolsSchema::new(vec![next_question_schema(), end_conversation_schema()])
+    };
+
+    NodeConfig::new(&format!("q{}", q.id))
+        .with_system_prompt(&system)
+        .with_task_message(q.prompt)
+        .with_tools(tools)
         .with_context_strategy(ContextStrategy::Append)
         .with_respond_immediately(true)
 }
 
 fn farewell_node() -> NodeConfig {
     NodeConfig::new("farewell")
-        .with_task_message(FAREWELL_TASK)
+        .with_task_message(
+            "The interview is complete and scored. Thank the candidate briefly for their time, \
+             let them know the EU Volt recruitment team will be in touch, and say goodbye warmly. \
+             Two or three sentences."
+        )
         .with_tools(ToolsSchema::new(vec![]))
         .with_context_strategy(ContextStrategy::Append)
         .with_respond_immediately(true)
@@ -337,9 +390,7 @@ fn make_begin_interview_handler(
         let interview = interview.clone();
         Box::pin(async move {
             let parsed: Value = serde_json::from_str(&args).unwrap_or_default();
-            let name = parsed["candidate_name"]
-                .as_str()
-                .map(String::from);
+            let name = parsed["candidate_name"].as_str().map(String::from);
 
             {
                 let mut state = interview.lock().unwrap();
@@ -347,17 +398,60 @@ fn make_begin_interview_handler(
             }
 
             log::info!(
-                "Interview started for candidate: {}",
+                "Interview started — candidate: {}",
                 name.as_deref().unwrap_or("unnamed")
             );
 
-            let result = json!({
-                "status": "interview_started",
-                "candidate_name": name,
-                "instruction": "Begin asking the priority questions now. Start with question 1.",
-            });
+            TransitionResult::transition(
+                json!({
+                    "status": "interview_started",
+                    "candidate_name": name,
+                }).to_string(),
+                "q1",
+            )
+        })
+    })
+}
 
-            TransitionResult::transition(result.to_string(), "interview")
+/// Factory for the `next_question` handler.
+/// `current_q` is 1-based, `next_node` is the target (e.g. "q2").
+fn make_next_question_handler(
+    interview: Arc<Mutex<InterviewState>>,
+    current_q: u32,
+    next_node: &'static str,
+    push: DeferredPush,
+) -> rustvani::dhara::DharaHandlerFn {
+    Arc::new(move |args: String| {
+        let interview = interview.clone();
+        let push = push.clone();
+        Box::pin(async move {
+            let parsed: Value = serde_json::from_str(&args).unwrap_or_default();
+            let notes = parsed["notes"].as_str().unwrap_or("").to_string();
+
+            {
+                let mut state = interview.lock().unwrap();
+                state.questions_asked = current_q;
+            }
+
+            log::info!("Q{} complete → {}. Notes: {}", current_q, next_node, notes);
+
+            // Push progress to client UI
+            push_ravi_msg(&push, json!({
+                "type": "interview_progress",
+                "question_completed": current_q,
+                "total_questions": 10,
+                "notes": notes,
+            })).await;
+
+            TransitionResult::transition(
+                json!({
+                    "status": "moving_on",
+                    "completed_question": current_q,
+                    "instruction": "Ask the next question naturally. \
+                                    Briefly acknowledge what they said before transitioning.",
+                }).to_string(),
+                next_node,
+            )
         })
     })
 }
@@ -372,7 +466,6 @@ fn make_end_conversation_handler(
         Box::pin(async move {
             let parsed: Value = serde_json::from_str(&args).unwrap_or_default();
 
-            // Clamp scores to valid ranges
             let tech    = parsed["technical_knowledge"].as_u64().unwrap_or(0).min(30) as u32;
             let problem = parsed["problem_solving"].as_u64().unwrap_or(0).min(25) as u32;
             let safety  = parsed["safety_awareness"].as_u64().unwrap_or(0).min(20) as u32;
@@ -385,14 +478,10 @@ fn make_end_conversation_handler(
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
 
-            let summary = parsed["summary"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-
+            let summary = parsed["summary"].as_str().unwrap_or("").to_string();
             let candidate_name = interview.lock().unwrap().candidate_name.clone();
 
-            // ---- Console output (mirrors the Python version) ----
+            // ---- Console output ----
             println!("\n{}", "=".repeat(60));
             println!("INTERVIEW COMPLETED");
             println!("{}", "=".repeat(60));
@@ -419,8 +508,8 @@ fn make_end_conversation_handler(
             println!("  SUMMARY:\n{}\n", summary);
             println!("{}", "=".repeat(60));
 
-            // ---- Push score to client via Ravi server-message ----
-            let score_payload = json!({
+            // ---- Push to client ----
+            push_ravi_msg(&push, json!({
                 "type": "interview_completed",
                 "candidate_name": candidate_name,
                 "score_breakdown": {
@@ -433,16 +522,16 @@ fn make_end_conversation_handler(
                 },
                 "red_flags": red_flags,
                 "summary": summary,
-            });
-            push_ravi_msg(&push, score_payload).await;
+            })).await;
 
-            let result = json!({
-                "status": "interview_scored",
-                "total_score": total,
-                "instruction": "Thank the candidate warmly and say goodbye.",
-            });
-
-            TransitionResult::transition(result.to_string(), "farewell")
+            TransitionResult::transition(
+                json!({
+                    "status": "interview_scored",
+                    "total_score": total,
+                    "instruction": "Thank the candidate warmly and say goodbye.",
+                }).to_string(),
+                "farewell",
+            )
         })
     })
 }
@@ -470,25 +559,60 @@ struct ConnectionFlow {
     push_tx:         DeferredPush,
 }
 
+/// Node names for questions 1–10.
+const Q_NODES: &[&str] = &[
+    "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q10",
+];
+
 fn build_flow() -> ConnectionFlow {
     let interview = Arc::new(Mutex::new(InterviewState::default()));
     let context   = Arc::new(Mutex::new(LLMContext::new(None)));
     let registry  = Arc::new(Mutex::new(FunctionRegistry::new()));
     let push_tx: DeferredPush = Arc::new(std::sync::OnceLock::new());
 
+    // Seed context so the bot speaks first on connect.
+    {
+        let mut ctx = context.lock().unwrap();
+        ctx.add_user_message("Start the interview now. Greet the candidate and introduce yourself.");
+    }
+
     let mut dhara = DharaManager::new(context.clone(), registry.clone());
 
-    // intro — greet candidate, then begin_interview transitions to interview
+    // ---- intro node ----
     dhara.register_node("intro", intro_node(), vec![
         ("begin_interview", make_begin_interview_handler(interview.clone())),
     ]);
 
-    // interview — the main Q&A phase, end_conversation transitions to farewell
-    dhara.register_node("interview", interview_node(), vec![
-        ("end_conversation", make_end_conversation_handler(interview.clone(), push_tx.clone())),
-    ]);
+    // ---- question nodes q1–q10 ----
+    for (i, q) in QUESTIONS.iter().enumerate() {
+        let is_last = i == QUESTIONS.len() - 1;
+        let node_config = question_node(q, is_last);
 
-    // farewell — no Dhara handlers needed
+        if is_last {
+            // q10 — only end_conversation, no next_question
+            dhara.register_node(Q_NODES[i], node_config, vec![
+                ("end_conversation", make_end_conversation_handler(
+                    interview.clone(), push_tx.clone(),
+                )),
+            ]);
+        } else {
+            // q1–q9 — next_question → q(n+1), plus early-exit end_conversation
+            let next_node: &'static str = Q_NODES[i + 1];
+            dhara.register_node(Q_NODES[i], node_config, vec![
+                ("next_question", make_next_question_handler(
+                    interview.clone(),
+                    q.id,
+                    next_node,
+                    push_tx.clone(),
+                )),
+                ("end_conversation", make_end_conversation_handler(
+                    interview.clone(), push_tx.clone(),
+                )),
+            ]);
+        }
+    }
+
+    // ---- farewell node ----
     dhara.register_node_no_tools("farewell", farewell_node());
 
     dhara.set_initial_node("intro");
@@ -616,6 +740,14 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
 
     let push_tx = task.push_sender();
 
+    // Kick off the first LLM run so the bot greets proactively.
+    let startup_tx = task.push_sender();
+    let startup_ctx = flow.context.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = startup_tx.send((Frame::llm_context(startup_ctx), FrameDirection::Downstream)).await;
+    });
+
     tokio::join!(
         async { task.run(system_clock(), Some(ravi_observer)).await.ok(); },
         transport.run_socket(socket, push_tx),
@@ -655,8 +787,7 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", port);
 
     log::info!("EU Volt Interview Bot on ws://{}/ws", addr);
-    log::info!("Flow: intro -> interview -> farewell");
-    log::info!("Tools: begin_interview (Dhara), end_conversation (Dhara)");
+    log::info!("Flow: intro → q1 → q2 → … → q10 → farewell");
 
     let listener = tokio::net::TcpListener::bind(&addr).await
         .unwrap_or_else(|e| panic!("Failed to bind {}: {}", addr, e));
