@@ -16,8 +16,10 @@
 //!     filter.rs         ← Structured filter → parameterized SQL
 //! ```
 
+#[cfg(feature = "db-postgres")]
 pub mod postgres;
 pub mod traits;
 
+#[cfg(feature = "db-postgres")]
 pub use postgres::NeonPostgresTool;
 pub use traits::BuiltinTool;
