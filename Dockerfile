@@ -69,9 +69,12 @@ COPY tests/ tests/
 COPY examples/ examples/
 COPY assets/ assets/
 
-# VAD model expected at working directory root by default
-COPY src/vad/data/silero.onnx silero.onnx
+# Model cache directory — resolved at runtime via RUSTVANI_CACHE_DIR
+ENV RUSTVANI_CACHE_DIR=/app/data
+RUN mkdir -p /app/data
+COPY src/vad/data/silero.onnx data/silero.onnx
 COPY src/vad/data/silero_vad_16k.bin data/silero_vad_16k.bin
+COPY src/turn/smart_turn_weights.bin.gz data/smart_turn_weights.bin.gz
 
 # ---------------------------------------------------------------------------
 # Build release + compile tests
