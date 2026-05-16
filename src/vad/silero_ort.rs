@@ -12,8 +12,10 @@ use ort::value::Value;
 
 use super::analyzer::VadAnalyzer;
 
-pub const DEFAULT_MODEL_PATH: &str =
-    concat!(env!("RUSTVANI_CACHE_DIR"), "/silero.onnx");
+/// Return the default model path resolved at runtime.
+pub fn default_model_path() -> std::path::PathBuf {
+    crate::utils::cache::silero_ort_model_path()
+}
 
 // ---------------------------------------------------------------------------
 // SileroVadInner
@@ -125,8 +127,15 @@ pub struct SileroVadOrt {
 }
 
 impl SileroVadOrt {
+    /// Downloads the model on first use if not already cached.
     pub fn new(sample_rate: u32) -> Result<Self, String> {
-        Self::from_path(sample_rate, DEFAULT_MODEL_PATH)
+        let path = default_model_path();
+        crate::utils::cache::ensure_model(
+            &path,
+            crate::utils::cache::SILERO_ONNX_URL,
+            "silero.onnx",
+        )?;
+        Self::from_path(sample_rate, &path.to_string_lossy())
     }
 
     pub fn from_path(sample_rate: u32, path: &str) -> Result<Self, String> {

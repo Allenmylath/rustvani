@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// URL for the smart-turn weights file (auto-downloaded at build time).
+/// URL for the smart-turn weights file.
 const SMART_TURN_URL: &str =
     "https://smartturn-rustvani.s3.ap-south-1.amazonaws.com/smart_turn_weights+(1).bin.gz";
 
@@ -12,16 +12,14 @@ const SILERO_ONNX_URL: &str =
     "https://github.com/snakers4/silero-vad/raw/master/files/silero_vad.onnx";
 
 /// URL for the custom-extracted Silero native weights (`silero_vad_16k.bin`).
-/// This is a project-specific flat binary. Upload it to a public URL and set
-/// this constant, or place the file manually in the cache directory.
-const SILERO_NATIVE_URL: Option<&str> =
-    Some("https://smartturn-rustvani.s3.ap-south-1.amazonaws.com/silero_vad_16k.bin");
+const SILERO_NATIVE_URL: &str =
+    "https://smartturn-rustvani.s3.ap-south-1.amazonaws.com/silero_vad_16k.bin";
 
 fn main() {
     let cache = cache_dir();
     fs::create_dir_all(&cache).unwrap();
 
-    // Make the cache path available to the library at compile time.
+    // Emit the cache path for any code that still wants it at compile time.
     println!("cargo:rustc-env=RUSTVANI_CACHE_DIR={}", cache.display());
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=RUSTVANI_CACHE_DIR");
@@ -36,7 +34,7 @@ fn main() {
             println!("cargo:warning=Copying local smart-turn weights to cache...");
             fs::copy(&weights_src, &weights_cache).unwrap();
         } else {
-            download_or_warn(&weights_cache, SMART_TURN_URL, "smart-turn weights");
+            download_or_fail(&weights_cache, SMART_TURN_URL, "smart-turn weights");
         }
     }
 
@@ -48,7 +46,7 @@ fn main() {
             println!("cargo:warning=Copying local silero.onnx to cache...");
             fs::copy(&silero_onnx_src, &silero_onnx_cache).unwrap();
         } else {
-            download_or_warn(&silero_onnx_cache, SILERO_ONNX_URL, "silero.onnx");
+            download_or_fail(&silero_onnx_cache, SILERO_ONNX_URL, "silero.onnx");
         }
     }
 
@@ -59,12 +57,8 @@ fn main() {
         if silero_bin_src.exists() {
             println!("cargo:warning=Copying local silero_vad_16k.bin to cache...");
             fs::copy(&silero_bin_src, &silero_bin_cache).unwrap();
-        } else if let Some(url) = SILERO_NATIVE_URL {
-            download_or_warn(&silero_bin_cache, url, "silero_vad_16k.bin");
         } else {
-            println!("cargo:warning=silero_vad_16k.bin not found.");
-            println!("cargo:warning=Place it manually at: {}", silero_bin_cache.display());
-            println!("cargo:warning=Or set SILERO_NATIVE_URL in build.rs to auto-download.");
+            download_or_fail(&silero_bin_cache, SILERO_NATIVE_URL, "silero_vad_16k.bin");
         }
     }
 }
@@ -85,19 +79,23 @@ fn cache_dir() -> PathBuf {
         })
 }
 
-fn download_or_warn(path: &PathBuf, url: &str, desc: &str) {
+/// Try to download a file at build time — warn on failure instead of panicking.
+/// Missing files are downloaded automatically at runtime on first use.
+fn download_or_fail(path: &PathBuf, url: &str, desc: &str) {
     println!("cargo:warning=Downloading {}...", desc);
     if let Err(e) = download(url, path) {
-        println!("cargo:warning=Failed to download {}: {}", desc, e);
-        println!("cargo:warning=URL: {}", url);
-        println!("cargo:warning=Expected path: {}", path.display());
+        println!(
+            "cargo:warning=Could not pre-download {} ({}). \
+             It will be downloaded automatically on first use.",
+            desc, e
+        );
     }
 }
 
 fn download(url: &str, dest: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(dest.parent().unwrap())?;
 
-    // 1. curl (most common)
+    // 1. curl
     if let Ok(status) = Command::new("curl")
         .args(&["-fsSL", "--retry", "2", "-o", dest.to_str().unwrap(), url])
         .status()

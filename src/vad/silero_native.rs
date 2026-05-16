@@ -16,8 +16,10 @@ use std::sync::{Arc, Mutex};
 
 use super::analyzer::VadAnalyzer;
 
-pub const DEFAULT_WEIGHTS_PATH: &str =
-    concat!(env!("RUSTVANI_CACHE_DIR"), "/silero_vad_16k.bin");
+/// Return the default weights path resolved at runtime.
+pub fn default_weights_path() -> std::path::PathBuf {
+    crate::utils::cache::silero_native_weights_path()
+}
 
 // ─── Engine constants ─────────────────────────────────────────────────
 
@@ -379,8 +381,15 @@ pub struct SileroVadNative {
 
 impl SileroVadNative {
     /// Load from the default weights path (rustvani cache directory).
+    /// Downloads the weights on first use if not already cached.
     pub fn new(sample_rate: u32) -> Result<Self, String> {
-        Self::from_path(sample_rate, DEFAULT_WEIGHTS_PATH)
+        let path = default_weights_path();
+        crate::utils::cache::ensure_model(
+            &path,
+            crate::utils::cache::SILERO_NATIVE_URL,
+            "silero_vad_16k.bin",
+        )?;
+        Self::from_path(sample_rate, &path.to_string_lossy())
     }
 
     /// Load from a custom weights path.

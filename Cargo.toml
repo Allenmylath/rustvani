@@ -12,7 +12,7 @@ keywords = ["voice", "ai", "speech", "pipeline", "conversational-ai"]
 categories = ["multimedia::audio", "asynchronous", "api-bindings"]
 exclude = [
     "src/bin/*", "dhara/*", "tests/*", "examples/*", ".env*",
-    "piper-models/*", "assets/*", "src/vad/data/*",
+    "piper-models/*", "assets/*", "src/vad/data/silero.onnx",
     "src/turn/smart_turn_weights.bin.gz",
 ]
 
@@ -40,63 +40,6 @@ dhara = ["dep:thiserror"]
 # Database tools (optional — not in default)
 db-postgres = ["dep:tokio-postgres", "dep:postgres-native-tls", "dep:native-tls"]
 
-# ---------------------------------------------------------------------------
-# Binaries — excluded from publish, for local dev only
-# ---------------------------------------------------------------------------
-[[bin]]
-name = "pipeline_test"
-path = "src/bin/pipeline_test.rs"
-required-features = ["transport-websocket", "vad-silero"]
-
-[[bin]]
-name = "ravi_server"
-path = "src/bin/ravi_server.rs"
-required-features = ["transport-websocket", "vad-silero"]
-
-[[bin]]
-name = "sarvam_ws_test"
-path = "src/bin/sarvam_ws_test.rs"
-required-features = ["stt-sarvam"]
-
-[[bin]]
-name = "sarvam_test"
-path = "src/bin/sarvam_test.rs"
-required-features = ["stt-sarvam"]
-
-[[bin]]
-name = "sarvam_pipeline_test"
-path = "src/bin/sarvam_pipeline_test.rs"
-required-features = ["stt-sarvam", "transport-websocket", "vad-silero"]
-
-[[bin]]
-name = "llm_only_test"
-path = "src/bin/llm_only_test.rs"
-required-features = ["llm-openai"]
-
-[[bin]]
-name = "websocket_server"
-path = "src/bin/websocket_server.rs"
-required-features = ["transport-websocket", "vad-silero", "stt-sarvam", "llm-openai", "tts-deepgram"]
-
-[[bin]]
-name = "sarvam_tts_test"
-path = "src/bin/sarvam_tts_test.rs"
-required-features = ["tts-sarvam"]
-
-[[bin]]
-name = "websocket_server_piper"
-path = "src/bin/websocket_server_piper.rs"
-required-features = ["transport-websocket", "vad-silero"]
-
-[[bin]]
-name = "pizza_voice_server"
-path = "src/bin/pizza_voice_server.rs"
-required-features = ["transport-websocket", "vad-silero", "stt-sarvam", "llm-openai", "tts-deepgram", "dhara", "db-postgres"]
-
-[[bin]]
-name = "agent_text_demo"
-path = "src/bin/agent_text_demo.rs"
-required-features = ["llm-openai"]
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -128,10 +71,10 @@ ndarray         = { version = "0.16", optional = true }
 # Transport — WebSocket (axum server + tungstenite)
 axum            = { version = "0.7", features = ["ws"], optional = true }
 tower-http      = { version = "0.5", features = ["cors"], optional = true }
-tokio-tungstenite = { version = "0.29", features = ["native-tls"], optional = true }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
 
 # HTTP client (LLM + STT services)
-reqwest         = { version = "0.12", features = ["json", "stream", "native-tls"], optional = true }
+reqwest         = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"], optional = true }
 
 # Dhara conversation flow system
 thiserror       = { version = "1", optional = true }
