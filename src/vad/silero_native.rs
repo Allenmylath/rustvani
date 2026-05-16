@@ -380,16 +380,26 @@ pub struct SileroVadNative {
 }
 
 impl SileroVadNative {
-    /// Load from the default weights path (rustvani cache directory).
-    /// Downloads the weights on first use if not already cached.
+    /// Load weights — uses bytes embedded at compile time when the crate was
+    /// built with the bundled model (installed from crates.io), so deployed
+    /// binaries need no download. Falls back to cache/download otherwise.
     pub fn new(sample_rate: u32) -> Result<Self, String> {
-        let path = default_weights_path();
-        crate::utils::cache::ensure_model(
-            &path,
-            crate::utils::cache::SILERO_NATIVE_URL,
-            "silero_vad_16k.bin",
-        )?;
-        Self::from_path(sample_rate, &path.to_string_lossy())
+        #[cfg(rustvani_bundle_silero_native)]
+        {
+            static WEIGHTS: &[u8] =
+                include_bytes!(env!("RUSTVANI_SILERO_NATIVE_PATH"));
+            return Self::from_bytes(sample_rate, WEIGHTS);
+        }
+        #[cfg(not(rustvani_bundle_silero_native))]
+        {
+            let path = default_weights_path();
+            crate::utils::cache::ensure_model(
+                &path,
+                crate::utils::cache::SILERO_NATIVE_URL,
+                "silero_vad_16k.bin",
+            )?;
+            Self::from_path(sample_rate, &path.to_string_lossy())
+        }
     }
 
     /// Load from a custom weights path.

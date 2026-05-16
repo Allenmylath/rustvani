@@ -51,13 +51,19 @@ fn main() {
     }
 
     // ── Silero native weights (custom flat binary) ───────────────────────
-    let silero_bin_cache = cache.join("silero_vad_16k.bin");
-    if !silero_bin_cache.exists() {
-        let silero_bin_src = manifest.join("src/vad/data/silero_vad_16k.bin");
-        if silero_bin_src.exists() {
-            println!("cargo:warning=Copying local silero_vad_16k.bin to cache...");
-            fs::copy(&silero_bin_src, &silero_bin_cache).unwrap();
-        } else {
+    let silero_bin_src = manifest.join("src/vad/data/silero_vad_16k.bin");
+    if silero_bin_src.exists() {
+        // File is bundled in the crate — embed it directly into the binary via include_bytes!
+        // This means deployed binaries carry the weights and need no download at runtime.
+        println!("cargo:rustc-cfg=rustvani_bundle_silero_native");
+        println!(
+            "cargo:rustc-env=RUSTVANI_SILERO_NATIVE_PATH={}",
+            silero_bin_src.display()
+        );
+    } else {
+        // Not bundled — pre-download to cache as a convenience; runtime will download if still missing.
+        let silero_bin_cache = cache.join("silero_vad_16k.bin");
+        if !silero_bin_cache.exists() {
             download_or_fail(&silero_bin_cache, SILERO_NATIVE_URL, "silero_vad_16k.bin");
         }
     }
