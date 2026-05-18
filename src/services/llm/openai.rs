@@ -17,7 +17,7 @@
 //!   CancelFrame → cancel token fires, then on_cancel → on_stop
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -182,7 +182,7 @@ pub struct OpenAILLMHandler {
     registry: Arc<Mutex<FunctionRegistry>>,
     /// Optional hook called after tool calls complete, before re-invoking.
     /// Used by DharaManager for node transitions.
-    transition_hook: Option<TransitionHook>,
+    transition_hook: Arc<RwLock<Option<TransitionHook>>>,
     /// Built-in tools attached to this handler.
     tools: Vec<Arc<dyn BuiltinTool>>,
     /// Cancellation token — cancelled on CancelFrame, cascades to all tools.
@@ -197,7 +197,7 @@ impl OpenAILLMHandler {
             client: Client::new(),
             adapter: OpenAILLMAdapter::new(),
             registry: Arc::new(Mutex::new(FunctionRegistry::new())),
-            transition_hook: None,
+            transition_hook: Arc::new(RwLock::new(None)),
             tools: Vec::new(),
             cancel_token: CancellationToken::new(),
         }
@@ -210,7 +210,7 @@ impl OpenAILLMHandler {
             client: Client::new(),
             adapter: OpenAILLMAdapter::new(),
             registry: Arc::new(Mutex::new(registry)),
-            transition_hook: None,
+            transition_hook: Arc::new(RwLock::new(None)),
             tools: Vec::new(),
             cancel_token: CancellationToken::new(),
         }
@@ -229,15 +229,19 @@ impl OpenAILLMHandler {
             client: Client::new(),
             adapter: OpenAILLMAdapter::new(),
             registry,
-            transition_hook: None,
+            transition_hook: Arc::new(RwLock::new(None)),
             tools: Vec::new(),
             cancel_token: CancellationToken::new(),
         }
     }
 
-    /// Set the transition hook (called after tool calls, before re-invoke).
-    pub fn set_transition_hook(&mut self, hook: TransitionHook) {
-        self.transition_hook = Some(hook);
+    
+    pub fn set_transition_hook(&self, hook: TransitionHook) {
+    *self.transition_hook.write().unwrap() = Some(hook);
+    }
+
+    pub fn transition_hook_slot(&self) -> Arc<RwLock<Option<TransitionHook>>> {
+        self.transition_hook.clone()
     }
 
     /// Attach a built-in tool.
@@ -592,7 +596,7 @@ impl OpenAILLMHandler {
                         .await?;
 
                     // --- Transition hook ---
-                    if let Some(hook) = &self.transition_hook {
+                    if let Some(hook) = self.transition_hook.read().unwrap().as_ref() {
                         hook(&context);
                     }
 
