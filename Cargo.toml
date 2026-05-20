@@ -1,6 +1,6 @@
 [package]
 name = "rustvani"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "BSD-2-Clause"
 description = "Voice AI framework for Rust — real-time speech pipelines with STT, LLM, TTS, and Dhara conversation flows"
@@ -88,10 +88,12 @@ native-tls          = { version = "0.2", optional = true }
 chrono          = { version = "0.4", features = ["serde"] }
 uuid            = { version = "1",   features = ["serde", "v4"] }
 
+# Logging and env helpers (used by release binaries — excluded from publish via src/bin/*)
+env_logger      = "0.11"
+dotenvy         = "0.15"
+
 # ---------------------------------------------------------------------------
 # Dev dependencies
 # ---------------------------------------------------------------------------
 [dev-dependencies]
 tokio      = { version = "1", features = ["full", "test-util"] }
-env_logger = "0.11"
-dotenvy    = "0.15"

@@ -42,7 +42,7 @@ use rustvani::{
 };
 use rustvani::adapters::schemas::{FunctionSchema, ToolsSchema};
 use rustvani::context::LLMContext;
-use rustvani::dhara::{ContextStrategy, DharaManager, NodeConfig, TransitionResult};
+use rustvani::dhara::{ContextStrategy, DharaContext, DharaManager, NodeConfig, TransitionResult};
 use rustvani::observer::{BaseObserver, FrameProcessed, FramePushed};
 use rustvani::processors::{
     llm_assistant_aggregator::LLMAssistantAggregator,
@@ -57,19 +57,10 @@ use rustvani::services::{
     SarvamSttConfig, SarvamSttHandler,
     DeepgramTtsConfig, DeepgramTtsHandler,
 };
-use rustvani::frames::{Frame, FrameDirection};
-use rustvani::ravi::models as ravi_models;
 use rustvani::services::llm::function_registry::{FunctionRegistry, ToolCallOutput};
 use rustvani::transport::websocket::{WebSocketParams, WebSocketTransport};
 use rustvani::transport::TransportParams;
 use rustvani::turn::SmartTurnConfig;
-
-// ---------------------------------------------------------------------------
-// Deferred push sender — set after PipelineTask::new(), used by handlers
-// ---------------------------------------------------------------------------
-
-type PushSender = tokio::sync::mpsc::Sender<(Frame, FrameDirection)>;
-type DeferredPush = Arc<std::sync::OnceLock<PushSender>>;
 
 // ---------------------------------------------------------------------------
 // Connection ID counter
@@ -430,7 +421,7 @@ impl OrderWriter {
         let order_row = tx.query_one(
             "INSERT INTO orders (delivery_address, status, payment_completed, total_price) \
              VALUES ($1, 'confirmed', false, $2) RETURNING id",
-            &[&address, &total],
+            &[&address as &(dyn tokio_postgres::types::ToSql + Sync), &total],
         ).await.map_err(|e| format!("Insert order failed: {}", e))?;
 
         let order_id: i32 = order_row.get(0);
@@ -723,36 +714,16 @@ fn register_fetch_menu(registry: &mut FunctionRegistry, writer: Arc<OrderWriter>
 }
 
 // ---------------------------------------------------------------------------
-// Ravi client push helper
-// ---------------------------------------------------------------------------
-
-/// Push a structured JSON payload to the client as a Ravi `server-message`.
-///
-/// Uses the deferred push sender — safe to call from Dhara handlers since
-/// the sender is guaranteed to be set before any handler runs.
-async fn push_ravi_msg(push: &DeferredPush, data: Value) {
-    if let Some(tx) = push.get() {
-        let payload = ravi_models::msg_server_message(data);
-        let frame = Frame::ravi_server_message(payload);
-        if let Err(e) = tx.send((frame, FrameDirection::Downstream)).await {
-            log::error!("push_ravi_msg: send failed: {}", e);
-        }
-    } else {
-        log::warn!("push_ravi_msg: deferred sender not yet initialized");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Handler factories — Dhara handlers
 // ---------------------------------------------------------------------------
 
 fn make_browse_menu_handler(
     writer: Arc<OrderWriter>,
-    push: DeferredPush,
+    ctx: DharaContext,
 ) -> rustvani::dhara::DharaHandlerFn {
     Arc::new(move |_args: String| {
         let writer = writer.clone();
-        let push = push.clone();
+        let ctx = ctx.clone();
         Box::pin(async move {
             // Fetch menu from DB and push directly to client UI
             let menu_result = match writer.fetch_menu().await {
@@ -763,7 +734,7 @@ fn make_browse_menu_handler(
                         .as_array().map(|a| a.len()).unwrap_or(0);
 
                     // Push full menu to client as server-message
-                    push_ravi_msg(&push, json!({
+                    ctx.push_ravi_message(json!({
                         "type": "menu",
                         "data": menu,
                     })).await;
@@ -798,12 +769,12 @@ fn make_browse_menu_handler(
 fn make_add_to_order_handler(
     order: Arc<Mutex<OrderState>>,
     writer: Arc<OrderWriter>,
-    push: DeferredPush,
+    ctx: DharaContext,
 ) -> rustvani::dhara::DharaHandlerFn {
     Arc::new(move |args: String| {
         let order = order.clone();
         let writer = writer.clone();
-        let push = push.clone();
+        let ctx = ctx.clone();
         Box::pin(async move {
             let parsed: serde_json::Value = serde_json::from_str(&args).unwrap_or_default();
             let pizza_name = parsed["pizza"].as_str().unwrap_or("").to_string();
@@ -915,7 +886,7 @@ fn make_add_to_order_handler(
 
             // 6. Push cart update to client UI
             let cart_data = order.lock().unwrap().cart_payload();
-            push_ravi_msg(&push, cart_data).await;
+            ctx.push_ravi_message(cart_data).await;
 
             let state = order.lock().unwrap();
             let result = json!({
@@ -936,11 +907,11 @@ fn make_add_to_order_handler(
 
 fn make_remove_from_order_handler(
     order: Arc<Mutex<OrderState>>,
-    push: DeferredPush,
+    ctx: DharaContext,
 ) -> rustvani::dhara::DharaHandlerFn {
     Arc::new(move |args: String| {
         let order = order.clone();
-        let push = push.clone();
+        let ctx = ctx.clone();
         Box::pin(async move {
             let parsed: serde_json::Value = serde_json::from_str(&args).unwrap_or_default();
             let num = parsed["item_number"].as_u64().unwrap_or(0) as usize;
@@ -963,7 +934,7 @@ fn make_remove_from_order_handler(
 
             // Push cart update outside the lock
             if let Some(cart) = cart_data {
-                push_ravi_msg(&push, cart).await;
+                ctx.push_ravi_message(cart).await;
             }
 
             TransitionResult::stay(result.to_string())
@@ -1086,11 +1057,11 @@ impl BaseObserver for NullObserver {
 
 fn make_fetch_item_detail_handler(
     writer: Arc<OrderWriter>,
-    push: DeferredPush,
+    ctx: DharaContext,
 ) -> rustvani::dhara::DharaHandlerFn {
     Arc::new(move |args: String| {
         let writer = writer.clone();
-        let push = push.clone();
+        let ctx = ctx.clone();
         Box::pin(async move {
             let parsed: Value = serde_json::from_str(&args).unwrap_or_default();
             let pizza_name = parsed["pizza"].as_str().unwrap_or("").to_string();
@@ -1098,7 +1069,7 @@ fn make_fetch_item_detail_handler(
             match writer.get_pizza_detail(&pizza_name).await {
                 Ok(Some(detail)) => {
                     // Push structured detail to client UI
-                    push_ravi_msg(&push, json!({
+                    ctx.push_ravi_message(json!({
                         "type": "item-detail",
                         "pizza": detail.clone(),
                     })).await;
@@ -1144,41 +1115,41 @@ fn make_fetch_item_detail_handler(
 // ---------------------------------------------------------------------------
 
 struct ConnectionFlow {
-    context:          Arc<Mutex<LLMContext>>,
-    registry:         Arc<Mutex<FunctionRegistry>>,
-    transition_hook:  rustvani::services::llm::openai::TransitionHook,
-    push_tx:          DeferredPush,
+    context:         Arc<Mutex<LLMContext>>,
+    registry:        Arc<Mutex<FunctionRegistry>>,
+    transition_hook: rustvani::services::llm::openai::TransitionHook,
+    dhara_ctx:       DharaContext,
 }
 
 /// Build the Dhara flow for a single connection.
 ///
 /// `order_writer` — shared writer for menu reads, add_to_order validation,
 ///                  and place_order writes.
-fn build_flow(order_writer: Arc<OrderWriter>) -> ConnectionFlow {
-    let order    = Arc::new(Mutex::new(OrderState::default()));
-    let context  = Arc::new(Mutex::new(LLMContext::new(None)));
-    let registry = Arc::new(Mutex::new(FunctionRegistry::new()));
-    let push_tx: DeferredPush = Arc::new(std::sync::OnceLock::new());
+fn build_flow(order_writer: Arc<OrderWriter>, conn_id: u64) -> ConnectionFlow {
+    let order     = Arc::new(Mutex::new(OrderState::default()));
+    let context   = Arc::new(Mutex::new(LLMContext::new(None)));
+    let registry  = Arc::new(Mutex::new(FunctionRegistry::new()));
+    let dhara_ctx = DharaContext::new(Arc::new(()), conn_id);
 
     let mut dhara = DharaManager::new(context.clone(), registry.clone());
 
     // greeting — browse_menu fetches + pushes menu, then transitions to menu node
     dhara.register_node("greeting", greeting_node(), vec![
-        ("browse_menu", make_browse_menu_handler(order_writer.clone(), push_tx.clone())),
+        ("browse_menu", make_browse_menu_handler(order_writer.clone(), dhara_ctx.clone())),
     ]);
 
     // menu — pizza ordering tools + fetch_item_detail
     dhara.register_node("menu", menu_node(), vec![
-        ("fetch_item_detail", make_fetch_item_detail_handler(order_writer.clone(), push_tx.clone())),
-        ("add_to_order",      make_add_to_order_handler(order.clone(), order_writer.clone(), push_tx.clone())),
-        ("remove_from_order", make_remove_from_order_handler(order.clone(), push_tx.clone())),
+        ("fetch_item_detail", make_fetch_item_detail_handler(order_writer.clone(), dhara_ctx.clone())),
+        ("add_to_order",      make_add_to_order_handler(order.clone(), order_writer.clone(), dhara_ctx.clone())),
+        ("remove_from_order", make_remove_from_order_handler(order.clone(), dhara_ctx.clone())),
         ("view_order",        make_view_order_handler(order.clone())),
         ("confirm_order",     make_confirm_order_handler(order.clone())),
     ]);
 
     // confirm — view/modify/place + fetch_item_detail
     dhara.register_node("confirm", confirm_node(), vec![
-        ("fetch_item_detail", make_fetch_item_detail_handler(order_writer.clone(), push_tx.clone())),
+        ("fetch_item_detail", make_fetch_item_detail_handler(order_writer.clone(), dhara_ctx.clone())),
         ("view_order",    make_view_order_handler(order.clone())),
         ("modify_order",  make_modify_order_handler()),
         ("place_order",   make_place_order_handler(order.clone(), order_writer.clone())),
@@ -1204,7 +1175,7 @@ fn build_flow(order_writer: Arc<OrderWriter>) -> ConnectionFlow {
     // Also register fetch_menu for the initial node (before any transition)
     register_fetch_menu(&mut registry.lock().unwrap(), order_writer);
 
-    ConnectionFlow { context, registry, transition_hook, push_tx }
+    ConnectionFlow { context, registry, transition_hook, dhara_ctx }
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,7 +1232,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
     }
 
     // ---- Dhara flow (fresh per connection) ----
-    let flow = build_flow(order_writer);
+    let flow = build_flow(order_writer, conn_id);
 
     // ---- RAVI ----
     let ravi = RaviProcessor::new(RaviParams {
@@ -1327,8 +1298,8 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
         PipelineParams { allow_interruptions: true, ..PipelineParams::default() },
     );
 
-    // Wire the deferred push sender — handlers can now push Ravi messages
-    let _ = flow.push_tx.set(task.push_sender());
+    // Wire pipeline access into DharaContext — handlers can now push Ravi messages
+    flow.dhara_ctx.set_push_sender(task.push_sender());
 
     let push_tx = task.push_sender();
 

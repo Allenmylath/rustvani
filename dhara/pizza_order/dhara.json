@@ -1,0 +1,170 @@
+{
+  "id": "pizza_order",
+  "version": "1.0",
+  "description": "Dhara Pizza voice ordering flow: greeting → menu → confirm → farewell",
+  "system_prompt": "You are a friendly pizza ordering assistant at Dhara Pizza. Speak naturally and conversationally — brief, warm, and fun. You are taking voice orders so keep responses short.",
+  "initial_node": "greeting",
+  "nodes": {
+    "greeting": {
+      "task_messages": [
+        {
+          "role": "user",
+          "content": "Greet the customer warmly. Ask if they'd like to see the menu. When they say yes, use the browse_menu tool."
+        }
+      ],
+      "context_strategy": "reset",
+      "respond_immediately": true,
+      "functions": ["browse_menu", "fetch_menu"]
+    },
+    "menu": {
+      "system_prompt_override": "You are a pizza ordering assistant at Dhara Pizza. CRITICAL: when a tool call returns a result and item count, the data is already on the customer's screen. Do NOT read the entire menu aloud — just say something like 'The menu is on your screen — what looks good?' When the customer picks a pizza, use add_to_order — it will validate the name against the database and return the actual price and available options. If validation fails, tell the customer what went wrong and suggest alternatives. Keep all voice responses to one or two sentences.",
+      "task_messages": [
+        {
+          "role": "user",
+          "content": "Help the customer build their order. If they want to see the menu again, call fetch_menu — the data appears on their screen, just invite them to pick. Use add_to_order when they choose (it validates against the DB), view_order to recap the order, remove_from_order to change it, confirm_order when done."
+        }
+      ],
+      "context_strategy": "append",
+      "respond_immediately": true,
+      "functions": ["fetch_menu", "fetch_item_detail", "add_to_order", "remove_from_order", "view_order", "confirm_order"]
+    },
+    "confirm": {
+      "task_messages": [
+        {
+          "role": "user",
+          "content": "Read back the complete order summary to the customer briefly (use view_order). Ask them to confirm or if they want to make changes. Use modify_order to return to the menu, or place_order with their delivery address to finalise."
+        }
+      ],
+      "context_strategy": "append",
+      "respond_immediately": true,
+      "functions": ["fetch_menu", "fetch_item_detail", "view_order", "modify_order", "place_order"]
+    },
+    "farewell": {
+      "task_messages": [
+        {
+          "role": "user",
+          "content": "The order has been placed and saved. Thank the customer briefly, mention delivery in 30-45 minutes, and say goodbye warmly. Keep it short."
+        }
+      ],
+      "context_strategy": "append",
+      "respond_immediately": true,
+      "functions": ["fetch_menu"]
+    }
+  },
+  "functions": {
+    "fetch_menu": {
+      "description": "Display the full pizza menu on the customer's screen. Shows all available pizzas with sizes and prices, plus available toppings. Data goes directly to the UI — do NOT read the entire menu aloud.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    "browse_menu": {
+      "description": "Customer wants to see the menu and start ordering",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "transitions": {
+        "default": "menu"
+      }
+    },
+    "add_to_order": {
+      "description": "Add a pizza to the customer's order. Validates the pizza name, size, and toppings against the database. Returns the validated details including canonical name, actual price, and available options.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pizza": {
+            "type": "string",
+            "description": "Pizza name (fuzzy matched against database)"
+          },
+          "size": {
+            "type": "string",
+            "enum": ["small", "medium", "large"],
+            "description": "Size of the pizza"
+          },
+          "toppings": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Extra topping names (fuzzy matched against database)"
+          }
+        },
+        "required": ["pizza", "size"]
+      }
+    },
+    "remove_from_order": {
+      "description": "Remove an item from the order by its number",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "item_number": {
+            "type": "integer",
+            "description": "Item number to remove (1-based)"
+          }
+        },
+        "required": ["item_number"]
+      }
+    },
+    "view_order": {
+      "description": "Show the current in-memory order summary",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    "confirm_order": {
+      "description": "Customer wants to review and confirm the order",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "transitions": {
+        "ready": "confirm"
+      }
+    },
+    "modify_order": {
+      "description": "Customer wants to go back and change the order",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "transitions": {
+        "default": "menu"
+      }
+    },
+    "place_order": {
+      "description": "Finalize and place the order — writes to database",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "delivery_address": {
+            "type": "string",
+            "description": "Full delivery address"
+          }
+        },
+        "required": ["delivery_address"]
+      },
+      "transitions": {
+        "placed": "farewell"
+      }
+    },
+    "fetch_item_detail": {
+      "description": "Show detailed information about a specific pizza on the customer's screen. Use when the customer asks about a particular pizza — its description, whether it's vegetarian, and available sizes with prices. The detail goes to the UI; give a brief verbal summary only.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pizza": {
+            "type": "string",
+            "description": "Pizza name to look up"
+          }
+        },
+        "required": ["pizza"]
+      }
+    }
+  }
+}

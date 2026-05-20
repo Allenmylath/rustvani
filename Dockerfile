@@ -65,6 +65,7 @@ COPY Cargo.lock .
 
 # Copy all source, tests, and assets
 COPY src/ src/
+COPY dhara/ dhara/
 COPY tests/ tests/
 COPY examples/ examples/
 COPY assets/ assets/
@@ -79,8 +80,8 @@ COPY src/turn/smart_turn_weights.bin.gz data/smart_turn_weights.bin.gz
 # ---------------------------------------------------------------------------
 # Build release + compile tests
 # ---------------------------------------------------------------------------
-RUN cargo build --release
-RUN cargo test --no-run
+RUN cargo build --release --features db-postgres
+RUN cargo test --no-run --features db-postgres
 
 # ---------------------------------------------------------------------------
 # Entrypoint — test / demo / any binary

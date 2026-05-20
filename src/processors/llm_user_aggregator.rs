@@ -16,6 +16,7 @@ use crate::frames::{
 struct State {
     aggregation: String,
     user_speaking: bool,
+    waiting_for_transcription: bool,
 }
 
 /// Collects TranscriptionFrames during a user turn.
@@ -46,6 +47,7 @@ impl LLMUserAggregator {
                 state: Mutex::new(State {
                     aggregation: String::new(),
                     user_speaking: false,
+                    waiting_for_transcription: false,
                 }),
             }),
             false,
@@ -92,7 +94,11 @@ impl FrameHandler for LLMUserAggregator {
     ) -> Result<()> {
         match &frame.inner {
             FrameInner::System(SystemFrame::VADUserStartedSpeaking { .. }) => {
-                self.state.lock().unwrap().user_speaking = true;
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.user_speaking = true;
+                    state.waiting_for_transcription = false;
+                }
                 processor.push_frame(frame, direction).await?;
                 // Broadcast interruption so bot stops immediately
                 if processor.interruptions_allowed() {
@@ -105,7 +111,11 @@ impl FrameHandler for LLMUserAggregator {
                 // Push VAD frame first so downstream sees it before LLMContextFrame
                 processor.push_frame(frame, direction).await?;
                 // Path A: transcripts already arrived — flush now
-                self.flush_and_trigger(processor).await?;
+                let triggered = self.flush_and_trigger(processor).await?;
+                if !triggered {
+                    // VAD done but transcription not yet arrived — arm the race-condition fix
+                    self.state.lock().unwrap().waiting_for_transcription = true;
+                }
             }
 
             FrameInner::Data(DataFrame::Transcription(t)) => {
@@ -122,8 +132,13 @@ impl FrameHandler for LLMUserAggregator {
                         state.aggregation.push(' ');
                         state.aggregation.push_str(&text);
                     }
-                    // Path B: transcript arrived after VAD stop
-                    !state.user_speaking
+                    // Path B: only trigger if VAD already stopped with an empty buffer
+                    if state.waiting_for_transcription {
+                        state.waiting_for_transcription = false;
+                        true
+                    } else {
+                        false
+                    }
                 };
 
                 if should_trigger {
