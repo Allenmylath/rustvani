@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/Gemini_Generated_Image_3ppqyo3ppqyo3ppq.png" alt="rustvani hero" width="100%" />
+  <img src="assets/rustvani.png" alt="rustvani hero" width="100%" />
 </p>
 
 # rustvani — वाणी
