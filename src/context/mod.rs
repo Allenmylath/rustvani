@@ -162,6 +162,71 @@ impl LLMContext {
         result.extend(self.messages.clone());
         result
     }
+
+    /// Rough token estimate: ~4 chars per token, covers all message fields.
+    pub fn estimate_tokens(&self) -> usize {
+        let mut chars: usize = self.system_prompt.as_deref().map_or(0, |s| s.len());
+        for msg in &self.messages {
+            chars += match msg {
+                Message::System { content } => content.len(),
+                Message::User { content } => content.len(),
+                Message::Assistant { content, tool_calls } => {
+                    content.as_deref().map_or(0, |c| c.len())
+                        + tool_calls.as_ref().map_or(0, |tcs| {
+                            tcs.iter()
+                                .map(|tc| tc.function_name.len() + tc.arguments.len() + 20)
+                                .sum()
+                        })
+                }
+                Message::ToolResult { content, .. } => content.len(),
+            };
+        }
+        chars.saturating_div(4)
+    }
+
+    /// Drop oldest conversation groups until the estimated token count fits
+    /// within `context_window_tokens * 0.8` (reserves headroom for the reply).
+    ///
+    /// A "group" is everything from one User message up to (but not including)
+    /// the next User message, so Assistant tool-call + ToolResult pairs are
+    /// never orphaned. Stops if no safe drop point remains.
+    pub fn trim_to_context_budget(&mut self, context_window_tokens: usize) {
+        let budget = (context_window_tokens as f64 * 0.8) as usize;
+        loop {
+            if self.estimate_tokens() <= budget {
+                break;
+            }
+            // Find the first User message that has another User message after it.
+            let first_user = self
+                .messages
+                .iter()
+                .position(|m| matches!(m, Message::User { .. }));
+            let next_user = first_user.and_then(|i| {
+                self.messages[i + 1..]
+                    .iter()
+                    .position(|m| matches!(m, Message::User { .. }))
+                    .map(|j| i + 1 + j)
+            });
+            match (first_user, next_user) {
+                (Some(start), Some(end)) => {
+                    let dropped = end - start;
+                    self.messages.drain(start..end);
+                    log::warn!(
+                        "LLMContext: trimmed {} messages to fit {}-token budget",
+                        dropped,
+                        context_window_tokens
+                    );
+                }
+                _ => {
+                    log::warn!(
+                        "LLMContext: context near limit ({} estimated tokens) but cannot safely trim further",
+                        self.estimate_tokens()
+                    );
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Convenience: create a shared context ready for pipeline use.

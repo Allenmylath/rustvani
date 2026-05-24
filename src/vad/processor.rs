@@ -1,14 +1,37 @@
 //! VAD processor.
 //!
 //! `VadProcessor` is a [`FrameHandler`] that:
-//! 1. Receives `InputAudioRaw` frames from the transport.
+//! 1. Receives `InputAudioRaw` frames from the transport or directly from the pipeline.
 //! 2. Accumulates PCM until a full Silero inference window is ready.
 //! 3. Runs inference via the configured `VadAnalyzer` backend.
 //! 4. Advances the state machine with the result.
 //! 5. Emits `VADUserStartedSpeaking` / `VADUserStoppedSpeaking` on transitions.
+//! 6. Optionally integrates with `SmartTurnAnalyzer` for ML-based end-of-turn detection.
 //!
 //! Supports both `SileroVadNative` (pure Rust) and `SileroVadOrt` (ONNX Runtime)
 //! via the `VadAnalyzer` trait.
+//!
+//! # Usage without a transport
+//!
+//! ```ignore
+//! let vad = VadProcessor::new(16_000, VadParams::default(), VadBackend::Native)?
+//!     .into_processor();
+//!
+//! let task = PipelineTask::new(vec![vad, stt, llm, tts], PipelineParams::default());
+//!
+//! // Push raw audio directly:
+//! let audio = Frame::input_audio_raw(AudioRawData::new(bytes, 16_000, 1));
+//! task.push_frame(audio, FrameDirection::Downstream).await?;
+//!
+//! // Consume VAD events:
+//! let mut filter = HashSet::new();
+//! filter.insert(FrameKind::VADUserStartedSpeaking);
+//! filter.insert(FrameKind::VADUserStoppedSpeaking);
+//! task.set_downstream_filter(filter);
+//! task.add_on_frame_reached_downstream(|frame| Box::pin(async move {
+//!     println!("VAD event: {:?}", frame.kind());
+//! }));
+//! ```
 
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,8 +41,9 @@ use log;
 
 use crate::error::Result;
 use crate::frames::{
-    Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor, SystemFrame,
+    ControlFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor, SystemFrame,
 };
+use crate::turn::{EndOfTurnState, SmartTurnAnalyzer, SmartTurnConfig};
 
 use super::analyzer::VadAnalyzer;
 use super::params::VadParams;
@@ -27,21 +51,27 @@ use super::state::{StateMachine, VadState};
 use super::{VadBackend, create_vad};
 
 // ---------------------------------------------------------------------------
-// VadProcessorState — shared between handler and async tasks
+// VadProcessorState
 // ---------------------------------------------------------------------------
 
 struct VadProcessorState {
-    machine:    StateMachine,
-    model:      Arc<dyn VadAnalyzer>,
-    start_secs: f32,
-    stop_secs:  f32,
+    machine: StateMachine,
+    model: Arc<dyn VadAnalyzer>,
+    params: VadParams,
+    sample_rate: u32,
+    last_is_speech: bool,
+    emitted_speaking: bool,
+    user_speaking: bool,
+    bot_speaking: bool,
+    turn_analyzer: Option<SmartTurnAnalyzer>,
 }
 
 // ---------------------------------------------------------------------------
 // VadProcessor
 // ---------------------------------------------------------------------------
 
-/// VAD processor — place between transport input and STT in the pipeline.
+/// VAD processor — place between transport input and STT in the pipeline,
+/// or use without a transport by pushing `InputAudioRaw` frames directly.
 pub struct VadProcessor {
     state: Arc<Mutex<VadProcessorState>>,
 }
@@ -59,16 +89,19 @@ impl VadProcessor {
         let model = create_vad(backend, sample_rate)
             .map_err(|e| crate::error::PipecatError::pipeline(e))?;
 
-        let start_secs = params.start_secs;
-        let stop_secs  = params.stop_secs;
-        let machine    = StateMachine::new(sample_rate, params);
+        let machine = StateMachine::new(sample_rate, params.clone());
 
         Ok(Self {
             state: Arc::new(Mutex::new(VadProcessorState {
                 machine,
                 model,
-                start_secs,
-                stop_secs,
+                params,
+                sample_rate,
+                last_is_speech: false,
+                emitted_speaking: false,
+                user_speaking: false,
+                bot_speaking: false,
+                turn_analyzer: None,
             })),
         })
     }
@@ -78,9 +111,50 @@ impl VadProcessor {
         Self::new(sample_rate, params, VadBackend::default())
     }
 
+    /// Enable ML-based smart end-of-turn detection.
+    ///
+    /// Requires the VAD analyzer to already be configured (i.e. this processor
+    /// was created with a valid backend).  
+    /// If `turn_config` is `None` the call is a no-op.
+    pub fn with_smart_turn(
+        self,
+        turn_config: Option<&SmartTurnConfig>,
+    ) -> Result<Self> {
+        let Some(config) = turn_config else {
+            return Ok(self);
+        };
+
+        let sample_rate = self.state.lock().unwrap().sample_rate;
+        let vad_start_secs = self.state.lock().unwrap().params.start_secs as f64;
+
+        let mut analyzer = SmartTurnAnalyzer::new(config)
+            .map_err(|e| crate::error::PipecatError::pipeline(format!("smart turn: {}", e)))?;
+
+        analyzer.set_sample_rate(sample_rate);
+        analyzer.update_vad_start_secs(vad_start_secs);
+
+        self.state.lock().unwrap().turn_analyzer = Some(analyzer);
+
+        log::info!("VadProcessor: smart turn analyzer initialized");
+        Ok(self)
+    }
+
     /// Build a `FrameProcessor` wrapping this handler.
     pub fn into_processor(self) -> FrameProcessor {
         FrameProcessor::new("VadProcessor", Box::new(self), false)
+    }
+
+    fn reset_state(&self) {
+        let mut guard = self.state.lock().unwrap();
+        guard.emitted_speaking = false;
+        guard.user_speaking = false;
+        guard.bot_speaking = false;
+        guard.last_is_speech = false;
+        guard.machine = StateMachine::new(guard.sample_rate, guard.params.clone());
+        if let Some(ref mut ta) = guard.turn_analyzer {
+            ta.clear();
+        }
+        log::debug!("VadProcessor: state reset");
     }
 }
 
@@ -96,69 +170,254 @@ impl FrameHandler for VadProcessor {
         frame: Frame,
         direction: FrameDirection,
     ) -> Result<()> {
-        // Only intercept InputAudioRaw downstream — everything else passes through.
-        if let FrameInner::System(SystemFrame::InputAudioRaw(ref audio_data)) = frame.inner {
-            if direction == FrameDirection::Downstream {
-                // Pass audio through so STT still gets it.
-                processor.push_frame(frame.clone(), direction).await?;
+        match &frame.inner {
+            // -----------------------------------------------------------------
+            // Lifecycle
+            // -----------------------------------------------------------------
+            FrameInner::System(SystemFrame::Start(_)) => {
+                processor.push_frame(frame, direction).await?;
+                self.reset_state();
+            }
+            FrameInner::System(SystemFrame::Stop { .. }) => {
+                processor.push_frame(frame, direction).await?;
+            }
+            FrameInner::Control(ControlFrame::End { .. }) => {
+                processor.push_frame(frame, direction).await?;
+                self.reset_state();
+            }
+            FrameInner::System(SystemFrame::Cancel { .. }) => {
+                processor.push_frame(frame, direction).await?;
+                self.reset_state();
+            }
 
-                // Check if we have a full window ready.
-                let window_opt = {
-                    let mut guard = self.state.lock().unwrap();
-                    guard.machine.next_window(&audio_data.audio)
-                };
+            // -----------------------------------------------------------------
+            // Speaking state tracking (mirrors BaseInputTransport behaviour)
+            // -----------------------------------------------------------------
+            FrameInner::System(SystemFrame::BotStartedSpeaking) => {
+                self.state.lock().unwrap().bot_speaking = true;
+                processor.push_frame(frame, direction).await?;
+            }
+            FrameInner::System(SystemFrame::BotStoppedSpeaking) => {
+                self.state.lock().unwrap().bot_speaking = false;
+                processor.push_frame(frame, direction).await?;
+            }
+            FrameInner::System(SystemFrame::VADUserStartedSpeaking { .. }) => {
+                self.state.lock().unwrap().user_speaking = true;
+                processor.push_frame(frame, direction).await?;
+            }
+            FrameInner::System(SystemFrame::VADUserStoppedSpeaking { .. }) => {
+                self.state.lock().unwrap().user_speaking = false;
+                processor.push_frame(frame, direction).await?;
+            }
 
-                if let Some(window) = window_opt {
-                    // Clone model out of the lock — Arc::clone is cheap.
-                    let model = {
-                        self.state.lock().unwrap().model.clone()
-                    };
+            // -----------------------------------------------------------------
+            // Core VAD + SmartTurn
+            // -----------------------------------------------------------------
+            FrameInner::System(SystemFrame::InputAudioRaw(ref audio_data)) => {
+                if direction == FrameDirection::Downstream {
+                    // Always pass audio through so STT still gets it.
+                    processor.push_frame(frame.clone(), direction).await?;
 
-                    // Run inference outside the lock.
-                    let confidence = model.voice_confidence(window.clone()).await;
-
-                    // Advance state machine — get previous and new state.
-                    let (prev_state, new_state, start_secs, stop_secs) = {
+                    // --- VAD window processing ---
+                    let window_opt = {
                         let mut guard = self.state.lock().unwrap();
-                        let prev = guard.machine.state;
-                        let next = guard.machine.advance(confidence, &window);
-                        (prev, next, guard.start_secs, guard.stop_secs)
+                        guard.machine.next_window(&audio_data.audio)
                     };
 
-                    // Emit VAD frames only on transitions.
-                    let ts = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64();
+                    let mut vad_quiet_transition = false;
 
-                    match (prev_state, new_state) {
-                        // Quiet/Starting → Speaking: speech confirmed
-                        (s, VadState::Speaking) if s != VadState::Speaking => {
-                            log::debug!("VAD: user started speaking (confidence={:.3})", confidence);
-                            let vad_frame = Frame::vad_user_started_speaking(start_secs, ts);
-                            processor
-                                .push_frame(vad_frame, FrameDirection::Downstream)
-                                .await?;
+                    if let Some(window) = window_opt {
+                        let model = {
+                            self.state.lock().unwrap().model.clone()
+                        };
+
+                        let confidence = model.voice_confidence(window.clone()).await;
+
+                        let (prev_state, new_state) = {
+                            let mut guard = self.state.lock().unwrap();
+                            guard.last_is_speech = confidence >= guard.params.confidence;
+                            let prev = guard.machine.state;
+                            let next = guard.machine.advance(confidence, &window);
+                            (prev, next)
+                        };
+
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64();
+
+                        match (prev_state, new_state) {
+                            // Quiet/Starting → Speaking: speech confirmed
+                            (s, VadState::Speaking) if s != VadState::Speaking => {
+                                let maybe_start = {
+                                    let mut guard = self.state.lock().unwrap();
+                                    if !guard.emitted_speaking {
+                                        guard.emitted_speaking = true;
+                                        guard.user_speaking = true;
+                                        Some(guard.params.start_secs)
+                                    } else {
+                                        None
+                                    }
+                                };
+
+                                if let Some(start_secs) = maybe_start {
+                                    log::info!(
+                                        "VAD: → Speaking (confidence={:.3})",
+                                        confidence
+                                    );
+                                    let vad_frame =
+                                        Frame::vad_user_started_speaking(start_secs, ts);
+                                    processor
+                                        .push_frame(vad_frame, FrameDirection::Downstream)
+                                        .await?;
+                                }
+                            }
+
+                            // Speaking/Stopping → Quiet: silence confirmed
+                            (s, VadState::Quiet) if s != VadState::Quiet => {
+                                let maybe_stop = {
+                                    let mut guard = self.state.lock().unwrap();
+                                    if guard.emitted_speaking {
+                                        if guard.turn_analyzer.is_some() {
+                                            log::info!(
+                                                "VAD: → Quiet (confidence={:.3}), \
+                                                 deferring to SmartTurn",
+                                                confidence
+                                            );
+                                            vad_quiet_transition = true;
+                                            None
+                                        } else {
+                                            guard.emitted_speaking = false;
+                                            guard.user_speaking = false;
+                                            Some(guard.params.stop_secs)
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                };
+
+                                if let Some(stop_secs) = maybe_stop {
+                                    log::info!(
+                                        "VAD: → Quiet (confidence={:.3})",
+                                        confidence
+                                    );
+                                    let vad_frame =
+                                        Frame::vad_user_stopped_speaking(stop_secs, ts);
+                                    processor
+                                        .push_frame(vad_frame, FrameDirection::Downstream)
+                                        .await?;
+                                }
+                            }
+
+                            _ => {}
                         }
-
-                        // Speaking/Stopping → Quiet: silence confirmed
-                        (s, VadState::Quiet) if s != VadState::Quiet => {
-                            log::debug!("VAD: user stopped speaking (confidence={:.3})", confidence);
-                            let vad_frame = Frame::vad_user_stopped_speaking(stop_secs, ts);
-                            processor
-                                .push_frame(vad_frame, FrameDirection::Downstream)
-                                .await?;
-                        }
-
-                        _ => {}
                     }
+
+                    // --- Smart turn processing ---
+                    let (last_is_speech, has_smart_turn) = {
+                        let guard = self.state.lock().unwrap();
+                        (guard.last_is_speech, guard.turn_analyzer.is_some())
+                    };
+
+                    if has_smart_turn {
+                        let turn_state = {
+                            let mut guard = self.state.lock().unwrap();
+                            if let Some(ref mut ta) = guard.turn_analyzer {
+                                ta.append_audio(&audio_data.audio, last_is_speech)
+                            } else {
+                                EndOfTurnState::Incomplete
+                            }
+                        };
+
+                        if turn_state == EndOfTurnState::Complete {
+                            let maybe_stop = {
+                                let mut guard = self.state.lock().unwrap();
+                                if guard.emitted_speaking {
+                                    guard.emitted_speaking = false;
+                                    guard.user_speaking = false;
+                                    Some(guard.params.stop_secs)
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(stop_secs) = maybe_stop {
+                                log::info!("SmartTurn: → Complete (silence timeout)");
+                                let ts = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs_f64();
+                                let vad_frame = Frame::vad_user_stopped_speaking(stop_secs, ts);
+                                processor
+                                    .push_frame(vad_frame, FrameDirection::Downstream)
+                                    .await?;
+                            }
+                        }
+
+                        if vad_quiet_transition {
+                            let (result, metrics) = {
+                                let mut guard = self.state.lock().unwrap();
+                                if let Some(ref mut ta) = guard.turn_analyzer {
+                                    ta.analyze_end_of_turn()
+                                } else {
+                                    (EndOfTurnState::Incomplete, None)
+                                }
+                            };
+
+                            if let Some(ref m) = metrics {
+                                log::info!(
+                                    "SmartTurn: prob={:.3} complete={} time={:.1}ms",
+                                    m.probability,
+                                    m.is_complete,
+                                    m.e2e_processing_time_ms
+                                );
+                            }
+
+                            if result == EndOfTurnState::Complete {
+                                let maybe_stop = {
+                                    let mut guard = self.state.lock().unwrap();
+                                    if guard.emitted_speaking {
+                                        guard.emitted_speaking = false;
+                                        guard.user_speaking = false;
+                                        Some(guard.params.stop_secs)
+                                    } else {
+                                        None
+                                    }
+                                };
+
+                                if let Some(stop_secs) = maybe_stop {
+                                    log::info!("SmartTurn: → Complete (ML prediction)");
+                                    let ts = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs_f64();
+                                    let vad_frame =
+                                        Frame::vad_user_stopped_speaking(stop_secs, ts);
+                                    processor
+                                        .push_frame(vad_frame, FrameDirection::Downstream)
+                                        .await?;
+                                }
+                            } else {
+                                log::info!("SmartTurn: → Incomplete, waiting for more audio");
+                            }
+                        }
+                    }
+
+                    return Ok(());
                 }
 
-                return Ok(());
+                // Upstream audio: just pass through.
+                processor.push_frame(frame, direction).await?;
+            }
+
+            // -----------------------------------------------------------------
+            // Default pass-through
+            // -----------------------------------------------------------------
+            _ => {
+                processor.push_frame(frame, direction).await?;
             }
         }
 
-        // All other frames: pass through unchanged.
-        processor.push_frame(frame, direction).await
+        Ok(())
     }
 }

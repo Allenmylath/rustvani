@@ -59,7 +59,7 @@ pub use processors::llm_assistant_aggregator::LLMAssistantAggregator;
 
 // VAD
 #[cfg(feature = "vad-silero")]
-pub use vad::{SileroVadNative, SileroVadOrt, VadAnalyzer, VadBackend, VadParams, VadState};
+pub use vad::{SileroVadNative, SileroVadOrt, VadAnalyzer, VadBackend, VadParams, VadProcessor, VadState};
 
 // Transport
 #[cfg(feature = "transport-websocket")]

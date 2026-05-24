@@ -62,6 +62,33 @@ pub struct OpenAILLMConfig {
     pub service_tier: Option<String>,
     /// Maximum number of recursive tool call rounds. Prevents infinite loops.
     pub max_tool_rounds: usize,
+    /// Context window size for this model in tokens. `None` falls back to
+    /// the hardcoded table in `resolve_context_window_tokens()`. Set
+    /// explicitly to override for custom or self-hosted models.
+    pub context_window_tokens: Option<usize>,
+}
+
+/// Hardcoded context windows for common models. Returns `None` for unknowns —
+/// callers treat `None` as "no trimming".
+fn default_context_tokens(model: &str) -> Option<usize> {
+    let m = model.to_lowercase();
+    let m = m.split('/').next_back().unwrap_or(&m);
+    if m.starts_with("gpt-4.1") { return Some(1_047_576); }
+    if m.starts_with("gpt-4o") { return Some(128_000); }
+    if m.starts_with("gpt-4-turbo") { return Some(128_000); }
+    if m.starts_with("gpt-3.5") { return Some(16_385); }
+    if m.starts_with("claude-opus-4") || m.starts_with("claude-sonnet-4") { return Some(1_048_576); }
+    if m.starts_with("claude-3") { return Some(200_000); }
+    if m.starts_with("gemini-2") || m.starts_with("gemini-1.5") { return Some(1_048_576); }
+    None
+}
+
+impl OpenAILLMConfig {
+    /// Returns the effective context window token limit for this config,
+    /// preferring the explicit override then falling back to the model table.
+    pub fn resolve_context_window_tokens(&self) -> Option<usize> {
+        self.context_window_tokens.or_else(|| default_context_tokens(&self.model))
+    }
 }
 
 impl Default for OpenAILLMConfig {
@@ -78,6 +105,7 @@ impl Default for OpenAILLMConfig {
             max_completion_tokens: None,
             service_tier: None,
             max_tool_rounds: 5,
+            context_window_tokens: None,
         }
     }
 }
@@ -496,6 +524,10 @@ impl OpenAILLMHandler {
                 break;
             }
             round += 1;
+
+            if let Some(budget) = self.config.resolve_context_window_tokens() {
+                context.lock().unwrap().trim_to_context_budget(budget);
+            }
 
             match self.run_stream(&context, processor).await? {
                 InferenceOutcome::Text => break,

@@ -1,11 +1,13 @@
 pub mod analyzer;
 pub mod params;
+pub mod processor;
 pub mod silero_ort;
 pub mod silero_native;
 pub mod state;
 
 pub use analyzer::VadAnalyzer;
 pub use params::{VadParams, VAD_CONFIDENCE, VAD_MIN_VOLUME, VAD_START_SECS, VAD_STOP_SECS};
+pub use processor::VadProcessor;
 pub use silero_ort::SileroVadOrt;
 pub use silero_native::SileroVadNative;
 pub use state::{StateMachine, VadState, calculate_audio_volume, exp_smoothing};
