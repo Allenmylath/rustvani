@@ -1892,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "rustvani"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-recursion",
  "async-trait",
