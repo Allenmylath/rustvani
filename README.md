@@ -1,3 +1,4 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Allenmylath/rustvani)
 <p align="center">
   <img src="assets/rustvanisupercolor.png" alt="rustvani hero" width="100%" />
 </p>
