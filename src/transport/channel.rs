@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 
 use crate::frames::{AudioRawData, Frame, FrameDirection, FrameProcessor};
 use crate::transport::{BaseTransport, OutputMessage, TransportParams};
+use crate::transport::incoming::dispatch_text_message;
 
 // ---------------------------------------------------------------------------
 // ChannelMessage
@@ -20,8 +21,12 @@ pub enum ChannelMessage {
     Audio(Vec<u8>),
     /// Serialised JSON text frame — used by RAVI for protocol messages.
     Text(String),
-    /// Interruption signal.
+    /// Interruption signal (legacy).
     Interruption,
+    /// Client VAD: user started speaking. Carries wall-clock timestamp in seconds.
+    ClientVadStart(f64),
+    /// Client VAD: user stopped speaking. Carries wall-clock timestamp in seconds.
+    ClientVadStop(f64),
 }
 
 // ---------------------------------------------------------------------------
@@ -122,12 +127,24 @@ impl ChannelTransport {
                         }
 
                         Some(ChannelMessage::Text(text)) => {
-                            handle_incoming_text(&text, &push_tx).await;
+                            dispatch_text_message(&text, &push_tx).await;
                         }
 
                         Some(ChannelMessage::Interruption) => {
                             let _ = push_tx
                                 .send((Frame::interruption(), FrameDirection::Downstream))
+                                .await;
+                        }
+
+                        Some(ChannelMessage::ClientVadStart(ts)) => {
+                            let _ = push_tx
+                                .send((Frame::client_vad_user_started_speaking(ts), FrameDirection::Downstream))
+                                .await;
+                        }
+
+                        Some(ChannelMessage::ClientVadStop(ts)) => {
+                            let _ = push_tx
+                                .send((Frame::client_vad_user_stopped_speaking(ts), FrameDirection::Downstream))
                                 .await;
                         }
 
@@ -189,51 +206,3 @@ impl ChannelTransport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Incoming text message handler
-// ---------------------------------------------------------------------------
-
-/// Parse an incoming text message and push the appropriate frame.
-///
-/// Two protocols are recognised:
-///
-/// 1. **RAVI** (`label == "ravi"`) — parsed into a `RaviClientMessage`
-///    frame and sent downstream.
-///
-/// 2. **Legacy interruption** (`type == "client_interruption"`) — kept for
-///    backward-compatibility.
-async fn handle_incoming_text(
-    text: &str,
-    push_tx: &mpsc::Sender<(Frame, FrameDirection)>,
-) {
-    let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else {
-        log::warn!("ChannelTransport: ignoring non-JSON text message");
-        return;
-    };
-
-    let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let label = msg.get("label").and_then(|v| v.as_str()).unwrap_or("");
-
-    if label == "ravi" {
-        let Some(msg_id) = msg.get("id").and_then(|v| v.as_str()) else {
-            log::warn!("ChannelTransport: RAVI message missing 'id' field — dropping");
-            return;
-        };
-
-        let data_str = msg.get("data").map(|d| d.to_string());
-
-        let frame = Frame::ravi_client_message(msg_id, msg_type, data_str);
-        let _ = push_tx.send((frame, FrameDirection::Downstream)).await;
-
-        log::trace!("ChannelTransport: RAVI '{}' (id={})", msg_type, msg_id);
-        return;
-    }
-
-    // Legacy: bare client interruption without RAVI label.
-    if msg_type == "client_interruption" {
-        log::info!("ChannelTransport: legacy client-initiated interruption");
-        let _ = push_tx
-            .send((Frame::interruption(), FrameDirection::Downstream))
-            .await;
-    }
-}

@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::frames::{AudioRawData, Frame, FrameDirection, FrameProcessor};
 use crate::transport::{BaseTransport, TransportParams};
+use crate::transport::incoming::dispatch_text_message;
 use crate::transport::output::OutputMessage;
 
 // ---------------------------------------------------------------------------
@@ -105,7 +106,7 @@ impl WebSocketTransport {
                         }
 
                         Some(Ok(Message::Text(text))) => {
-                            handle_incoming_text(&text, &push_tx).await;
+                            dispatch_text_message(&text, &push_tx).await;
                         }
 
                         Some(Ok(Message::Close(_))) | None => {
@@ -172,55 +173,3 @@ impl WebSocketTransport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Incoming text message handler
-// ---------------------------------------------------------------------------
-
-/// Parse an incoming text WebSocket message and push the appropriate frame.
-///
-/// Two protocols are recognised:
-///
-/// 1. **RAVI** (`label == "rtvi-ai"`) — parsed into a `RaviClientMessage`
-///    frame and sent downstream. The `RaviProcessor` in the pipeline handles
-///    the protocol logic.
-///
-/// 2. **Legacy interruption** (`type == "client_interruption"`) — kept for
-///    backward-compatibility with clients that pre-date RAVI.
-async fn handle_incoming_text(
-    text: &str,
-    push_tx: &mpsc::Sender<(Frame, FrameDirection)>,
-) {
-    let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else {
-        log::warn!("WebSocketTransport: ignoring non-JSON text message");
-        return;
-    };
-
-    let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let label    = msg.get("label").and_then(|v| v.as_str()).unwrap_or("");
-
-    if label == "ravi" {
-        // RAVI inbound message.
-        let Some(msg_id) = msg.get("id").and_then(|v| v.as_str()) else {
-            log::warn!("WebSocketTransport: RAVI message missing 'id' field — dropping");
-            return;
-        };
-
-        // `data` is optional; serialise it back to a JSON string so the
-        // RaviProcessor can deserialise it into the appropriate type.
-        let data_str = msg.get("data").map(|d| d.to_string());
-
-        let frame = Frame::ravi_client_message(msg_id, msg_type, data_str);
-        let _ = push_tx.send((frame, FrameDirection::Downstream)).await;
-
-        log::trace!("WebSocketTransport: RAVI '{}' (id={})", msg_type, msg_id);
-        return;
-    }
-
-    // Legacy: bare client interruption without RAVI label.
-    if msg_type == "client_interruption" {
-        log::info!("WebSocketTransport: legacy client-initiated interruption");
-        let _ = push_tx
-            .send((Frame::interruption(), FrameDirection::Downstream))
-            .await;
-    }
-}
