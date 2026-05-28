@@ -36,6 +36,7 @@ pub enum FrameKind {
     BotStartedSpeaking, BotStoppedSpeaking,
     UserStartedSpeaking, UserStoppedSpeaking,
     VADUserStartedSpeaking, VADUserStoppedSpeaking,
+    ClientVADUserStartedSpeaking, ClientVADUserStoppedSpeaking,
     // System — audio/video input
     InputAudioRaw,
     // System — processor control
@@ -210,6 +211,8 @@ pub enum SystemFrame {
     UserStoppedSpeaking  { emulated: bool },
     VADUserStartedSpeaking { start_secs: f32, timestamp: f64 },
     VADUserStoppedSpeaking { stop_secs: f32, timestamp: f64 },
+    ClientVADUserStartedSpeaking { timestamp: f64 },
+    ClientVADUserStoppedSpeaking  { timestamp: f64 },
 
     // ---- Audio input ----
     InputAudioRaw(AudioRawData),
@@ -311,6 +314,8 @@ impl Frame {
                 SystemFrame::UserStoppedSpeaking { .. }    => "UserStoppedSpeakingFrame",
                 SystemFrame::VADUserStartedSpeaking { .. } => "VADUserStartedSpeakingFrame",
                 SystemFrame::VADUserStoppedSpeaking { .. } => "VADUserStoppedSpeakingFrame",
+                SystemFrame::ClientVADUserStartedSpeaking { .. } => "ClientVADUserStartedSpeakingFrame",
+                SystemFrame::ClientVADUserStoppedSpeaking { .. }  => "ClientVADUserStoppedSpeakingFrame",
                 SystemFrame::InputAudioRaw(_)              => "InputAudioRawFrame",
                 SystemFrame::PauseProcessor { .. }         => "PauseProcessorFrame",
                 SystemFrame::PauseProcessorUrgent { .. }   => "PauseProcessorUrgentFrame",
@@ -361,6 +366,8 @@ impl Frame {
                 SystemFrame::UserStoppedSpeaking { .. }    => FrameKind::UserStoppedSpeaking,
                 SystemFrame::VADUserStartedSpeaking { .. } => FrameKind::VADUserStartedSpeaking,
                 SystemFrame::VADUserStoppedSpeaking { .. } => FrameKind::VADUserStoppedSpeaking,
+                SystemFrame::ClientVADUserStartedSpeaking { .. } => FrameKind::ClientVADUserStartedSpeaking,
+                SystemFrame::ClientVADUserStoppedSpeaking { .. }  => FrameKind::ClientVADUserStoppedSpeaking,
                 SystemFrame::InputAudioRaw(_)              => FrameKind::InputAudioRaw,
                 SystemFrame::PauseProcessor { .. }         => FrameKind::PauseProcessor,
                 SystemFrame::PauseProcessorUrgent { .. }   => FrameKind::PauseProcessorUrgent,
@@ -473,6 +480,12 @@ impl Frame {
     }
     pub fn vad_user_stopped_speaking(stop_secs: f32, timestamp: f64) -> Self {
         Self::make(FrameInner::System(SystemFrame::VADUserStoppedSpeaking { stop_secs, timestamp }))
+    }
+    pub fn client_vad_user_started_speaking(timestamp: f64) -> Self {
+        Self::make(FrameInner::System(SystemFrame::ClientVADUserStartedSpeaking { timestamp }))
+    }
+    pub fn client_vad_user_stopped_speaking(timestamp: f64) -> Self {
+        Self::make(FrameInner::System(SystemFrame::ClientVADUserStoppedSpeaking { timestamp }))
     }
 
     // ---- Audio ----

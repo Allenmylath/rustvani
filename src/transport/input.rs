@@ -80,6 +80,16 @@ impl BaseInputTransport {
         self.state.paused.load(Ordering::Relaxed)
     }
 
+    pub async fn push_client_vad_started(&self, processor: &FrameProcessor, timestamp: f64) {
+        let frame = Frame::client_vad_user_started_speaking(timestamp);
+        let _ = processor.push_frame(frame, FrameDirection::Downstream).await;
+    }
+
+    pub async fn push_client_vad_stopped(&self, processor: &FrameProcessor, timestamp: f64) {
+        let frame = Frame::client_vad_user_stopped_speaking(timestamp);
+        let _ = processor.push_frame(frame, FrameDirection::Downstream).await;
+    }
+
     fn on_start(&self, processor: &FrameProcessor) {
         self.state.paused.store(false, Ordering::Relaxed);
         self.state.user_speaking.store(false, Ordering::Relaxed);
@@ -205,6 +215,31 @@ impl FrameHandler for BaseInputTransport {
                 self.state.user_speaking.store(false, Ordering::Relaxed);
                 processor.push_frame(frame, direction).await?;
             }
+            FrameInner::System(SystemFrame::ClientVADUserStartedSpeaking { timestamp }) => {
+                let ts = *timestamp;
+                if self.state.emitted_speaking
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    log::info!("VAD client: → Speaking");
+                    self.state.user_speaking.store(true, Ordering::Relaxed);
+                    let frame = Frame::vad_user_started_speaking(0.0, ts);
+                    processor.push_frame(frame, FrameDirection::Downstream).await?;
+                }
+                // raw ClientVAD frame is not forwarded downstream
+            }
+            FrameInner::System(SystemFrame::ClientVADUserStoppedSpeaking { timestamp }) => {
+                let ts = *timestamp;
+                if self.state.emitted_speaking
+                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    log::info!("VAD client: → Quiet");
+                    self.state.user_speaking.store(false, Ordering::Relaxed);
+                    let frame = Frame::vad_user_stopped_speaking(0.0, ts);
+                    processor.push_frame(frame, FrameDirection::Downstream).await?;
+                }
+            }
             _ => {
                 processor.push_frame(frame, direction).await?;
             }
@@ -274,46 +309,52 @@ async fn run_audio_task(
                                 .unwrap_or_default()
                                 .as_secs_f64();
 
-                            let was_speaking = state.emitted_speaking.load(Ordering::Relaxed);
-
                             match vad_state {
-                                VadState::Speaking if !was_speaking => {
-                                    log::info!("VAD: → Speaking (confidence={:.3})", confidence);
-                                    state.emitted_speaking.store(true, Ordering::Relaxed);
-                                    let frame = Frame::vad_user_started_speaking(
-                                        state.params.vad_params.start_secs,
-                                        ts,
-                                    );
-                                    if let Err(e) = processor
-                                        .push_frame(frame, FrameDirection::Downstream)
-                                        .await
+                                VadState::Speaking => {
+                                    if state.emitted_speaking
+                                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                                        .is_ok()
                                     {
-                                        log::error!("BaseInputTransport: VAD push failed: {}", e);
-                                    }
-                                }
-                                VadState::Quiet if was_speaking => {
-                                    if !has_smart_turn {
-                                        log::info!("VAD: → Quiet (confidence={:.3})", confidence);
-                                        state.emitted_speaking.store(false, Ordering::Relaxed);
-                                        let frame = Frame::vad_user_stopped_speaking(
-                                            state.params.vad_params.stop_secs,
+                                        log::info!("VAD server: → Speaking (confidence={:.3})", confidence);
+                                        let frame = Frame::vad_user_started_speaking(
+                                            state.params.vad_params.start_secs,
                                             ts,
                                         );
                                         if let Err(e) = processor
                                             .push_frame(frame, FrameDirection::Downstream)
                                             .await
                                         {
-                                            log::error!(
-                                                "BaseInputTransport: VAD push failed: {}", e
+                                            log::error!("BaseInputTransport: VAD push failed: {}", e);
+                                        }
+                                    }
+                                }
+                                VadState::Quiet => {
+                                    if state.emitted_speaking
+                                        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+                                        .is_ok()
+                                    {
+                                        if !has_smart_turn {
+                                            log::info!("VAD server: → Quiet (confidence={:.3})", confidence);
+                                            let frame = Frame::vad_user_stopped_speaking(
+                                                state.params.vad_params.stop_secs,
+                                                ts,
+                                            );
+                                            if let Err(e) = processor
+                                                .push_frame(frame, FrameDirection::Downstream)
+                                                .await
+                                            {
+                                                log::error!(
+                                                    "BaseInputTransport: VAD push failed: {}", e
+                                                );
+                                            }
+                                        } else {
+                                            log::info!(
+                                                "VAD server: → Quiet (confidence={:.3}), deferring to SmartTurn",
+                                                confidence
                                             );
                                         }
-                                    } else {
-                                        log::info!(
-                                            "VAD: → Quiet (confidence={:.3}), deferring to SmartTurn",
-                                            confidence
-                                        );
+                                        vad_quiet_transition = true;
                                     }
-                                    vad_quiet_transition = true;
                                 }
                                 _ => {}
                             }
@@ -326,7 +367,10 @@ async fn run_audio_task(
                     let turn_state = ta.append_audio(&data.audio, last_is_speech);
 
                     if turn_state == EndOfTurnState::Complete {
-                        if state.emitted_speaking.swap(false, Ordering::Relaxed) {
+                        if state.emitted_speaking
+                            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                        {
                             log::info!("SmartTurn: → Complete (silence timeout)");
                             let ts = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
@@ -355,19 +399,23 @@ async fn run_audio_task(
                         }
 
                         if result == EndOfTurnState::Complete {
-                            log::info!("SmartTurn: → Complete (ML prediction)");
-                            state.emitted_speaking.store(false, Ordering::Relaxed);
-                            let ts = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs_f64();
-                            let frame = Frame::vad_user_stopped_speaking(
-                                state.params.vad_params.stop_secs,
-                                ts,
-                            );
-                            let _ = processor
-                                .push_frame(frame, FrameDirection::Downstream)
-                                .await;
+                            if state.emitted_speaking
+                                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                log::info!("SmartTurn: → Complete (ML prediction)");
+                                let ts = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs_f64();
+                                let frame = Frame::vad_user_stopped_speaking(
+                                    state.params.vad_params.stop_secs,
+                                    ts,
+                                );
+                                let _ = processor
+                                    .push_frame(frame, FrameDirection::Downstream)
+                                    .await;
+                            }
                         } else {
                             log::info!("SmartTurn: → Incomplete, waiting for more audio");
                         }
@@ -391,6 +439,7 @@ async fn run_audio_task(
                          — forcing UserStoppedSpeaking"
                     );
                     state.user_speaking.store(false, Ordering::Relaxed);
+                    state.emitted_speaking.store(false, Ordering::Relaxed);
 
                     let frame = Frame::user_stopped_speaking();
                     if let Err(e) = processor
