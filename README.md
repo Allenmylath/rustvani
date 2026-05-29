@@ -25,7 +25,7 @@ User speaks → VAD → STT → LLM → TTS → User hears
 
 ```toml
 [dependencies]
-rustvani = "0.1.6"
+rustvani = "0.2.0"
 ```
 
 ```bash
@@ -227,7 +227,7 @@ src/
 ├── ravi/              RAVI protocol (real-time audio/video interface)
 ├── services/
 │   ├── llm/           OpenAI + Sarvam LLM (SSE streaming, function calling)
-│   ├── stt/           Sarvam STT (WebSocket streaming)
+│   ├── stt/           Sarvam STT + 60db STT (WebSocket streaming)
 │   └── tts/           Sarvam TTS (WebSocket) + Piper TTS (local ONNX)
 ├── tools/             Built-in tools (Neon Postgres with pgvector)
 ├── transport/         WebSocket transport (axum) + base I/O + ChannelTransport
@@ -270,11 +270,12 @@ transport.push_client_vad_stopped(&processor, timestamp).await;
 The coordination rule: `emitted_speaking` is an `AtomicBool` shared between client and server paths. The first source to win `compare_exchange(false, true)` emits the event; the second is a no-op. This eliminates double-triggers with zero locking overhead.
 
 ### Speech-to-Text
+- **60db STT** — real-time WebSocket streaming with 39 languages, two-phase finals (fast dictation + LLM-refined canonical), and automatic resampling
 - **Sarvam AI** streaming WebSocket STT (`saaras:v3`)
 - Supports transcription, translation, verbatim, transliteration, and codemix modes
 - Multi-language: `ml-IN`, `hi-IN`, `en-IN`, auto-detect (`unknown`)
 - Integrated **RNNoise** noise suppression (pure Rust via `nnnoiseless`)
-- Transparent resampling if source rate ≠ 48 kHz (via `rubato`)
+- Transparent resampling if source rate ≠ target rate (via `rubato`)
 
 ### Large Language Models
 - **OpenAI-compatible** API with SSE streaming
@@ -435,6 +436,7 @@ rustvani is in active development. Core pipeline, frame system, and all listed s
 - Full pipeline lifecycle (start, interruption, cancel, end)
 - Silero VAD — native Rust + ONNX — with SmartTurn end-of-turn prediction
 - Client + Server VAD coordination (Dioxus frontend integration)
+- 60db STT (WebSocket streaming, 39 languages)
 - Sarvam STT / TTS / LLM
 - OpenAI-compatible LLM with function calling + re-invocation loop
 - Piper TTS (local ONNX, zero network)
@@ -448,7 +450,7 @@ rustvani is in active development. Core pipeline, frame system, and all listed s
 **Planned:**
 - Anthropic / Gemini LLM adapters
 - WebRTC transport
-- Deepgram / Whisper STT
+- Whisper STT
 - ElevenLabs / PlayHT TTS
 - Metrics and observability
 
