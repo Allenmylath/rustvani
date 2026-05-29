@@ -59,6 +59,8 @@ fn read_wav_pcm(path: &str) -> std::result::Result<(Vec<u8>, u32), Box<dyn std::
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info"),
     )
