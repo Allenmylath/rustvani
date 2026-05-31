@@ -8,7 +8,7 @@ pub use llm::sarvam::{SarvamLLMConfig, SarvamLLMHandler};
 pub use stt::gnani::{GnaniSttConfig, GnaniSttHandler};
 pub use stt::sarvam::{SarvamSttConfig, SarvamSttHandler};
 pub use stt::sixtydb::{
-    SixtyDbAudioEnhancement, SixtyDbContext, SixtyDbContextItem, SixtyDbEncoding,
+    SixtyDbEncoding,
     SixtyDbSttConfig, SixtyDbSttHandler,
 };
 pub use tts::sarvam::{SarvamTtsConfig, SarvamTtsHandler};
