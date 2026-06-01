@@ -150,6 +150,9 @@ No Python, no virtualenv, no `requirements.txt`. The image is ~50 MB total.
 
 ```bash
 SARVAM_API_KEY=your_key
+SIXTYDB_API_KEY=your_key
+GNANI_API_KEY=your_key
+DEEPGRAM_API_KEY=your_key
 OPENAI_API_KEY=your_key   # or any OpenAI-compatible endpoint
 DATABASE_URL=postgres://…  # if using the Postgres built-in tool
 ```
@@ -227,8 +230,8 @@ src/
 ├── ravi/              RAVI protocol (real-time audio/video interface)
 ├── services/
 │   ├── llm/           OpenAI + Sarvam LLM (SSE streaming, function calling)
-│   ├── stt/           Sarvam STT + 60db STT (WebSocket streaming)
-│   └── tts/           Sarvam TTS (WebSocket) + Piper TTS (local ONNX)
+│   ├── stt/           Sarvam STT + 60db STT + Gnani STT (WebSocket streaming)
+│   └── tts/           Sarvam TTS + Deepgram TTS (WebSocket) + Piper TTS (local ONNX)
 ├── tools/             Built-in tools (Neon Postgres with pgvector)
 ├── transport/         WebSocket transport (axum) + base I/O + ChannelTransport
 ├── utils/             Sentence splitter, text preprocessor
@@ -272,6 +275,7 @@ The coordination rule: `emitted_speaking` is an `AtomicBool` shared between clie
 ### Speech-to-Text
 - **60db STT** — real-time WebSocket streaming with 39 languages, two-phase finals (fast dictation + LLM-refined canonical), and automatic resampling
 - **Sarvam AI** streaming WebSocket STT (`saaras:v3`)
+- **Gnani (Vachana) STT** — WebSocket streaming for Indic languages (`hi-IN`, `ta-IN`, `en-IN`, etc.)
 - Supports transcription, translation, verbatim, transliteration, and codemix modes
 - Multi-language: `ml-IN`, `hi-IN`, `en-IN`, auto-detect (`unknown`)
 - Integrated **RNNoise** noise suppression (pure Rust via `nnnoiseless`)
@@ -286,6 +290,7 @@ The coordination rule: `emitted_speaking` is an `AtomicBool` shared between clie
 
 ### Text-to-Speech
 - **Sarvam Bulbul** TTS (v2, v3-beta, v3) — WebSocket streaming with 25+ voices
+- **Deepgram Aura** TTS — WebSocket streaming with Aura-2 voices, interruption via `Clear` without reconnect
 - **Piper TTS** — fully local ONNX inference, zero network calls
   - espeak-ng phonemization → Piper ONNX → chunked PCM streaming
   - Multiple quality levels (Low/Medium/High)
@@ -438,7 +443,9 @@ rustvani is in active development. Core pipeline, frame system, and all listed s
 - Client + Server VAD coordination (Dioxus frontend integration)
 - 60db STT (WebSocket streaming, 39 languages)
 - Sarvam STT / TTS / LLM
+- Gnani STT (Vachana API, Indic languages)
 - OpenAI-compatible LLM with function calling + re-invocation loop
+- Deepgram TTS (Aura-2 voices, WebSocket streaming)
 - Piper TTS (local ONNX, zero network)
 - Dhara conversation flow manager
 - RAVI protocol

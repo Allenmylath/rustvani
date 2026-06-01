@@ -1,0 +1,536 @@
+[33mcommit 12114ffca0d6106073c6f3a0a3ec028605335d33[m[33m ([m[1;32mmain[m[33m)[m
+Author: Allenmylath <allengeorgemylath@gmail.com>
+Date:   Mon Jun 1 11:19:40 2026 +0530
+
+    added support for gnanitests pending
+
+[1mdiff --git a/Cargo.toml b/Cargo.toml[m
+[1mindex 9a1e281..5a9856a 100644[m
+[1m--- a/Cargo.toml[m
+[1m+++ b/Cargo.toml[m
+[36m@@ -26,6 +26,7 @@[m [mtransport-websocket = ["dep:axum", "dep:tower-http", "dep:tokio-tungstenite"][m
+ [m
+ # Services[m
+ stt-sarvam = ["dep:reqwest"][m
+[32m+[m[32mstt-gnani = ["dep:tokio-tungstenite"][m
+ llm-openai = ["dep:reqwest"][m
+ tts-deepgram = ["dep:tokio-tungstenite"][m
+ tts-sarvam = ["dep:tokio-tungstenite"][m
+[1mdiff --git a/src/services/mod.rs b/src/services/mod.rs[m
+[1mindex 3420725..b63037f 100644[m
+[1m--- a/src/services/mod.rs[m
+[1m+++ b/src/services/mod.rs[m
+[36m@@ -5,6 +5,7 @@[m [mpub mod tts;[m
+ [m
+ pub use llm::openai::{OpenAILLMConfig, OpenAILLMHandler};[m
+ pub use llm::sarvam::{SarvamLLMConfig, SarvamLLMHandler};[m
+[32m+[m[32mpub use stt::gnani::{GnaniSttConfig, GnaniSttHandler};[m
+ pub use stt::sarvam::{SarvamSttConfig, SarvamSttHandler};[m
+ pub use tts::sarvam::{SarvamTtsConfig, SarvamTtsHandler};[m
+ pub use tts::{DeepgramTtsConfig, DeepgramTtsHandler};[m
+[1mdiff --git a/src/services/stt/gnani.rs b/src/services/stt/gnani.rs[m
+[1mnew file mode 100644[m
+[1mindex 0000000..3a03247[m
+[1m--- /dev/null[m
+[1m+++ b/src/services/stt/gnani.rs[m
+[36m@@ -0,0 +1,490 @@[m
+[32m+[m[32m//! Gnani (Vachana) Speech-to-Text service.[m
+[32m+[m[32m//![m
+[32m+[m[32m//! Connects to Gnani's WebSocket streaming API (`wss://api.vachana.ai/stt/v3/stream`)[m
+[32m+[m[32m//! and pushes `TranscriptionFrame`s downstream when transcripts arrive.[m
+[32m+[m[32m//![m
+[32m+[m[32m//! Pipeline position:[m
+[32m+[m[32m//!   transport.input() → GnaniSttHandler → llm → tts → transport.output()[m
+[32m+[m[32m//![m
+[32m+[m[32m//! Frames consumed:[m
+[32m+[m[32m//!   - StartFrame             → connects WebSocket[m
+[32m+[m[32m//!   - InputAudioRaw          → buffer into 1024-byte chunks → send binary[m
+[32m+[m[32m//!   - VADUserStoppedSpeaking → flush any remaining buffered audio[m
+[32m+[m[32m//!   - EndFrame / CancelFrame → disconnects WebSocket[m
+[32m+[m[32m//![m
+[32m+[m[32m//! Frames produced:[m
+[32m+[m[32m//!   - TranscriptionFrame (downstream) on transcript[m
+[32m+[m[32m//!   - ErrorFrame (upstream) on connection / parse errors[m
+[32m+[m[32m//![m
+[32m+[m[32m//! Auth: `x-api-key-id` header.[m
+[32m+[m[32m//! Audio: raw PCM signed 16-bit little-endian, mono, chunked into 1024-byte frames.[m
+[32m+[m
+[32m+[m[32muse std::sync::Arc;[m
+[32m+[m[32muse std::time::{SystemTime, UNIX_EPOCH};[m
+[32m+[m
+[32m+[m[32muse async_trait::async_trait;[m
+[32m+[m[32muse futures::{SinkExt, StreamExt};[m
+[32m+[m[32muse log;[m
+[32m+[m[32muse serde::Deserialize;[m
+[32m+[m[32muse tokio::sync::{mpsc, Mutex};[m
+[32m+[m[32muse tokio::task::JoinHandle;[m
+[32m+[m[32muse tokio_tungstenite::tungstenite::http::Request;[m
+[32m+[m[32muse tokio_tungstenite::tungstenite::Message;[m
+[32m+[m
+[32m+[m[32muse crate::error::Result;[m
+[32m+[m[32muse crate::frames::{[m
+[32m+[m[32m    ControlFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,[m
+[32m+[m[32m    SystemFrame, TranscriptionData,[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m[32m// Constants[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m
+[32m+[m[32mconst GNANI_BASE_WSS: &str = "wss://api.vachana.ai";[m
+[32m+[m[32mconst STT_PATH: &str       = "/stt/v3/stream";[m
+[32m+[m[32m/// Gnani expects 512 samples × 2 bytes = 1024 bytes per binary frame.[m
+[32m+[m[32mconst CHUNK_SIZE: usize    = 1024;[m
+[32m+[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m[32m// Config[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m
+[32m+[m[32m/// Configuration for `GnaniSttHandler`.[m
+[32m+[m[32m#[derive(Debug, Clone)][m
+[32m+[m[32mpub struct GnaniSttConfig {[m
+[32m+[m[32m    /// Vachana API key.[m
+[32m+[m[32m    pub api_key: String,[m
+[32m+[m
+[32m+[m[32m    /// BCP-47 language code e.g. "hi-IN", "en-IN", "ta-IN".[m
+[32m+[m[32m    /// Default: "en-IN".[m
+[32m+[m[32m    pub language_code: String,[m
+[32m+[m
+[32m+[m[32m    /// Audio sample rate in Hz. Must match the actual audio source.[m
+[32m+[m[32m    /// Accepted values: 8000, 16000, 44100, 48000.[m
+[32m+[m[32m    /// Default: 16000.[m
+[32m+[m[32m    pub sample_rate: u32,[m
+[32m+[m
+[32m+[m[32m    /// Output format.[m
+[32m+[m[32m    /// - `"verbatim"` — raw spoken-form output (default).[m
+[32m+[m[32m    /// - `"transcribe"` — enables Inverse Text Normalization (ITN).[m
+[32m+[m[32m    pub format: String,[m
+[32m+[m
+[32m+[m[32m    /// When `format` is `"transcribe"`, set `true` to render digits in the[m
+[32m+[m[32m    /// native script of the target language.[m
+[32m+[m[32m    /// Default: `false`.[m
+[32m+[m[32m    pub itn_native_numerals: bool,[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mimpl Default for GnaniSttConfig {[m
+[32m+[m[32m    fn default() -> Self {[m
+[32m+[m[32m        Self {[m
+[32m+[m[32m            api_key:             String::new(),[m
+[32m+[m[32m            language_code:       "en-IN".to_string(),[m
+[32m+[m[32m            sample_rate:         16_000,[m
+[32m+[m[32m            format:              "verbatim".to_string(),[m
+[32m+[m[32m            itn_native_numerals: false,[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mimpl GnaniSttConfig {[m
+[32m+[m[32m    fn ws_url(&self) -> String {[m
+[32m+[m[32m        format!("{}{}", GNANI_BASE_WSS, STT_PATH)[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m[32m// Server message types[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m
+[32m+[m[32m#[derive(Debug, Deserialize)][m
+[32m+[m[32m#[allow(dead_code)][m
+[32m+[m[32mstruct GnaniMessage {[m
+[32m+[m[32m    #[serde(rename = "type")][m
+[32m+[m[32m    msg_type: String,[m
+[32m+[m[32m    #[serde(default)][m
+[32m+[m[32m    message: Option<String>,[m
+[32m+[m[32m    #[serde(default)][m
+[32m+[m[32m    timestamp: Option<String>,[m
+[32m+[m[32m    #[serde(default)][m
+[32m+[m[32m    text: Option<String>,[m
+[32m+[m[32m    #[serde(default)][m
+[32m+[m[32m    audio_duration_ms: Option<u64>,[m
+[32m+[m[32m    #[serde(default)][m
+[32m+[m[32m    segment_id: Option<String>,[m
+[32m+[m[32m    #[serde(default)][m
+[32m+[m[32m    segment_index: Option<u64>,[m
+[32m+[m[32m    #[serde(default)][m
+[32m+[m[32m    latency: Option<u64>,[m
+[32m+[m[32m    #[serde(default)][m
+[32m+[m[32m    config: Option<serde_json::Value>,[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m[32m// Internal state[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m
+[32m+[m[32mstruct GnaniSttState {[m
+[32m+[m[32m    ws_tx:        Option<mpsc::Sender<Message>>,[m
+[32m+[m[32m    send_task:    Option<JoinHandle<()>>,[m
+[32m+[m[32m    receive_task: Option<JoinHandle<()>>,[m
+[32m+[m[32m    /// Buffered audio bytes waiting to form a complete 1024-byte chunk.[m
+[32m+[m[32m    audio_buffer: Vec<u8>,[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mimpl GnaniSttState {[m
+[32m+[m[32m    fn new() -> Self {[m
+[32m+[m[32m        Self {[m
+[32m+[m[32m            ws_tx:        None,[m
+[32m+[m[32m            send_task:    None,[m
+[32m+[m[32m            receive_task: None,[m
+[32m+[m[32m            audio_buffer: Vec::new(),[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m[32m// GnaniSttHandler[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m
+[32m+[m[32mpub struct GnaniSttHandler {[m
+[32m+[m[32m    config: GnaniSttConfig,[m
+[32m+[m[32m    state:  Arc<Mutex<GnaniSttState>>,[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mimpl GnaniSttHandler {[m
+[32m+[m[32m    pub fn new(config: GnaniSttConfig) -> Self {[m
+[32m+[m[32m        Self {[m
+[32m+[m[32m            config,[m
+[32m+[m[32m            state: Arc::new(Mutex::new(GnaniSttState::new())),[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    pub fn into_processor(self) -> FrameProcessor {[m
+[32m+[m[32m        FrameProcessor::new("GnaniStt", Box::new(self), false)[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m[32m// Connection / disconnection[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m
+[32m+[m[32mimpl GnaniSttHandler {[m
+[32m+[m[32m    async fn connect(&self, processor: FrameProcessor) {[m
+[32m+[m[32m        let url = self.config.ws_url();[m
+[32m+[m[32m        log::info!("GnaniStt: connecting to {}", url);[m
+[32m+[m
+[32m+[m[32m        let mut request_builder = Request::builder()[m
+[32m+[m[32m            .uri(&url)[m
+[32m+[m[32m            .header("Host", "api.vachana.ai")[m
+[32m+[m[32m            .header("x-api-key-id", &self.config.api_key)[m
+[32m+[m[32m            .header("lang_code", &self.config.language_code)[m
+[32m+[m[32m            .header("x-sample-rate", self.config.sample_rate.to_string())[m
+[32m+[m[32m            .header("x-format", &self.config.format)[m
+[32m+[m[32m            .header("Connection", "Upgrade")[m
+[32m+[m[32m            .header("Upgrade", "websocket")[m
+[32m+[m[32m            .header("Sec-WebSocket-Version", "13")[m
+[32m+[m[32m            .header([m
+[32m+[m[32m                "Sec-WebSocket-Key",[m
+[32m+[m[32m                tokio_tungstenite::tungstenite::handshake::client::generate_key(),[m
+[32m+[m[32m            );[m
+[32m+[m
+[32m+[m[32m        if self.config.itn_native_numerals {[m
+[32m+[m[32m            request_builder = request_builder.header("itn_native_numerals", "true");[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m        let request = match request_builder.body(()) {[m
+[32m+[m[32m            Ok(r) => r,[m
+[32m+[m[32m            Err(e) => {[m
+[32m+[m[32m                let _ = processor[m
+[32m+[m[32m                    .push_error(format!("GnaniStt: request build failed: {}", e), false)[m
+[32m+[m[32m                    .await;[m
+[32m+[m[32m                return;[m
+[32m+[m[32m            }[m
+[32m+[m[32m        };[m
+[32m+[m
+[32m+[m[32m        let ws_stream = match tokio_tungstenite::connect_async(request).await {[m
+[32m+[m[32m            Ok((stream, _)) => stream,[m
+[32m+[m[32m            Err(e) => {[m
+[32m+[m[32m                let _ = processor[m
+[32m+[m[32m                    .push_error(format!("GnaniStt: connect failed: {}", e), false)[m
+[32m+[m[32m                    .await;[m
+[32m+[m[32m                return;[m
+[32m+[m[32m            }[m
+[32m+[m[32m        };[m
+[32m+[m
+[32m+[m[32m        let (sink, stream) = ws_stream.split();[m
+[32m+[m[32m        let (ws_tx, ws_rx) = mpsc::channel::<Message>(64);[m
+[32m+[m
+[32m+[m[32m        let send_task    = tokio::spawn(run_send_task(sink, ws_rx));[m
+[32m+[m[32m        let lang_clone   = self.config.language_code.clone();[m
+[32m+[m[32m        let receive_task = tokio::spawn(run_receive_task(stream, processor, lang_clone));[m
+[32m+[m
+[32m+[m[32m        let mut state = self.state.lock().await;[m
+[32m+[m[32m        state.ws_tx        = Some(ws_tx);[m
+[32m+[m[32m        state.send_task    = Some(send_task);[m
+[32m+[m[32m        state.receive_task = Some(receive_task);[m
+[32m+[m
+[32m+[m[32m        log::info!("GnaniStt: connected");[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    async fn disconnect(&self) {[m
+[32m+[m[32m        let mut state = self.state.lock().await;[m
+[32m+[m[32m        if let Some(h) = state.receive_task.take() { h.abort(); }[m
+[32m+[m[32m        if let Some(h) = state.send_task.take()    { h.abort(); }[m
+[32m+[m[32m        state.ws_tx = None;[m
+[32m+[m[32m        state.audio_buffer.clear();[m
+[32m+[m[32m        log::info!("GnaniStt: disconnected");[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    /// Buffer audio into 1024-byte chunks and send as binary WS messages.[m
+[32m+[m[32m    async fn send_audio(&self, audio: &[u8]) {[m
+[32m+[m[32m        let mut state = self.state.lock().await;[m
+[32m+[m[32m        state.audio_buffer.extend_from_slice(audio);[m
+[32m+[m
+[32m+[m[32m        while state.audio_buffer.len() >= CHUNK_SIZE {[m
+[32m+[m[32m            let chunk: Vec<u8> = state.audio_buffer.drain(..CHUNK_SIZE).collect();[m
+[32m+[m[32m            if let Some(tx) = &state.ws_tx {[m
+[32m+[m[32m                let _ = tx.send(Message::Binary(chunk.into())).await;[m
+[32m+[m[32m            }[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    /// Send any remaining buffered audio (partial frame allowed on flush).[m
+[32m+[m[32m    async fn flush_audio(&self) {[m
+[32m+[m[32m        let mut state = self.state.lock().await;[m
+[32m+[m[32m        if !state.audio_buffer.is_empty() {[m
+[32m+[m[32m            let chunk: Vec<u8> = state.audio_buffer.drain(..).collect();[m
+[32m+[m[32m            if let Some(tx) = &state.ws_tx {[m
+[32m+[m[32m                let _ = tx.send(Message::Binary(chunk.into())).await;[m
+[32m+[m[32m            }[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m[32m// FrameHandler impl[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m
+[32m+[m[32m#[async_trait][m
+[32m+[m[32mimpl FrameHandler for GnaniSttHandler {[m
+[32m+[m[32m    async fn on_process_frame([m
+[32m+[m[32m        &self,[m
+[32m+[m[32m        processor: &FrameProcessor,[m
+[32m+[m[32m        frame: Frame,[m
+[32m+[m[32m        direction: FrameDirection,[m
+[32m+[m[32m    ) -> Result<()> {[m
+[32m+[m[32m        match &frame.inner {[m
+[32m+[m[32m            FrameInner::System(SystemFrame::Start(_)) => {[m
+[32m+[m[32m                processor.push_frame(frame, direction).await?;[m
+[32m+[m[32m                self.connect(processor.clone()).await;[m
+[32m+[m[32m            }[m
+[32m+[m
+[32m+[m[32m            FrameInner::System(SystemFrame::InputAudioRaw(ref audio)) => {[m
+[32m+[m[32m                processor.push_frame(frame.clone(), direction).await?;[m
+[32m+[m[32m                self.send_audio(&audio.audio).await;[m
+[32m+[m[32m            }[m
+[32m+[m
+[32m+[m[32m            FrameInner::System(SystemFrame::VADUserStoppedSpeaking { .. }) => {[m
+[32m+[m[32m                processor.push_frame(frame, direction).await?;[m
+[32m+[m[32m                self.flush_audio().await;[m
+[32m+[m[32m            }[m
+[32m+[m
+[32m+[m[32m            FrameInner::Control(ControlFrame::End { .. })[m
+[32m+[m[32m            | FrameInner::System(SystemFrame::Cancel { .. }) => {[m
+[32m+[m[32m                self.disconnect().await;[m
+[32m+[m[32m                processor.push_frame(frame, direction).await?;[m
+[32m+[m[32m            }[m
+[32m+[m
+[32m+[m[32m            _ => {[m
+[32m+[m[32m                processor.push_frame(frame, direction).await?;[m
+[32m+[m[32m            }[m
+[32m+[m[32m        }[m
+[32m+[m[32m        Ok(())[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    fn can_generate_metrics(&self) -> bool {[m
+[32m+[m[32m        true[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m[32m// Background tasks[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m
+[32m+[m[32mtype WsSink = futures::stream::SplitSink<[m
+[32m+[m[32m    tokio_tungstenite::WebSocketStream<[m
+[32m+[m[32m        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,[m
+[32m+[m[32m    >,[m
+[32m+[m[32m    Message,[m
+[32m+[m[32m>;[m
+[32m+[m
+[32m+[m[32mtype WsStream = futures::stream::SplitStream<[m
+[32m+[m[32m    tokio_tungstenite::WebSocketStream<[m
+[32m+[m[32m        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,[m
+[32m+[m[32m    >,[m
+[32m+[m[32m>;[m
+[32m+[m
+[32m+[m[32masync fn run_send_task(mut sink: WsSink, mut rx: mpsc::Receiver<Message>) {[m
+[32m+[m[32m    while let Some(msg) = rx.recv().await {[m
+[32m+[m[32m        if sink.send(msg).await.is_err() {[m
+[32m+[m[32m            log::warn!("GnaniStt: send failed — closing send task");[m
+[32m+[m[32m            break;[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m[32m    let _ = sink.close().await;[m
+[32m+[m[32m    log::debug!("GnaniStt: send task exited");[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync fn run_receive_task([m
+[32m+[m[32m    mut stream:          WsStream,[m
+[32m+[m[32m    processor:           FrameProcessor,[m
+[32m+[m[32m    language_fallback:   String,[m
+[32m+[m[32m) {[m
+[32m+[m[32m    log::debug!("GnaniStt: receive task started");[m
+[32m+[m
+[32m+[m[32m    while let Some(result) = stream.next().await {[m
+[32m+[m[32m        match result {[m
+[32m+[m[32m            Ok(Message::Text(text)) => {[m
+[32m+[m[32m                handle_message(text.as_str(), &processor, &language_fallback).await;[m
+[32m+[m[32m            }[m
+[32m+[m[32m            Ok(Message::Close(_)) => {[m
+[32m+[m[32m                log::info!("GnaniStt: server closed WebSocket");[m
+[32m+[m[32m                break;[m
+[32m+[m[32m            }[m
+[32m+[m[32m            Err(e) => {[m
+[32m+[m[32m                let _ = processor[m
+[32m+[m[32m                    .push_error(format!("GnaniStt: receive error: {}", e), false)[m
+[32m+[m[32m                    .await;[m
+[32m+[m[32m                break;[m
+[32m+[m[32m            }[m
+[32m+[m[32m            _ => {}[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    log::debug!("GnaniStt: receive task exited");[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync fn handle_message([m
+[32m+[m[32m    text:              &str,[m
+[32m+[m[32m    processor:         &FrameProcessor,[m
+[32m+[m[32m    language_fallback: &str,[m
+[32m+[m[32m) {[m
+[32m+[m[32m    log::debug!("GnaniStt: raw message: {}", text);[m
+[32m+[m
+[32m+[m[32m    let msg: GnaniMessage = match serde_json::from_str(text) {[m
+[32m+[m[32m        Ok(m) => m,[m
+[32m+[m[32m        Err(e) => {[m
+[32m+[m[32m            log::warn!("GnaniStt: parse error: {} — raw: {}", e, text);[m
+[32m+[m[32m            return;[m
+[32m+[m[32m        }[m
+[32m+[m[32m    };[m
+[32m+[m
+[32m+[m[32m    match msg.msg_type.as_str() {[m
+[32m+[m[32m        "connected" => {[m
+[32m+[m[32m            log::info!([m
+[32m+[m[32m                "GnaniStt: server connected — msg={:?} config={:?}",[m
+[32m+[m[32m                msg.message,[m
+[32m+[m[32m                msg.config[m
+[32m+[m[32m            );[m
+[32m+[m[32m        }[m
+[32m+[m[32m        "processing" => {[m
+[32m+[m[32m            log::debug!("GnaniStt: processing segment");[m
+[32m+[m[32m        }[m
+[32m+[m[32m        "transcript" => {[m
+[32m+[m[32m            if let Some(text) = msg.text {[m
+[32m+[m[32m                if !text.trim().is_empty() {[m
+[32m+[m[32m                    let mut frame_data = TranscriptionData::new(text, "", time_now_iso8601());[m
+[32m+[m[32m                    frame_data.language  = Some(language_fallback.to_string());[m
+[32m+[m[32m                    frame_data.finalized = true;[m
+[32m+[m
+[32m+[m[32m                    log::info!([m
+[32m+[m[32m                        "GnaniStt: transcript='{}' segment_index={:?} latency={:?}ms",[m
+[32m+[m[32m                        frame_data.text,[m
+[32m+[m[32m                        msg.segment_index,[m
+[32m+[m[32m                        msg.latency[m
+[32m+[m[32m                    );[m
+[32m+[m
+[32m+[m[32m                    let _ = processor[m
+[32m+[m[32m                        .push_frame(Frame::transcription(frame_data), FrameDirection::Downstream)[m
+[32m+[m[32m                        .await;[m
+[32m+[m[32m                }[m
+[32m+[m[32m            }[m
+[32m+[m[32m        }[m
+[32m+[m[32m        "error" => {[m
+[32m+[m[32m            let err_msg = msg.message.unwrap_or_else(|| "unknown server error".to_string());[m
+[32m+[m[32m            log::warn!("GnaniStt: server error: {}", err_msg);[m
+[32m+[m[32m            let _ = processor[m
+[32m+[m[32m                .push_error(format!("GnaniStt: server error: {}", err_msg), false)[m
+[32m+[m[32m                .await;[m
+[32m+[m[32m        }[m
+[32m+[m[32m        other => {[m
+[32m+[m[32m            log::debug!("GnaniStt: unknown message type: {}", other);[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m[32m// Helpers[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m
+[32m+[m[32mfn time_now_iso8601() -> String {[m
+[32m+[m[32m    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();[m
+[32m+[m[32m    format!("{}.{:03}", d.as_secs(), d.subsec_millis())[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m[32m// Tests[m
+[32m+[m[32m// ---------------------------------------------------------------------------[m
+[32m+[m
+[32m+[m[32m#[cfg(test)][m
+[32m+[m[32mmod tests {[m
+[32m+[m[32m    use super::*;[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn test_default_config() {[m
+[32m+[m[32m        let cfg = GnaniSttConfig::default();[m
+[32m+[m[32m        assert!(cfg.api_key.is_empty());[m
+[32m+[m[32m        assert_eq!(cfg.language_code, "en-IN");[m
+[32m+[m[32m        assert_eq!(cfg.sample_rate, 16_000);[m
+[32m+[m[32m        assert_eq!(cfg.format, "verbatim");[m
+[32m+[m[32m        assert!(!cfg.itn_native_numerals);[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn test_ws_url() {[m
+[32m+[m[32m        let cfg = GnaniSttConfig::default();[m
+[32m+[m[32m        assert_eq!(cfg.ws_url(), "wss://api.vachana.ai/stt/v3/stream");[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn test_config_with_itn() {[m
+[32m+[m[32m        let cfg = GnaniSttConfig {[m
+[32m+[m[32m            api_key: "test-key".to_string(),[m
+[32m+[m[32m            language_code: "hi-IN".to_string(),[m
+[32m+[m[32m            format: "transcribe".to_string(),[m
+[32m+[m[32m            itn_native_numerals: true,[m
+[32m+[m[32m            ..Default::default()[m
+[32m+[m[32m        };[m
+[32m+[m[32m        assert_eq!(cfg.language_code, "hi-IN");[m
+[32m+[m[32m        assert_eq!(cfg.format, "transcribe");[m
+[32m+[m[32m        assert!(cfg.itn_native_numerals);[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn test_handler_creation() {[m
+[32m+[m[32m        let handler = GnaniSttHandler::new(GnaniSttConfig {[m
+[32m+[m[32m            api_key: "test-key".to_string(),[m
+[32m+[m[32m            ..Default::default()[m
+[32m+[m[32m        });[m
+[32m+[m[32m        assert_eq!(handler.config.sample_rate, 16_000);[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn test_time_now_iso8601() {[m
+[32m+[m[32m        let ts = time_now_iso8601();[m
+[32m+[m[32m        assert!(!ts.is_empty());[m
+[32m+[m[32m        assert!(ts.contains('.'));[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[1mdiff --git a/src/services/stt/mod.rs b/src/services/stt/mod.rs[m
+[1mindex 9879c90..e33a491 100644[m
+[1m--- a/src/services/stt/mod.rs[m
+[1m+++ b/src/services/stt/mod.rs[m
+[36m@@ -1,3 +1,5 @@[m
+[32m+[m[32mpub mod gnani;[m
+ pub mod sarvam;[m
+ [m
+[32m+[m[32mpub use gnani::{GnaniSttConfig, GnaniSttHandler};[m
+ pub use sarvam::{SarvamSttConfig, SarvamSttHandler};[m
