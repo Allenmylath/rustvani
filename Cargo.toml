@@ -31,9 +31,8 @@ transport-websocket = ["dep:axum", "dep:tower-http", "dep:tokio-tungstenite"]
 # Services
 stt-sarvam = ["dep:reqwest"]
 stt-60db = ["dep:tokio-tungstenite"]
+stt-gnani = ["dep:tokio-tungstenite"]
 llm-openai = ["dep:reqwest"]
-tts-deepgram = ["dep:tokio-tungstenite"]
-tts-sarvam = ["dep:tokio-tungstenite"]
 
 # Dhara conversation flow system
 dhara = ["dep:thiserror"]
