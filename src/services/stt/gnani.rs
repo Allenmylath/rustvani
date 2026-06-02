@@ -110,7 +110,7 @@ struct GnaniMessage {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
-    audio_duration_ms: Option<u64>,
+    audio_duration_ms: Option<f64>,
     #[serde(default)]
     segment_id: Option<String>,
     #[serde(default)]

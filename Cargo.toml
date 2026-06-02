@@ -20,7 +20,7 @@ exclude = [
 # Features
 # ---------------------------------------------------------------------------
 [features]
-default = ["vad-silero", "transport-websocket", "stt-sarvam", "stt-60db", "llm-openai", "tts-deepgram", "dhara"]
+default = ["vad-silero", "transport-websocket", "stt-sarvam", "stt-60db", "llm-openai", "tts-deepgram", "dhara", "db-postgres"]
 
 # Core VAD
 vad-silero = ["dep:ort", "dep:ndarray"]
@@ -33,6 +33,9 @@ stt-sarvam = ["dep:reqwest"]
 stt-60db = ["dep:tokio-tungstenite"]
 stt-gnani = ["dep:tokio-tungstenite"]
 llm-openai = ["dep:reqwest"]
+tts-deepgram = ["dep:tokio-tungstenite"]
+tts-sarvam = ["dep:tokio-tungstenite"]
+tts-piper = ["dep:ort"]
 
 # Dhara conversation flow system
 dhara = ["dep:thiserror"]
