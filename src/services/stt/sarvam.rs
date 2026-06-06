@@ -28,11 +28,13 @@
 //! Lang: language-code param (hyphen, not underscore)
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log;
 use serde::Deserialize;
@@ -42,6 +44,7 @@ use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::audio_process::noisefilter::RNNoiseFilter;
+use crate::billing::{BillingCollector, BillingEvent};
 use crate::error::Result;
 use crate::frames::{
     ControlFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,
@@ -217,6 +220,10 @@ pub struct SarvamSttHandler {
     state:  Arc<Mutex<SarvamSttState>>,
     /// Noise filter shared with the receive task (for reset on transcript).
     noise_filter: Option<Arc<Mutex<RNNoiseFilter>>>,
+    /// Optional billing collector — records audio duration per transcript.
+    billing: Option<Arc<dyn BillingCollector>>,
+    /// Accumulated raw PCM bytes sent to Sarvam since last transcript.
+    audio_bytes: Arc<AtomicU64>,
 }
 
 impl SarvamSttHandler {
@@ -235,7 +242,14 @@ impl SarvamSttHandler {
             config,
             state: Arc::new(Mutex::new(SarvamSttState::new())),
             noise_filter,
+            billing: None,
+            audio_bytes: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn with_billing(mut self, billing: Arc<dyn BillingCollector>) -> Self {
+        self.billing = Some(billing);
+        self
     }
 
     pub fn into_processor(self) -> FrameProcessor {
@@ -293,7 +307,12 @@ impl SarvamSttHandler {
         let send_task    = tokio::spawn(run_send_task(sink, ws_rx));
         let lang_fb      = self.config.language.clone();
         let nf_clone     = self.noise_filter.clone();
-        let receive_task = tokio::spawn(run_receive_task(stream, processor, lang_fb, nf_clone));
+        let billing      = self.billing.clone();
+        let audio_bytes  = self.audio_bytes.clone();
+        let sample_rate  = self.config.sample_rate;
+        let receive_task = tokio::spawn(run_receive_task(
+            stream, processor, lang_fb, nf_clone, billing, audio_bytes, sample_rate,
+        ));
 
         let mut state     = self.state.lock().await;
         state.ws_tx        = Some(ws_tx);
@@ -321,6 +340,7 @@ impl SarvamSttHandler {
     /// Send audio per AsyncAPI spec:
     /// {"audio": {"data": <base64>, "sample_rate": "<rate>", "encoding": "audio/wav"}}
     async fn send_audio(&self, audio: &[u8]) {
+        self.audio_bytes.fetch_add(audio.len() as u64, Ordering::Relaxed);
         let msg = serde_json::json!({
             "audio": {
                 "data":        BASE64.encode(audio),
@@ -454,6 +474,9 @@ async fn run_receive_task(
     processor:           FrameProcessor,
     language_fallback:   Option<String>,
     noise_filter:        Option<Arc<Mutex<RNNoiseFilter>>>,
+    billing:             Option<Arc<dyn BillingCollector>>,
+    audio_bytes:         Arc<AtomicU64>,
+    sample_rate:         u32,
 ) {
     log::debug!("SarvamStt: receive task started");
 
@@ -465,6 +488,9 @@ async fn run_receive_task(
                     &processor,
                     &language_fallback,
                     &noise_filter,
+                    &billing,
+                    &audio_bytes,
+                    sample_rate,
                 )
                 .await;
             }
@@ -490,6 +516,9 @@ async fn handle_message(
     processor:         &FrameProcessor,
     language_fallback: &Option<String>,
     noise_filter:      &Option<Arc<Mutex<RNNoiseFilter>>>,
+    billing:           &Option<Arc<dyn BillingCollector>>,
+    audio_bytes:       &Arc<AtomicU64>,
+    sample_rate:       u32,
 ) {
     log::debug!("SarvamStt: raw message: {}", text);
 
@@ -503,7 +532,7 @@ async fn handle_message(
 
     match msg.msg_type.as_str() {
         "data" => {
-            handle_transcript(msg.data, processor, language_fallback, noise_filter).await;
+            handle_transcript(msg.data, processor, language_fallback, noise_filter, billing, audio_bytes, sample_rate).await;
         }
         "events" => {
             if let Some(data) = msg.data {
@@ -532,6 +561,9 @@ async fn handle_transcript(
     processor:         &FrameProcessor,
     language_fallback: &Option<String>,
     noise_filter:      &Option<Arc<Mutex<RNNoiseFilter>>>,
+    billing:           &Option<Arc<dyn BillingCollector>>,
+    audio_bytes:       &Arc<AtomicU64>,
+    sample_rate:       u32,
 ) {
     let data = match data {
         Some(d) => d,
@@ -547,6 +579,21 @@ async fn handle_transcript(
         Some(s) if !s.trim().is_empty() => s,
         _ => return,
     };
+
+    // Swap the byte counter to zero and emit a billing event for this utterance.
+    // PCM i16 LE: 2 bytes per sample, mono → duration_ms = bytes / 2 / sample_rate * 1000
+    let bytes = audio_bytes.swap(0, Ordering::Relaxed);
+    if bytes > 0 {
+        if let Some(bc) = billing {
+            let duration_ms = (bytes as f64) / (2.0 * sample_rate as f64) * 1000.0;
+            bc.record(BillingEvent::SttUsage {
+                session_id:        bc.session_id(),
+                provider:          "sarvam".to_string(),
+                audio_duration_ms: duration_ms,
+                occurred_at:       Utc::now(),
+            });
+        }
+    }
 
     let language = t.language_code.or_else(|| language_fallback.clone());
 
@@ -586,4 +633,184 @@ fn urlencoding(s: &str) -> String {
             _ => format!("%{:02X}", c as u32).chars().collect(),
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::billing::{BillingCollector, BillingEvent, NoopBillingCollector};
+
+    // ---- Duration formula ---------------------------------------------------
+
+    #[test]
+    fn audio_duration_formula_16khz_1000ms() {
+        // 16000 samples/s × 2 bytes/sample = 32000 bytes → 1000 ms
+        let bytes: u64 = 32_000;
+        let sample_rate: u32 = 16_000;
+        let ms = (bytes as f64) / (2.0 * sample_rate as f64) * 1000.0;
+        assert!((ms - 1000.0).abs() < 0.001, "expected 1000ms, got {ms}");
+    }
+
+    #[test]
+    fn audio_duration_formula_8khz_500ms() {
+        // 8000 samples/s × 2 bytes × 0.5s = 8000 bytes → 500 ms
+        let bytes: u64 = 8_000;
+        let sample_rate: u32 = 8_000;
+        let ms = (bytes as f64) / (2.0 * sample_rate as f64) * 1000.0;
+        assert!((ms - 500.0).abs() < 0.001, "expected 500ms, got {ms}");
+    }
+
+    #[test]
+    fn audio_duration_formula_24khz_250ms() {
+        // 24000 samples/s × 2 bytes × 0.25s = 12000 bytes → 250ms
+        let bytes: u64 = 12_000;
+        let sample_rate: u32 = 24_000;
+        let ms = (bytes as f64) / (2.0 * sample_rate as f64) * 1000.0;
+        assert!((ms - 250.0).abs() < 0.001, "expected 250ms, got {ms}");
+    }
+
+    // ---- AtomicU64 counter --------------------------------------------------
+
+    #[test]
+    fn audio_bytes_atomic_increments_and_swap_resets() {
+        let counter = Arc::new(AtomicU64::new(0));
+        counter.fetch_add(1024, Ordering::Relaxed);
+        counter.fetch_add(2048, Ordering::Relaxed);
+        let total = counter.swap(0, Ordering::Relaxed);
+        assert_eq!(total, 3072);
+        assert_eq!(counter.load(Ordering::Relaxed), 0, "counter must be zero after swap");
+    }
+
+    // ---- with_billing builder -----------------------------------------------
+
+    #[test]
+    fn with_billing_sets_field() {
+        let h = SarvamSttHandler::new(SarvamSttConfig {
+            noise_reduction: false,
+            ..Default::default()
+        }).with_billing(Arc::new(NoopBillingCollector));
+        assert!(h.billing.is_some());
+    }
+
+    // ---- handle_transcript billing integration ------------------------------
+
+    struct MockCollector {
+        session_id: uuid::Uuid,
+        events: std::sync::Mutex<Vec<BillingEvent>>,
+    }
+    impl MockCollector {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                session_id: uuid::Uuid::new_v4(),
+                events: std::sync::Mutex::new(vec![]),
+            })
+        }
+        fn events(&self) -> Vec<BillingEvent> { self.events.lock().unwrap().clone() }
+    }
+    impl BillingCollector for MockCollector {
+        fn record(&self, e: BillingEvent) { self.events.lock().unwrap().push(e); }
+        fn session_id(&self) -> uuid::Uuid { self.session_id }
+    }
+
+    fn dummy_proc() -> FrameProcessor {
+        FrameProcessor::new("test", Box::new(crate::frames::PassthroughHandler), false)
+    }
+
+    #[tokio::test]
+    async fn billing_transcript_emits_stt_usage_with_correct_duration() {
+        // 16kHz, 32000 bytes = 1000ms
+        let audio_bytes = Arc::new(AtomicU64::new(32_000));
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
+        let data    = serde_json::json!({ "transcript": "hello world", "language_code": "en-IN" });
+
+        handle_transcript(Some(data), &dummy_proc(), &None, &None, &billing, &audio_bytes, 16_000).await;
+
+        let evs = mock.events();
+        assert_eq!(evs.len(), 1, "expected exactly one SttUsage event");
+        match &evs[0] {
+            BillingEvent::SttUsage { provider, audio_duration_ms, .. } => {
+                assert_eq!(provider, "sarvam");
+                assert!((audio_duration_ms - 1000.0).abs() < 0.001, "expected 1000ms, got {audio_duration_ms}");
+            }
+            other => panic!("expected SttUsage, got {:?}", other),
+        }
+        // Counter swapped to zero
+        assert_eq!(audio_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn billing_transcript_with_zero_bytes_emits_no_event() {
+        let audio_bytes = Arc::new(AtomicU64::new(0));
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
+        let data    = serde_json::json!({ "transcript": "hello", "language_code": "en-IN" });
+
+        handle_transcript(Some(data), &dummy_proc(), &None, &None, &billing, &audio_bytes, 16_000).await;
+        assert_eq!(mock.events().len(), 0, "zero bytes must not emit billing event");
+    }
+
+    #[tokio::test]
+    async fn billing_no_collector_transcript_does_not_panic() {
+        let audio_bytes = Arc::new(AtomicU64::new(16_000));
+        let billing: Option<Arc<dyn BillingCollector>> = None;
+        let data    = serde_json::json!({ "transcript": "hello", "language_code": "en-IN" });
+
+        handle_transcript(Some(data), &dummy_proc(), &None, &None, &billing, &audio_bytes, 16_000).await;
+        // no panic; counter still reset
+        assert_eq!(audio_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn billing_transcript_counter_resets_per_utterance() {
+        let audio_bytes = Arc::new(AtomicU64::new(32_000)); // 1st utterance: 1000ms
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
+        let data1   = serde_json::json!({ "transcript": "first", "language_code": "en-IN" });
+        handle_transcript(Some(data1), &dummy_proc(), &None, &None, &billing, &audio_bytes, 16_000).await;
+
+        // Simulate second utterance
+        audio_bytes.fetch_add(16_000, Ordering::Relaxed); // 500ms
+        let data2 = serde_json::json!({ "transcript": "second", "language_code": "en-IN" });
+        handle_transcript(Some(data2), &dummy_proc(), &None, &None, &billing, &audio_bytes, 16_000).await;
+
+        let evs = mock.events();
+        assert_eq!(evs.len(), 2);
+        let durations: Vec<f64> = evs.iter().filter_map(|e| match e {
+            BillingEvent::SttUsage { audio_duration_ms, .. } => Some(*audio_duration_ms),
+            _ => None,
+        }).collect();
+        assert!((durations[0] - 1000.0).abs() < 0.001, "1st utterance: {}", durations[0]);
+        assert!((durations[1] -  500.0).abs() < 0.001, "2nd utterance: {}", durations[1]);
+    }
+
+    // ---- Config / URL helpers -----------------------------------------------
+
+    #[test]
+    fn ws_url_contains_model_and_sample_rate() {
+        let cfg = SarvamSttConfig::default();
+        let url = cfg.ws_url();
+        assert!(url.contains("saaras"), "model missing: {url}");
+        assert!(url.contains("16000"), "sample_rate missing: {url}");
+        assert!(url.contains("flush_signal=true"), "flush_signal missing: {url}");
+    }
+
+    #[test]
+    fn ws_url_translate_model_uses_translate_path() {
+        let cfg = SarvamSttConfig {
+            model: "saaras:v2.5".into(),
+            ..Default::default()
+        };
+        assert!(cfg.ws_url().contains("speech-to-text-translate"));
+    }
+
+    #[test]
+    fn urlencoding_handles_special_chars() {
+        assert_eq!(urlencoding("saaras:v3"), "saaras%3Av3");
+        assert_eq!(urlencoding("en-IN"), "en-IN");
+    }
 }

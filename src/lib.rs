@@ -2,6 +2,7 @@
 // Core modules (always available)
 // ---------------------------------------------------------------------------
 pub mod agents;
+pub mod billing;
 pub mod clock;
 pub mod context;
 pub mod error;
@@ -41,6 +42,9 @@ pub mod tools;
 // ---------------------------------------------------------------------------
 // Core re-exports (always available)
 // ---------------------------------------------------------------------------
+pub use billing::{BillingCollector, BillingEvent, LogBillingStorage, NoopBillingCollector, SessionBilling};
+#[cfg(feature = "db-postgres")]
+pub use billing::PostgresBillingStorage;
 pub use clock::{BaseClock, SystemClock, system_clock};
 pub use error::{PipecatError, Result};
 pub use frames::{

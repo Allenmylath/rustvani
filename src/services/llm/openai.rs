@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::StreamExt;
 use log;
 use reqwest::Client;
@@ -29,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapters::base::LLMAdapter;
 use crate::adapters::openai::OpenAILLMAdapter;
+use crate::billing::{BillingCollector, BillingEvent};
 use crate::context::{LLMContext, ToolCall};
 use crate::error::{PipecatError, Result};
 use crate::frames::{
@@ -115,6 +117,11 @@ impl Default for OpenAILLMConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<Value>,
@@ -137,12 +144,13 @@ struct ChatRequest {
     tools: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
 }
 
 #[derive(Deserialize)]
 struct ChatChunk {
     choices: Vec<ChunkChoice>,
-    #[allow(dead_code)]
     usage: Option<Value>,
 }
 
@@ -215,6 +223,8 @@ pub struct OpenAILLMHandler {
     tools: Vec<Arc<dyn BuiltinTool>>,
     /// Cancellation token — cancelled on CancelFrame, cascades to all tools.
     cancel_token: CancellationToken,
+    /// Optional billing collector — records LLM token usage per inference call.
+    billing: Option<Arc<dyn BillingCollector>>,
 }
 
 impl OpenAILLMHandler {
@@ -228,6 +238,7 @@ impl OpenAILLMHandler {
             transition_hook: Arc::new(RwLock::new(None)),
             tools: Vec::new(),
             cancel_token: CancellationToken::new(),
+            billing: None,
         }
     }
 
@@ -241,6 +252,7 @@ impl OpenAILLMHandler {
             transition_hook: Arc::new(RwLock::new(None)),
             tools: Vec::new(),
             cancel_token: CancellationToken::new(),
+            billing: None,
         }
     }
 
@@ -260,7 +272,14 @@ impl OpenAILLMHandler {
             transition_hook: Arc::new(RwLock::new(None)),
             tools: Vec::new(),
             cancel_token: CancellationToken::new(),
+            billing: None,
         }
+    }
+
+    /// Attach a billing collector to record token usage per LLM call.
+    pub fn with_billing(mut self, billing: Arc<dyn BillingCollector>) -> Self {
+        self.billing = Some(billing);
+        self
     }
 
     
@@ -394,6 +413,12 @@ impl OpenAILLMHandler {
             service_tier: self.config.service_tier.clone(),
             tools,
             tool_choice,
+            // Request usage counts in the final streaming chunk.
+            stream_options: if self.billing.is_some() {
+                Some(StreamOptions { include_usage: true })
+            } else {
+                None
+            },
         };
 
         let response = self.client
@@ -416,6 +441,7 @@ impl OpenAILLMHandler {
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
         let mut tool_accum: HashMap<u32, PartialToolCall> = HashMap::new();
+        let mut last_usage: Option<(u32, u32)> = None;
 
         'outer: while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| {
@@ -443,6 +469,15 @@ impl OpenAILLMHandler {
 
                 match serde_json::from_str::<ChatChunk>(data) {
                     Ok(chunk) => {
+                        // Capture token usage from the final usage-only chunk
+                        // (sent when stream_options.include_usage = true).
+                        if let Some(u) = &chunk.usage {
+                            let inp = u["prompt_tokens"    ].as_u64().unwrap_or(0) as u32;
+                            let out = u["completion_tokens"].as_u64().unwrap_or(0) as u32;
+                            if inp + out > 0 {
+                                last_usage = Some((inp, out));
+                            }
+                        }
                         if let Some(choice) = chunk.choices.first() {
                             if let Some(content) = &choice.delta.content {
                                 if !content.is_empty() {
@@ -479,6 +514,26 @@ impl OpenAILLMHandler {
                     Err(e) => {
                         log::warn!("OpenAILLM: chunk parse error: {} — raw: {}", e, data);
                     }
+                }
+            }
+        }
+
+        // Emit billing event with real token counts if available.
+        if let Some(bc) = &self.billing {
+            match last_usage {
+                Some((inp, out)) => {
+                    bc.record(BillingEvent::LlmUsage {
+                        session_id:    bc.session_id(),
+                        provider:      "openai".to_string(),
+                        model:         self.config.model.clone(),
+                        input_tokens:  inp,
+                        output_tokens: out,
+                        estimated:     false,
+                        occurred_at:   Utc::now(),
+                    });
+                }
+                None => {
+                    log::debug!("OpenAILLM: no usage data in stream (billing not recorded)");
                 }
             }
         }

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log;
 use serde::Deserialize;
@@ -31,6 +32,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::billing::{BillingCollector, BillingEvent};
 use crate::error::Result;
 use crate::frames::{
     ControlFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,
@@ -149,16 +151,24 @@ impl GnaniSttState {
 // ---------------------------------------------------------------------------
 
 pub struct GnaniSttHandler {
-    config: GnaniSttConfig,
-    state:  Arc<Mutex<GnaniSttState>>,
+    config:  GnaniSttConfig,
+    state:   Arc<Mutex<GnaniSttState>>,
+    /// Optional billing collector — records audio duration per transcript.
+    billing: Option<Arc<dyn BillingCollector>>,
 }
 
 impl GnaniSttHandler {
     pub fn new(config: GnaniSttConfig) -> Self {
         Self {
             config,
-            state: Arc::new(Mutex::new(GnaniSttState::new())),
+            state:   Arc::new(Mutex::new(GnaniSttState::new())),
+            billing: None,
         }
+    }
+
+    pub fn with_billing(mut self, billing: Arc<dyn BillingCollector>) -> Self {
+        self.billing = Some(billing);
+        self
     }
 
     pub fn into_processor(self) -> FrameProcessor {
@@ -219,7 +229,9 @@ impl GnaniSttHandler {
 
         let send_task    = tokio::spawn(run_send_task(sink, ws_rx));
         let lang_clone   = self.config.language_code.clone();
-        let receive_task = tokio::spawn(run_receive_task(stream, processor, lang_clone));
+        let receive_task = tokio::spawn(run_receive_task(
+            stream, processor, lang_clone, self.billing.clone(),
+        ));
 
         let mut state = self.state.lock().await;
         state.ws_tx        = Some(ws_tx);
@@ -338,16 +350,17 @@ async fn run_send_task(mut sink: WsSink, mut rx: mpsc::Receiver<Message>) {
 }
 
 async fn run_receive_task(
-    mut stream:          WsStream,
-    processor:           FrameProcessor,
-    language_fallback:   String,
+    mut stream:        WsStream,
+    processor:         FrameProcessor,
+    language_fallback: String,
+    billing:           Option<Arc<dyn BillingCollector>>,
 ) {
     log::debug!("GnaniStt: receive task started");
 
     while let Some(result) = stream.next().await {
         match result {
             Ok(Message::Text(text)) => {
-                handle_message(text.as_str(), &processor, &language_fallback).await;
+                handle_message(text.as_str(), &processor, &language_fallback, &billing).await;
             }
             Ok(Message::Close(_)) => {
                 log::info!("GnaniStt: server closed WebSocket");
@@ -370,6 +383,7 @@ async fn handle_message(
     text:              &str,
     processor:         &FrameProcessor,
     language_fallback: &str,
+    billing:           &Option<Arc<dyn BillingCollector>>,
 ) {
     log::debug!("GnaniStt: raw message: {}", text);
 
@@ -393,6 +407,19 @@ async fn handle_message(
             log::debug!("GnaniStt: processing segment");
         }
         "transcript" => {
+            // Emit billing event for the audio duration this utterance covered.
+            if let Some(ms) = msg.audio_duration_ms {
+                if ms > 0.0 {
+                    if let Some(bc) = billing {
+                        bc.record(BillingEvent::SttUsage {
+                            session_id:        bc.session_id(),
+                            provider:          "gnani".to_string(),
+                            audio_duration_ms: ms,
+                            occurred_at:       Utc::now(),
+                        });
+                    }
+                }
+            }
             if let Some(text) = msg.text {
                 if !text.trim().is_empty() {
                     let mut frame_data = TranscriptionData::new(text, "", time_now_iso8601());
@@ -486,5 +513,94 @@ mod tests {
         let ts = time_now_iso8601();
         assert!(!ts.is_empty());
         assert!(ts.contains('.'));
+    }
+
+    // ---- Billing tests -------------------------------------------------------
+
+    struct MockCollector {
+        session_id: uuid::Uuid,
+        events: std::sync::Mutex<Vec<BillingEvent>>,
+    }
+    impl MockCollector {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                session_id: uuid::Uuid::new_v4(),
+                events: std::sync::Mutex::new(vec![]),
+            })
+        }
+        fn events(&self) -> Vec<BillingEvent> { self.events.lock().unwrap().clone() }
+    }
+    impl BillingCollector for MockCollector {
+        fn record(&self, e: BillingEvent) { self.events.lock().unwrap().push(e); }
+        fn session_id(&self) -> uuid::Uuid { self.session_id }
+    }
+
+    fn dummy_proc() -> FrameProcessor {
+        FrameProcessor::new("test", Box::new(crate::frames::PassthroughHandler), false)
+    }
+
+    #[tokio::test]
+    async fn billing_transcript_with_duration_emits_stt_usage() {
+        let json = r#"{"type":"transcript","text":"hello world","audio_duration_ms":2500.0}"#;
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
+
+        handle_message(json, &dummy_proc(), "en-IN", &billing).await;
+
+        let evs = mock.events();
+        assert_eq!(evs.len(), 1, "expected exactly one SttUsage event");
+        match &evs[0] {
+            BillingEvent::SttUsage { provider, audio_duration_ms, .. } => {
+                assert_eq!(provider, "gnani");
+                assert!((audio_duration_ms - 2500.0).abs() < 0.001);
+            }
+            other => panic!("expected SttUsage, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn billing_transcript_without_duration_emits_no_billing() {
+        let json = r#"{"type":"transcript","text":"hello"}"#;
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
+
+        handle_message(json, &dummy_proc(), "en-IN", &billing).await;
+        assert_eq!(mock.events().len(), 0, "missing duration must not produce billing event");
+    }
+
+    #[tokio::test]
+    async fn billing_transcript_with_zero_duration_emits_no_billing() {
+        let json = r#"{"type":"transcript","text":"hello","audio_duration_ms":0.0}"#;
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
+
+        handle_message(json, &dummy_proc(), "en-IN", &billing).await;
+        assert_eq!(mock.events().len(), 0, "zero-duration transcript must not produce billing event");
+    }
+
+    #[tokio::test]
+    async fn billing_non_transcript_message_emits_no_event() {
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
+        let proc    = dummy_proc();
+
+        handle_message(r#"{"type":"processing"}"#, &proc, "en-IN", &billing).await;
+        handle_message(r#"{"type":"connected"}"#,  &proc, "en-IN", &billing).await;
+        assert_eq!(mock.events().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn billing_no_collector_transcript_does_not_panic() {
+        let json    = r#"{"type":"transcript","text":"hello","audio_duration_ms":1000.0}"#;
+        let billing: Option<Arc<dyn BillingCollector>> = None;
+        handle_message(json, &dummy_proc(), "en-IN", &billing).await; // must not panic
+    }
+
+    #[test]
+    fn with_billing_sets_field() {
+        use crate::billing::NoopBillingCollector;
+        let h = GnaniSttHandler::new(GnaniSttConfig::default())
+            .with_billing(Arc::new(NoopBillingCollector));
+        assert!(h.billing.is_some());
     }
 }

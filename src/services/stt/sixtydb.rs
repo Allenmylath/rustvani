@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log;
 use base64::Engine as _;
@@ -22,6 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::audio_process::resamplers::{ResamplerQuality, StreamResampler};
+use crate::billing::{BillingCollector, BillingEvent};
 use crate::error::Result;
 use crate::frames::{
     ControlFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,
@@ -133,18 +135,26 @@ impl Default for SixtyDbSttState {
 // ---------------------------------------------------------------------------
 
 pub struct SixtyDbSttHandler {
-    config: SixtyDbSttConfig,
-    state: Arc<Mutex<SixtyDbSttState>>,
+    config:    SixtyDbSttConfig,
+    state:     Arc<Mutex<SixtyDbSttState>>,
     resampler: Mutex<Option<StreamResampler>>,
+    /// Optional billing collector — records audio duration from server billing_summary.
+    billing:   Option<Arc<dyn BillingCollector>>,
 }
 
 impl SixtyDbSttHandler {
     pub fn new(config: SixtyDbSttConfig) -> Self {
         Self {
             config,
-            state: Arc::new(Mutex::new(SixtyDbSttState::default())),
+            state:     Arc::new(Mutex::new(SixtyDbSttState::default())),
             resampler: Mutex::new(None),
+            billing:   None,
         }
+    }
+
+    pub fn with_billing(mut self, billing: Arc<dyn BillingCollector>) -> Self {
+        self.billing = Some(billing);
+        self
     }
 
     pub fn into_processor(self) -> FrameProcessor {
@@ -173,6 +183,7 @@ impl SixtyDbSttHandler {
             stream,
             processor,
             self.config.clone(),
+            self.billing.clone(),
             self.state.clone(),
         ));
 
@@ -326,15 +337,18 @@ async fn run_send_task(mut sink: WsSink, mut rx: mpsc::Receiver<Message>) {
 }
 
 async fn run_receive_task(
-    mut stream: WsStream,
-    processor: FrameProcessor,
-    config: SixtyDbSttConfig,
+    mut stream:   WsStream,
+    processor:    FrameProcessor,
+    config:       SixtyDbSttConfig,
+    billing:      Option<Arc<dyn BillingCollector>>,
     shared_state: Arc<Mutex<SixtyDbSttState>>,
 ) {
     while let Some(result) = stream.next().await {
         match result {
             Ok(Message::Text(text)) => {
-                handle_text_message(text.as_str(), &processor, &config, &shared_state).await;
+                handle_text_message(
+                    text.as_str(), &processor, &config, &shared_state, &billing,
+                ).await;
             }
             Ok(Message::Close(_)) => {
                 log::info!("SixtyDbStt: server closed WebSocket");
@@ -350,10 +364,11 @@ async fn run_receive_task(
 }
 
 async fn handle_text_message(
-    text: &str,
-    processor: &FrameProcessor,
-    config: &SixtyDbSttConfig,
+    text:         &str,
+    processor:    &FrameProcessor,
+    config:       &SixtyDbSttConfig,
     shared_state: &Arc<Mutex<SixtyDbSttState>>,
+    billing:      &Option<Arc<dyn BillingCollector>>,
 ) {
     let val: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -414,7 +429,21 @@ async fn handle_text_message(
 
         "session_stopped" => {
             if let Some(summary) = obj.get("billing_summary") {
-                log::info!("SixtyDbStt: billing_summary: {}", summary);
+                let duration_ms = summary
+                    .get("duration_ms")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                log::info!("SixtyDbStt: billing_summary duration_ms={:.0}", duration_ms);
+                if duration_ms > 0.0 {
+                    if let Some(bc) = billing {
+                        bc.record(BillingEvent::SttUsage {
+                            session_id:        bc.session_id(),
+                            provider:          "sixtydb".to_string(),
+                            audio_duration_ms: duration_ms,
+                            occurred_at:       Utc::now(),
+                        });
+                    }
+                }
             }
         }
 
@@ -576,5 +605,106 @@ mod tests {
         let audio_data = AudioRawData::new(i16_to_bytes(&vec![1000i16; 100]), 16_000, 1);
         let frame = Frame::input_audio_raw(audio_data);
         handler.on_process_frame(&proc, frame, FrameDirection::Downstream).await.unwrap();
+    }
+
+    // ---- Billing tests -------------------------------------------------------
+
+    struct MockCollector {
+        session_id: uuid::Uuid,
+        events: std::sync::Mutex<Vec<BillingEvent>>,
+    }
+    impl MockCollector {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                session_id: uuid::Uuid::new_v4(),
+                events: std::sync::Mutex::new(vec![]),
+            })
+        }
+        fn events(&self) -> Vec<BillingEvent> { self.events.lock().unwrap().clone() }
+    }
+    impl BillingCollector for MockCollector {
+        fn record(&self, e: BillingEvent) { self.events.lock().unwrap().push(e); }
+        fn session_id(&self) -> uuid::Uuid { self.session_id }
+    }
+
+    fn new_state() -> Arc<Mutex<SixtyDbSttState>> {
+        Arc::new(Mutex::new(SixtyDbSttState::default()))
+    }
+
+    #[tokio::test]
+    async fn billing_session_stopped_with_duration_emits_stt_usage() {
+        let json = r#"{"type":"session_stopped","billing_summary":{"duration_ms":4200.0}}"#;
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
+        let proc    = started_processor().await;
+
+        handle_text_message(json, &proc, &default_config(), &new_state(), &billing).await;
+
+        let evs = mock.events();
+        assert_eq!(evs.len(), 1, "expected exactly one SttUsage event");
+        match &evs[0] {
+            BillingEvent::SttUsage { provider, audio_duration_ms, .. } => {
+                assert_eq!(provider, "sixtydb");
+                assert!((audio_duration_ms - 4200.0).abs() < 0.001);
+            }
+            other => panic!("expected SttUsage, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn billing_session_stopped_with_zero_duration_emits_no_event() {
+        let json = r#"{"type":"session_stopped","billing_summary":{"duration_ms":0.0}}"#;
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
+        let proc    = started_processor().await;
+
+        handle_text_message(json, &proc, &default_config(), &new_state(), &billing).await;
+        assert_eq!(mock.events().len(), 0, "zero duration must not emit billing event");
+    }
+
+    #[tokio::test]
+    async fn billing_session_stopped_without_billing_summary_emits_no_event() {
+        let json = r#"{"type":"session_stopped"}"#;
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
+        let proc    = started_processor().await;
+
+        handle_text_message(json, &proc, &default_config(), &new_state(), &billing).await;
+        assert_eq!(mock.events().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn billing_non_session_stopped_messages_emit_no_event() {
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
+        let proc    = started_processor().await;
+        let cfg     = default_config();
+        let state   = new_state();
+
+        for json in &[
+            r#"{"type":"transcription","text":"hello"}"#,
+            r#"{"type":"speech_started"}"#,
+            r#"{"type":"connected"}"#,
+        ] {
+            handle_text_message(json, &proc, &cfg, &state, &billing).await;
+        }
+        assert_eq!(mock.events().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn billing_no_collector_session_stopped_does_not_panic() {
+        let json    = r#"{"type":"session_stopped","billing_summary":{"duration_ms":1000.0}}"#;
+        let billing: Option<Arc<dyn BillingCollector>> = None;
+        let proc    = started_processor().await;
+
+        handle_text_message(json, &proc, &default_config(), &new_state(), &billing).await;
+    }
+
+    #[test]
+    fn with_billing_sets_field() {
+        use crate::billing::NoopBillingCollector;
+        let h = SixtyDbSttHandler::new(SixtyDbSttConfig::default())
+            .with_billing(Arc::new(NoopBillingCollector));
+        assert!(h.billing.is_some());
     }
 }
