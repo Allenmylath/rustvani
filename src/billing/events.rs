@@ -4,6 +4,39 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Speaker role in a transcript entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptRole {
+    User,
+    Assistant,
+}
+
+impl TranscriptRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::User      => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+/// A single conversational turn captured for the session transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptEntry {
+    pub turn_id:     Uuid,
+    pub session_id:  Uuid,
+    pub role:        TranscriptRole,
+    /// Full text of what was said. For assistant turns that were cut short,
+    /// this is the partial text that was actually spoken to the user.
+    pub text:        String,
+    /// ISO language code from STT, present on user turns only.
+    pub language:    Option<String>,
+    /// `true` when the bot was interrupted mid-response.
+    pub interrupted: bool,
+    pub occurred_at: DateTime<Utc>,
+}
+
 /// A single billable occurrence emitted by a service handler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -42,6 +75,7 @@ pub enum BillingEvent {
         audio_duration_ms: f64,
         occurred_at: DateTime<Utc>,
     },
+    Transcript(TranscriptEntry),
 }
 
 impl BillingEvent {
@@ -52,6 +86,7 @@ impl BillingEvent {
             Self::LlmUsage     { session_id, .. } => *session_id,
             Self::TtsUsage     { session_id, .. } => *session_id,
             Self::SttUsage     { session_id, .. } => *session_id,
+            Self::Transcript(e)                   => e.session_id,
         }
     }
 }
@@ -158,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn session_id_accessor_works_for_all_five_variants() {
+    fn session_id_accessor_works_for_all_variants() {
         let sid = id();
         let now = Utc::now();
         let variants: &[BillingEvent] = &[
@@ -169,6 +204,10 @@ mod tests {
             BillingEvent::TtsUsage     { session_id: sid, provider: "x".into(), voice: "v".into(),
                                           char_count: 1, occurred_at: now },
             BillingEvent::SttUsage     { session_id: sid, provider: "x".into(), audio_duration_ms: 1.0, occurred_at: now },
+            BillingEvent::Transcript(TranscriptEntry {
+                turn_id: id(), session_id: sid, role: TranscriptRole::User,
+                text: "hello".into(), language: None, interrupted: false, occurred_at: now,
+            }),
         ];
         for ev in variants {
             assert_eq!(ev.session_id(), sid, "session_id() wrong for {:?}", ev);

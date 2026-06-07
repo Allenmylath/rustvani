@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::events::{BillingEvent, SessionSummary};
+use super::events::{BillingEvent, SessionSummary, TranscriptEntry};
 use super::storage::BillingStorage;
 
 // ---------------------------------------------------------------------------
@@ -18,6 +18,12 @@ use super::storage::BillingStorage;
 pub trait BillingCollector: Send + Sync {
     fn record(&self, event: BillingEvent);
     fn session_id(&self) -> Uuid;
+
+    /// Convenience wrapper: records a transcript turn without constructing the
+    /// full `BillingEvent::Transcript` at the call site.
+    fn record_transcript(&self, entry: TranscriptEntry) {
+        self.record(BillingEvent::Transcript(entry));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +163,8 @@ fn apply_event(s: &mut SessionSummary, event: &BillingEvent) {
             s.stt_audio_ms += audio_duration_ms;
             s.stt_calls    += 1;
         }
+        // Transcript entries are stored individually — nothing to aggregate.
+        BillingEvent::Transcript(_) => {}
     }
 }
 

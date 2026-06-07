@@ -32,20 +32,49 @@ This folder contains detailed usage documentation for every service and componen
 | [Transport](transport.md) | `src/transport/` | WebSocket I/O, ChannelTransport for testing |
 | [Postgres Tool](tools-postgres.md) | `src/tools/postgres/` | Built-in LLM tool for Neon Postgres + pgvector |
 
+## Observability
+
+| Component | Documentation | Purpose |
+|---|---|---|
+| [Billing](billing.md) | `src/billing/` | Per-session usage (tokens, TTS chars, STT duration) + conversation transcript |
+| [Audio Capture](audio-capture.md) | `src/audio_capture/` | Per-turn WAV recordings for user and bot, linked to transcript entries |
+
 ## Quick Pipeline Assembly
 
 All services follow the same pattern:
 
 ```rust
 use rustvani::*;
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
-let stt = SomeSttHandler::new(config).into_processor();
-let llm = SomeLlmHandler::new(config).into_processor();
-let tts = SomeTtsHandler::new(config).unwrap().into_processor();
+// Shared turn-id cells (needed if using transcript + audio capture together)
+let active_user_turn_id: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
+let active_bot_turn_id:  Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
+
+let (billing, _) = SessionBilling::new(session_id, billing_storage, 256);
+let (audio_cap, _) = SessionAudioCapture::new(session_id, audio_storage, 64);
+
+let stt          = SomeSttHandler::new(stt_config).into_processor();
+let user_agg     = LLMUserAggregator::with_billing(context.clone(), billing.clone(), active_user_turn_id.clone());
+let llm          = SomeLlmHandler::new(llm_config).into_processor();
+let assistant_agg = LLMAssistantAggregator::with_billing(context.clone(), billing.clone(), active_bot_turn_id.clone());
+let tts          = SomeTtsHandler::new(tts_config).unwrap().into_processor();
+let audio_proc   = AudioCaptureProcessor::new(audio_cap, active_user_turn_id, active_bot_turn_id);
 
 let task = PipelineTask::new(
-    vec![transport.input(), stt, user_agg, llm, assistant_agg, tts, transport.output()],
-    PipelineParams { allow_interruptions: true, ..Default::default() },
+    vec![
+        transport.input(),
+        stt, user_agg, llm, assistant_agg, tts,
+        audio_proc,           // after TTS, before output transport
+        transport.output(),
+    ],
+    PipelineParams {
+        allow_interruptions: true,
+        billing_collector: Some(billing),
+        billing_metadata: [("user_id".into(), "u_42".into())].into_iter().collect(),
+        ..Default::default()
+    },
 );
 ```
 

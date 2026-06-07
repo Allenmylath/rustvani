@@ -2,6 +2,7 @@
 // Core modules (always available)
 // ---------------------------------------------------------------------------
 pub mod agents;
+pub mod audio_capture;
 pub mod billing;
 pub mod clock;
 pub mod context;
@@ -42,7 +43,11 @@ pub mod tools;
 // ---------------------------------------------------------------------------
 // Core re-exports (always available)
 // ---------------------------------------------------------------------------
+pub use audio_capture::{AudioCaptureCollector, AudioCaptureProcessor, AudioStorage, LocalAudioStorage, NoopAudioCaptureCollector, SessionAudioCapture};
+#[cfg(feature = "db-postgres")]
+pub use audio_capture::PostgresAudioMetaStorage;
 pub use billing::{BillingCollector, BillingEvent, LogBillingStorage, NoopBillingCollector, SessionBilling};
+pub use billing::events::{TranscriptEntry, TranscriptRole};
 #[cfg(feature = "db-postgres")]
 pub use billing::PostgresBillingStorage;
 pub use clock::{BaseClock, SystemClock, system_clock};

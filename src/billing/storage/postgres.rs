@@ -127,6 +127,27 @@ impl BillingStorage for PostgresBillingStorage {
                     .await
                     .map_err(|e| PipecatError::pipeline(format!("billing stt_event: {e}")))?;
             }
+
+            BillingEvent::Transcript(entry) => {
+                let role_str = entry.role.as_str();
+                self.client
+                    .execute(
+                        "INSERT INTO session_transcripts
+                         (session_id, turn_id, role, text, language, interrupted, occurred_at)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                        &[
+                            &sid,
+                            &entry.turn_id,
+                            &role_str,
+                            &entry.text,
+                            &entry.language,
+                            &entry.interrupted,
+                            &entry.occurred_at,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| PipecatError::pipeline(format!("billing transcript_entry: {e}")))?;
+            }
         }
 
         Ok(())
@@ -212,8 +233,22 @@ CREATE TABLE IF NOT EXISTS billing_events (
     raw_json          JSONB
 );
 
-CREATE INDEX IF NOT EXISTS billing_sessions_started_at  ON billing_sessions (started_at);
-CREATE INDEX IF NOT EXISTS billing_sessions_metadata    ON billing_sessions USING GIN (metadata);
-CREATE INDEX IF NOT EXISTS billing_events_session_id    ON billing_events   (session_id);
-CREATE INDEX IF NOT EXISTS billing_events_occurred_at   ON billing_events   (occurred_at);
+CREATE TABLE IF NOT EXISTS session_transcripts (
+    id          BIGSERIAL   PRIMARY KEY,
+    session_id  UUID        NOT NULL REFERENCES billing_sessions(session_id) ON DELETE CASCADE,
+    turn_id     UUID        NOT NULL,
+    role        TEXT        NOT NULL CHECK (role IN ('user', 'assistant')),
+    text        TEXT        NOT NULL,
+    language    TEXT,
+    interrupted BOOLEAN     NOT NULL DEFAULT FALSE,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS billing_sessions_started_at       ON billing_sessions    (started_at);
+CREATE INDEX IF NOT EXISTS billing_sessions_metadata         ON billing_sessions    USING GIN (metadata);
+CREATE INDEX IF NOT EXISTS billing_events_session_id         ON billing_events      (session_id);
+CREATE INDEX IF NOT EXISTS billing_events_occurred_at        ON billing_events      (occurred_at);
+CREATE INDEX IF NOT EXISTS session_transcripts_session_id    ON session_transcripts (session_id);
+CREATE INDEX IF NOT EXISTS session_transcripts_occurred_at   ON session_transcripts (occurred_at);
 ";

@@ -34,6 +34,7 @@ impl BillingStorage for LogBillingStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::super::events::{TranscriptEntry, TranscriptRole};
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -50,6 +51,11 @@ mod tests {
             BillingEvent::TtsUsage     { session_id: id, provider: "deepgram".into(), voice: "v".into(),
                                           char_count: 80, occurred_at: now },
             BillingEvent::SttUsage     { session_id: id, provider: "gnani".into(), audio_duration_ms: 1500.0, occurred_at: now },
+            BillingEvent::Transcript(TranscriptEntry {
+                turn_id: Uuid::new_v4(), session_id: id,
+                role: TranscriptRole::User, text: "hello".into(),
+                language: Some("en-IN".into()), interrupted: false, occurred_at: now,
+            }),
         ];
         for ev in &events {
             assert!(storage.record_event(ev).await.is_ok(), "record_event failed for {:?}", ev);
