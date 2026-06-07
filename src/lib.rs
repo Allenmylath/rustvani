@@ -43,7 +43,7 @@ pub mod tools;
 // ---------------------------------------------------------------------------
 // Core re-exports (always available)
 // ---------------------------------------------------------------------------
-pub use audio_capture::{AudioCaptureCollector, AudioCaptureProcessor, AudioStorage, LocalAudioStorage, NoopAudioCaptureCollector, SessionAudioCapture};
+pub use audio_capture::{AudioCaptureCollector, AudioCaptureProcessor, AudioStorage, LocalAudioStorage, NoopAudioCaptureCollector, RecordedSegment, SessionAudioCapture};
 #[cfg(feature = "db-postgres")]
 pub use audio_capture::PostgresAudioMetaStorage;
 pub use billing::{BillingCollector, BillingEvent, LogBillingStorage, NoopBillingCollector, SessionBilling};

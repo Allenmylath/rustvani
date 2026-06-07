@@ -8,7 +8,7 @@ pub use collector::{AudioCaptureCollector, NoopAudioCaptureCollector, SessionAud
 pub use processor::AudioCaptureProcessor;
 pub use segment::{AudioSegmentMeta, PendingAudioSegment};
 pub use storage::local::LocalAudioStorage;
-pub use storage::AudioStorage;
+pub use storage::{AudioStorage, RecordedSegment};
 
 #[cfg(feature = "db-postgres")]
 pub use storage::postgres::PostgresAudioMetaStorage;
