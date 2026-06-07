@@ -75,6 +75,9 @@ pub use vad::{SileroVadNative, SileroVadOrt, VadAnalyzer, VadBackend, VadParams,
 pub use transport::{BaseInputTransport, BaseOutputTransport, BaseTransport, TransportParams};
 
 // Services — each gated by its feature
+#[cfg(feature = "stt-deepgram")]
+pub use services::{DeepgramSttConfig, DeepgramSttHandler};
+
 #[cfg(feature = "stt-sarvam")]
 pub use services::{SarvamSttConfig, SarvamSttHandler};
 

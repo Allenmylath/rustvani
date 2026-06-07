@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -53,6 +54,18 @@ impl SessionBilling {
         storage: Arc<dyn BillingStorage>,
         channel_capacity: usize,
     ) -> (Arc<Self>, tokio::task::JoinHandle<()>) {
+        Self::new_with_dir(session_id, storage, channel_capacity, None)
+    }
+
+    /// Like `new`, but also writes `transcript.json` into `session_dir` at
+    /// session end. Pass `{base_dir}/{session_id}` to co-locate the transcript
+    /// with the audio WAV files produced by `LocalAudioStorage`.
+    pub fn new_with_dir(
+        session_id: Uuid,
+        storage: Arc<dyn BillingStorage>,
+        channel_capacity: usize,
+        session_dir: Option<PathBuf>,
+    ) -> (Arc<Self>, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(channel_capacity);
         let summary = Arc::new(Mutex::new(SessionSummary {
             session_id,
@@ -65,7 +78,7 @@ impl SessionBilling {
             summary: summary.clone(),
         });
 
-        let handle = tokio::spawn(drain_task(rx, summary, storage));
+        let handle = tokio::spawn(drain_task(rx, summary, storage, session_dir));
         (collector, handle)
     }
 
@@ -102,8 +115,16 @@ async fn drain_task(
     mut rx: mpsc::Receiver<BillingEvent>,
     summary: Arc<Mutex<SessionSummary>>,
     storage: Arc<dyn BillingStorage>,
+    session_dir: Option<PathBuf>,
 ) {
+    let mut transcripts: Vec<TranscriptEntry> = Vec::new();
+
     while let Some(event) = rx.recv().await {
+        // Collect transcript entries for the end-of-session JSON file.
+        if let BillingEvent::Transcript(ref entry) = event {
+            transcripts.push(entry.clone());
+        }
+
         // Hold the Mutex for microseconds only — never across .await.
         {
             let mut s = summary.lock().unwrap();
@@ -133,6 +154,29 @@ async fn drain_task(
 
     if let Err(e) = storage.finalize_session(&final_summary).await {
         log::error!("BillingStorage::finalize_session failed: {e}");
+    }
+
+    // Write a single transcript.json for the session if a directory was given.
+    if let Some(dir) = session_dir {
+        write_transcript_json(&dir, &transcripts).await;
+    }
+}
+
+async fn write_transcript_json(dir: &PathBuf, transcripts: &[TranscriptEntry]) {
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+        log::error!("billing: could not create session dir {}: {e}", dir.display());
+        return;
+    }
+    match serde_json::to_string_pretty(transcripts) {
+        Ok(json) => {
+            let path = dir.join("transcript.json");
+            if let Err(e) = tokio::fs::write(&path, json).await {
+                log::error!("billing: transcript write failed {}: {e}", path.display());
+            } else {
+                log::info!("billing: wrote {}", path.display());
+            }
+        }
+        Err(e) => log::error!("billing: transcript serialize failed: {e}"),
     }
 }
 
