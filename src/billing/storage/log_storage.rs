@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
-use super::super::events::{BillingEvent, SessionSummary};
+use super::super::events::{BillingEvent, SessionSummary, TranscriptEntry};
 use super::BillingStorage;
 
 /// Writes billing data as structured JSON log lines at INFO level.
@@ -18,10 +18,18 @@ impl BillingStorage for LogBillingStorage {
         Ok(())
     }
 
-    async fn finalize_session(&self, summary: &SessionSummary) -> Result<()> {
+    async fn finalize_session(
+        &self,
+        summary: &SessionSummary,
+        transcripts: &[TranscriptEntry],
+    ) -> Result<()> {
         log::info!(
             "billing_summary: {}",
             serde_json::to_string(summary).unwrap_or_default()
+        );
+        log::info!(
+            "billing_transcript: {}",
+            serde_json::to_string(transcripts).unwrap_or_default()
         );
         Ok(())
     }
@@ -76,6 +84,6 @@ mod tests {
             stt_calls: 4,
             ..Default::default()
         };
-        assert!(storage.finalize_session(&summary).await.is_ok());
+        assert!(storage.finalize_session(&summary, &[]).await.is_ok());
     }
 }

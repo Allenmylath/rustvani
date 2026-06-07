@@ -5,13 +5,18 @@ use chrono::Utc;
 use tokio_postgres::Client;
 
 use crate::error::{PipecatError, Result};
-use super::super::events::{BillingEvent, SessionSummary};
+use super::super::events::{BillingEvent, SessionSummary, TranscriptEntry};
 use super::BillingStorage;
 
 /// Persists billing data to PostgreSQL.
 ///
-/// The schema is defined in `billing_sessions` and `billing_events` tables.
-/// Call `PostgresBillingStorage::run_migrations()` once at startup to create them.
+/// Transcript entries are NOT inserted row-by-row. Instead the complete ordered
+/// transcript is serialised as a single JSON array and written to
+/// `billing_sessions.transcript_json` at session end. This gives you exactly
+/// one transcript record per session.
+///
+/// Call `PostgresBillingStorage::run_migrations()` once at startup to create
+/// or update the schema.
 pub struct PostgresBillingStorage {
     client: Arc<Client>,
 }
@@ -25,7 +30,7 @@ impl PostgresBillingStorage {
         Self { client }
     }
 
-    /// Creates the billing schema if it does not exist. Safe to call repeatedly.
+    /// Creates / updates the billing schema. Safe to call repeatedly.
     pub async fn run_migrations(client: &Client) -> Result<()> {
         client.batch_execute(SCHEMA_SQL).await
             .map_err(|e| PipecatError::pipeline(format!("billing migration failed: {e}")))?;
@@ -38,7 +43,7 @@ impl BillingStorage for PostgresBillingStorage {
     async fn record_event(&self, event: &BillingEvent) -> Result<()> {
         let sid = event.session_id();
 
-        // Ensure the session row exists before referencing it from billing_events.
+        // Ensure the session row exists before any FK references.
         self.client
             .execute(
                 "INSERT INTO billing_sessions (session_id) VALUES ($1)
@@ -128,34 +133,25 @@ impl BillingStorage for PostgresBillingStorage {
                     .map_err(|e| PipecatError::pipeline(format!("billing stt_event: {e}")))?;
             }
 
-            BillingEvent::Transcript(entry) => {
-                let role_str = entry.role.as_str();
-                self.client
-                    .execute(
-                        "INSERT INTO session_transcripts
-                         (session_id, turn_id, role, text, language, interrupted, occurred_at)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                        &[
-                            &sid,
-                            &entry.turn_id,
-                            &role_str,
-                            &entry.text,
-                            &entry.language,
-                            &entry.interrupted,
-                            &entry.occurred_at,
-                        ],
-                    )
-                    .await
-                    .map_err(|e| PipecatError::pipeline(format!("billing transcript_entry: {e}")))?;
-            }
+            // Transcripts are collected and written as a single JSON at session
+            // end via finalize_session — do nothing here.
+            BillingEvent::Transcript(_) => {}
         }
 
         Ok(())
     }
 
-    async fn finalize_session(&self, s: &SessionSummary) -> Result<()> {
+    async fn finalize_session(
+        &self,
+        s: &SessionSummary,
+        transcripts: &[TranscriptEntry],
+    ) -> Result<()> {
         let meta = serde_json::to_value(&s.metadata)
             .unwrap_or(serde_json::Value::Object(Default::default()));
+
+        let transcript_json = serde_json::to_value(transcripts)
+            .unwrap_or(serde_json::Value::Array(vec![]));
+
         let now = Utc::now();
 
         self.client
@@ -165,8 +161,8 @@ impl BillingStorage for PostgresBillingStorage {
                   llm_input_tokens, llm_output_tokens, llm_calls,
                   tts_chars, tts_calls,
                   stt_audio_ms, stt_calls,
-                  metadata, created_at, updated_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14)
+                  metadata, transcript_json, created_at, updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)
                  ON CONFLICT (session_id) DO UPDATE SET
                    started_at        = COALESCE(EXCLUDED.started_at,        billing_sessions.started_at),
                    ended_at          = COALESCE(EXCLUDED.ended_at,          billing_sessions.ended_at),
@@ -180,6 +176,7 @@ impl BillingStorage for PostgresBillingStorage {
                    stt_audio_ms      = EXCLUDED.stt_audio_ms,
                    stt_calls         = EXCLUDED.stt_calls,
                    metadata          = EXCLUDED.metadata,
+                   transcript_json   = EXCLUDED.transcript_json,
                    updated_at        = EXCLUDED.updated_at",
                 &[
                     &s.session_id, &s.started_at, &s.ended_at,
@@ -188,7 +185,7 @@ impl BillingStorage for PostgresBillingStorage {
                     &(s.llm_calls as i32),
                     &(s.tts_chars as i32), &(s.tts_calls as i32),
                     &s.stt_audio_ms, &(s.stt_calls as i32),
-                    &meta, &now,
+                    &meta, &transcript_json, &now,
                 ],
             )
             .await
@@ -213,9 +210,14 @@ CREATE TABLE IF NOT EXISTS billing_sessions (
     stt_audio_ms      FLOAT8      NOT NULL DEFAULT 0,
     stt_calls         INTEGER     NOT NULL DEFAULT 0,
     metadata          JSONB       NOT NULL DEFAULT '{}',
+    transcript_json   JSONB       NOT NULL DEFAULT '[]',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Add transcript_json to existing deployments that pre-date this column.
+ALTER TABLE billing_sessions
+    ADD COLUMN IF NOT EXISTS transcript_json JSONB NOT NULL DEFAULT '[]';
 
 CREATE TABLE IF NOT EXISTS billing_events (
     id                BIGSERIAL   PRIMARY KEY,
@@ -233,22 +235,8 @@ CREATE TABLE IF NOT EXISTS billing_events (
     raw_json          JSONB
 );
 
-CREATE TABLE IF NOT EXISTS session_transcripts (
-    id          BIGSERIAL   PRIMARY KEY,
-    session_id  UUID        NOT NULL REFERENCES billing_sessions(session_id) ON DELETE CASCADE,
-    turn_id     UUID        NOT NULL,
-    role        TEXT        NOT NULL CHECK (role IN ('user', 'assistant')),
-    text        TEXT        NOT NULL,
-    language    TEXT,
-    interrupted BOOLEAN     NOT NULL DEFAULT FALSE,
-    occurred_at TIMESTAMPTZ NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS billing_sessions_started_at       ON billing_sessions    (started_at);
-CREATE INDEX IF NOT EXISTS billing_sessions_metadata         ON billing_sessions    USING GIN (metadata);
-CREATE INDEX IF NOT EXISTS billing_events_session_id         ON billing_events      (session_id);
-CREATE INDEX IF NOT EXISTS billing_events_occurred_at        ON billing_events      (occurred_at);
-CREATE INDEX IF NOT EXISTS session_transcripts_session_id    ON session_transcripts (session_id);
-CREATE INDEX IF NOT EXISTS session_transcripts_occurred_at   ON session_transcripts (occurred_at);
+CREATE INDEX IF NOT EXISTS billing_sessions_started_at  ON billing_sessions (started_at);
+CREATE INDEX IF NOT EXISTS billing_sessions_metadata    ON billing_sessions  USING GIN (metadata);
+CREATE INDEX IF NOT EXISTS billing_events_session_id    ON billing_events    (session_id);
+CREATE INDEX IF NOT EXISTS billing_events_occurred_at   ON billing_events    (occurred_at);
 ";

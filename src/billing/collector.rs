@@ -152,11 +152,11 @@ async fn drain_task(
         final_summary.stt_calls,
     );
 
-    if let Err(e) = storage.finalize_session(&final_summary).await {
+    if let Err(e) = storage.finalize_session(&final_summary, &transcripts).await {
         log::error!("BillingStorage::finalize_session failed: {e}");
     }
 
-    // Write a single transcript.json for the session if a directory was given.
+    // Optionally also write transcript.json to a local session directory.
     if let Some(dir) = session_dir {
         write_transcript_json(&dir, &transcripts).await;
     }
