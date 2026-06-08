@@ -25,7 +25,7 @@ User speaks → VAD → STT → LLM → TTS → User hears
 
 ```toml
 [dependencies]
-rustvani = "0.2.1"
+rustvani = "0.2.6"
 ```
 
 ```bash
