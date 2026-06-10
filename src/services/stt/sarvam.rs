@@ -1,10 +1,57 @@
-//! Sarvam AI Speech-to-Text service.
+//! Sarvam AI Speech-to-Text service — turn-gated streaming.
 //!
 //! Connects to Sarvam's WebSocket streaming API and pushes TranscriptionFrames
 //! downstream when transcripts arrive.
 //!
 //! Pipeline position:
-//!   transport.input() → SarvamSttHandler → llm → tts → transport.output()
+//!   transport.input() → SarvamSttHandler → LLMUserAggregator → llm → tts → out
+//!
+//! ── Ordering & attribution invariants (the TurnGate) ──────────────────────
+//!
+//! 1. AUDIO GATING (fatherhood by construction).
+//!    Audio is forwarded to Sarvam only while the local VAD says the user is
+//!    speaking, plus a pre-roll buffer (the ~pre_roll_ms of audio captured
+//!    while the VAD was still confirming speech) and the denoiser tail.
+//!    Between turns nothing is sent, so Sarvam's server-side VAD has no noise
+//!    to hallucinate from: every transcript it can possibly return descends
+//!    from a local-VAD-attested turn. Spurious "fatherless" transcripts are
+//!    impossible by construction, not by bookkeeping.
+//!
+//! 2. STOP-FRAME GATING (transcript-before-stop ordering).
+//!    VADUserStoppedSpeaking is never forwarded directly. It is stashed in
+//!    the gate; the WebSocket receive task releases it downstream immediately
+//!    AFTER pushing the transcript it was waiting for. Both pushes happen
+//!    sequentially from one task, so downstream FIFO guarantees the
+//!    aggregator always sees Transcript → VadStop, never the reverse.
+//!    A timeout (stop_release_timeout_ms) releases the stop if Sarvam never
+//!    replies, so a turn cannot hang.
+//!
+//! 3. EMISSION LINEARIZATION (the `emit` mutex).
+//!    Turn frames (VadStart, Transcription, released VadStop) can originate
+//!    on two tasks: the pipeline task (VadStart passthrough) and the WS
+//!    receive task (transcript + released stop). All such emissions acquire
+//!    the gate's async `emit` lock, and the claim/drop of the pending stop
+//!    happens inside the same critical section. Every interleaving therefore
+//!    collapses to one of two valid serial orders:
+//!      …Transcript, VadStop, VadStart…   (turn flushed, then new turn), or
+//!      …VadStart[pending dropped], Transcript…  (barge-in merge).
+//!    The premature-flush and lost-text interleavings cannot occur.
+//!
+//! 4. EXACTLY-ONCE RELEASE (atomic claim).
+//!    The stashed stop lives in a Mutex<Option<Frame>>; `take()` is the CAS.
+//!    Three parties race for it — transcript arrival (release), timeout
+//!    (release), barge-in VadStart (drop). Exactly one wins. Timeouts are
+//!    additionally generation-guarded so a stale timer can never steal a
+//!    newer turn's pending stop.
+//!
+//! 5. DURATION LEDGER (turn attribution + billing).
+//!    The gate keeps a FIFO of (epoch, ms-of-audio-sent). Sarvam reports
+//!    `metrics.audio_duration` per transcript; since the server consumes the
+//!    stream in order, consuming that duration from the ledger head
+//!    identifies which turn (epoch) fathered the transcript, with a small
+//!    tolerance for server-side silence trimming. The server-reported
+//!    duration is also the billing source of truth (it replaces the old
+//!    byte-swap heuristic, which misattributed inter-utterance audio).
 //!
 //! Wiring:
 //!   let stt = SarvamSttHandler::new(SarvamSttConfig {
@@ -14,22 +61,26 @@
 //!   .into_processor();
 //!
 //! Frames consumed:
-//!   - StartFrame             → connects WebSocket
-//!   - InputAudioRaw          → denoise → base64 encode → send to Sarvam
-//!   - VADUserStoppedSpeaking → flush noise filter → send flush signal
-//!   - EndFrame / CancelFrame → disconnects WebSocket
+//!   - StartFrame             → connects WebSocket, resets gate
+//!   - InputAudioRaw          → denoise → gate (send now / pre-roll buffer)
+//!   - VADUserStartedSpeaking → drops any pending stop (barge-in), bumps
+//!                              epoch, forwards frame, sends pre-roll
+//!   - VADUserStoppedSpeaking → CONSUMED: stashed in gate; denoiser tail +
+//!                              flush signal sent; release timeout armed
+//!   - EndFrame / CancelFrame → resets gate, disconnects, forwards
 //!
 //! Frames produced:
 //!   - TranscriptionFrame (downstream) on transcript
+//!   - VADUserStoppedSpeaking (downstream) when the gate releases it
 //!   - ErrorFrame (upstream) on connection / parse errors
 //!
 //! Auth: api-subscription-key header (lowercase), per SDK source.
 //! URL:  wss://api.sarvam.ai/speech-to-text/ws
 //! Lang: language-code param (hyphen, not underscore)
 
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -63,6 +114,11 @@ const STT_TRANSLATE_PATH: &str  = "/speech-to-text-translate/ws";
 const TRANSLATE_MODELS: &[&str] = &["saaras:v2.5"];
 // saaras:v3 supports the mode param
 const MODE_MODELS: &[&str]      = &["saaras:v3"];
+
+/// Server-side VAD may trim leading/trailing silence, so the audio duration
+/// it reports per transcript can be slightly less than what we sent. Ledger
+/// consumption treats remainders at or below this as fully consumed.
+const LEDGER_TOLERANCE_MS: f64 = 120.0;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -109,20 +165,40 @@ pub struct SarvamSttConfig {
     /// Enable RNNoise noise suppression before sending audio to Sarvam.
     /// Default: true.
     pub noise_reduction: bool,
+
+    /// Forward audio to Sarvam only during local-VAD-attested turns
+    /// (plus pre-roll). Eliminates spurious server-VAD transcripts by
+    /// construction and cuts STT cost. Default: true.
+    /// When false, the legacy continuous-streaming behavior is used —
+    /// note that spurious transcripts then become possible again, and the
+    /// aggregator's late-transcript policy should be set to Discard.
+    pub audio_gating: bool,
+
+    /// How much audio (ms) to retain while the user is NOT speaking, sent as
+    /// pre-roll when local VAD confirms speech. Covers VAD detection latency
+    /// so the first syllable isn't clipped. Default: 500.
+    pub pre_roll_ms: u32,
+
+    /// How long (ms) to hold a gated VADUserStoppedSpeaking waiting for
+    /// Sarvam's transcript before releasing it anyway. Default: 1200.
+    pub stop_release_timeout_ms: u64,
 }
 
 impl Default for SarvamSttConfig {
     fn default() -> Self {
         Self {
-            api_key:              String::new(),
-            model:                "saaras:v3".to_string(),
-            language:             Some("unknown".to_string()),
-            mode:                 Some("transcribe".to_string()),
-            sample_rate:          16_000,
-            encoding:             "wav".to_string(),
-            high_vad_sensitivity: false,
-            vad_signals:          false,
-            noise_reduction:      true,
+            api_key:                 String::new(),
+            model:                   "saaras:v3".to_string(),
+            language:                Some("unknown".to_string()),
+            mode:                    Some("transcribe".to_string()),
+            sample_rate:             16_000,
+            encoding:                "wav".to_string(),
+            high_vad_sensitivity:    false,
+            vad_signals:             false,
+            noise_reduction:         true,
+            audio_gating:            true,
+            pre_roll_ms:             500,
+            stop_release_timeout_ms: 1_200,
         }
     }
 }
@@ -181,12 +257,24 @@ struct SarvamMessage {
     data: Option<serde_json::Value>,
 }
 
+/// Per-transcript server metrics. `audio_duration` (seconds) is how much of
+/// the audio stream this transcript consumed — the attribution & billing
+/// source of truth.
+#[derive(Debug, Deserialize)]
+struct SarvamMetrics {
+    audio_duration: Option<f64>,
+    #[allow(dead_code)]
+    processing_latency: Option<f64>,
+}
+
 /// Transcript payload inside a "data" message.
 /// Field is "transcript" for both saarika:v2.5 and saaras:v3.
 #[derive(Debug, Deserialize)]
 struct SarvamTranscript {
     transcript:    Option<String>,
     language_code: Option<String>,
+    request_id:    Option<String>,
+    metrics:       Option<SarvamMetrics>,
 }
 
 /// VAD event payload inside an "events" message.
@@ -196,7 +284,312 @@ struct SarvamEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Internal state
+// TurnGate — ordering, attribution, and audio gating
+// ---------------------------------------------------------------------------
+
+struct LedgerEntry {
+    epoch: u64,
+    ms:    f64,
+}
+
+struct GateInner {
+    /// Turn counter. Bumped on every VADUserStartedSpeaking.
+    epoch: u64,
+    /// Local VAD state, as seen by this gate.
+    speaking: bool,
+    /// The stashed VADUserStoppedSpeaking frame, waiting for its transcript.
+    pending_stop:  Option<Frame>,
+    pending_epoch: u64,
+    /// Generation counter guarding release timeouts. Bumped on every stash,
+    /// claim, and drop, so a stale timer always finds a mismatch.
+    timeout_gen: u64,
+    /// Ring buffer of recent denoised samples captured while NOT speaking;
+    /// drained and sent as pre-roll on VadStart.
+    pre_roll:     VecDeque<i16>,
+    pre_roll_cap: usize,
+    /// FIFO of (epoch, ms of audio sent) for closed turns.
+    ledger: VecDeque<LedgerEntry>,
+    /// Audio ms sent so far for the currently open turn.
+    current_sent_ms: f64,
+}
+
+/// Outcome of processing one Sarvam data message through the gate.
+struct TranscriptOutcome {
+    released_stop: bool,
+    father_epoch:  Option<u64>,
+    billed_ms:     f64,
+}
+
+pub(crate) struct TurnGate {
+    /// Linearizes downstream emission of turn frames (VadStart, Transcript,
+    /// released VadStop) across the pipeline task and the WS receive task.
+    /// The pending-stop claim/drop always happens inside this critical
+    /// section, which is what makes the emission order provably serial.
+    emit:        Mutex<()>,
+    inner:       std::sync::Mutex<GateInner>,
+    sample_rate: u32,
+}
+
+impl TurnGate {
+    fn new(sample_rate: u32, pre_roll_ms: u32) -> Arc<Self> {
+        let cap = (sample_rate as u64 * pre_roll_ms as u64 / 1000) as usize;
+        Arc::new(Self {
+            emit: Mutex::new(()),
+            inner: std::sync::Mutex::new(GateInner {
+                epoch:           0,
+                speaking:        false,
+                pending_stop:    None,
+                pending_epoch:   0,
+                timeout_gen:     0,
+                pre_roll:        VecDeque::with_capacity(cap),
+                pre_roll_cap:    cap,
+                ledger:          VecDeque::new(),
+                current_sent_ms: 0.0,
+            }),
+            sample_rate,
+        })
+    }
+
+    fn ms_of(&self, samples: usize) -> f64 {
+        samples as f64 * 1000.0 / self.sample_rate as f64
+    }
+
+    /// Local VAD start. Atomically drops any pending stop (barge-in: the
+    /// user resumed, so that turn boundary is stale), bumps the epoch,
+    /// forwards the VadStart frame downstream under the emit lock, and
+    /// returns the pre-roll samples the caller should send to Sarvam.
+    async fn on_vad_start(
+        &self,
+        processor: &FrameProcessor,
+        frame: Frame,
+        direction: FrameDirection,
+    ) -> Result<Vec<i16>> {
+        let _emit = self.emit.lock().await;
+
+        let (dropped, epoch, pre_roll) = {
+            let mut s = self.inner.lock().unwrap();
+            let dropped = s.pending_stop.take().is_some();
+            if dropped {
+                // Disarm the timer that was guarding the dropped stop.
+                s.timeout_gen = s.timeout_gen.wrapping_add(1);
+            }
+            s.epoch += 1;
+            s.speaking = true;
+            let pre: Vec<i16> = s.pre_roll.drain(..).collect();
+            s.current_sent_ms = self.ms_of(pre.len());
+            (dropped, s.epoch, pre)
+        };
+
+        if dropped {
+            log::info!(
+                "TurnGate: barge-in — pending VadStop dropped (atomic take), \
+                 turn continues as epoch {}",
+                epoch
+            );
+        } else {
+            log::debug!("TurnGate: VadStart — opening epoch {}", epoch);
+        }
+
+        processor.push_frame(frame, direction).await?;
+        Ok(pre_roll)
+    }
+
+    /// Local VAD stop. Finalizes the open turn's ledger entry, stashes the
+    /// stop frame (NOT forwarded), and returns the timeout generation the
+    /// caller should arm a release timer with. `tail_ms` is the duration of
+    /// the denoiser tail the caller already sent for this turn.
+    fn on_vad_stop(&self, frame: Frame, tail_ms: f64) -> u64 {
+        let mut s = self.inner.lock().unwrap();
+        if s.pending_stop.is_some() {
+            // Should be unreachable (transport CAS prevents double-stop),
+            // but never silently lose a frame boundary.
+            log::warn!("TurnGate: replacing an unreleased pending VadStop");
+        }
+        s.speaking = false;
+        s.current_sent_ms += tail_ms;
+        let epoch = s.epoch;
+        let ms = s.current_sent_ms;
+        s.ledger.push_back(LedgerEntry { epoch, ms });
+        s.current_sent_ms = 0.0;
+        s.pending_stop = Some(frame);
+        s.pending_epoch = epoch;
+        s.timeout_gen = s.timeout_gen.wrapping_add(1);
+        log::debug!(
+            "TurnGate: VadStop gated for epoch {} ({:.0}ms sent), awaiting transcript",
+            epoch, ms
+        );
+        s.timeout_gen
+    }
+
+    /// Audio admission. While speaking: account the duration and tell the
+    /// caller to send. While quiet: buffer into the pre-roll ring instead.
+    /// When `gated` is false (legacy continuous streaming), always send but
+    /// still account the duration against the current epoch.
+    fn admit_audio(&self, samples: &[i16], gated: bool) -> bool {
+        let mut s = self.inner.lock().unwrap();
+        if s.speaking || !gated {
+            s.current_sent_ms += self.ms_of(samples.len());
+            return true;
+        }
+        for &v in samples {
+            if s.pre_roll.len() == s.pre_roll_cap {
+                s.pre_roll.pop_front();
+            }
+            s.pre_roll.push_back(v);
+        }
+        false
+    }
+
+    /// A Sarvam data message arrived on the receive task. Pushes the
+    /// transcript (if any) downstream, then releases the pending stop (if
+    /// any) immediately after it — both under the emit lock, from this one
+    /// task, so downstream order is Transcript → VadStop, always.
+    ///
+    /// `server_ms` is metrics.audio_duration × 1000 when present; it drives
+    /// ledger attribution and is the preferred billing duration.
+    async fn on_transcript(
+        &self,
+        processor: &FrameProcessor,
+        data: Option<TranscriptionData>,
+        server_ms: Option<f64>,
+    ) -> Result<TranscriptOutcome> {
+        let _emit = self.emit.lock().await;
+
+        let (stop, father, consumed_ms) = {
+            let mut s = self.inner.lock().unwrap();
+            let stop = s.pending_stop.take();
+            if stop.is_some() {
+                // Disarm the release timer for this stash.
+                s.timeout_gen = s.timeout_gen.wrapping_add(1);
+            }
+            let (father, consumed) = consume_ledger(&mut s, server_ms);
+            (stop, father, consumed)
+        };
+
+        if let Some(td) = data {
+            processor
+                .push_frame(Frame::transcription(td), FrameDirection::Downstream)
+                .await?;
+        }
+
+        let released = stop.is_some();
+        if let Some(stop_frame) = stop {
+            log::debug!(
+                "TurnGate: releasing VadStop after transcript (epoch {:?})",
+                father
+            );
+            processor
+                .push_frame(stop_frame, FrameDirection::Downstream)
+                .await?;
+        }
+
+        Ok(TranscriptOutcome {
+            released_stop: released,
+            father_epoch:  father,
+            billed_ms:     server_ms.unwrap_or(consumed_ms),
+        })
+    }
+
+    /// Timeout fallback: release the pending stop if — and only if — it is
+    /// still the same stash this timer was armed for (generation guard).
+    async fn release_pending_after(
+        self: Arc<Self>,
+        processor: FrameProcessor,
+        gen: u64,
+        after: Duration,
+    ) {
+        tokio::time::sleep(after).await;
+        let _emit = self.emit.lock().await;
+
+        let stop = {
+            let mut s = self.inner.lock().unwrap();
+            if s.timeout_gen == gen {
+                s.pending_stop.take()
+            } else {
+                None
+            }
+        };
+
+        match stop {
+            Some(frame) => {
+                log::warn!(
+                    "TurnGate: no transcript within timeout — releasing VadStop anyway"
+                );
+                let _ = processor
+                    .push_frame(frame, FrameDirection::Downstream)
+                    .await;
+            }
+            None => {
+                log::debug!("TurnGate: release timer fired but lost the race — no-op");
+            }
+        }
+    }
+
+    /// Full reset on End/Cancel/Start. Any pending stop is dropped (the
+    /// pipeline is going away or restarting; releasing it would be noise).
+    fn reset(&self) {
+        let mut s = self.inner.lock().unwrap();
+        s.pending_stop = None;
+        s.timeout_gen = s.timeout_gen.wrapping_add(1);
+        s.speaking = false;
+        s.pre_roll.clear();
+        s.ledger.clear();
+        s.current_sent_ms = 0.0;
+    }
+}
+
+/// Consume `server_ms` of audio from the front of the ledger, returning the
+/// epoch the consumption ends in (the transcript's father) and the ms
+/// consumed. With `server_ms == None` (legacy models without metrics), the
+/// oldest closed turn is consumed whole; if none exists, the open turn is.
+fn consume_ledger(s: &mut GateInner, server_ms: Option<f64>) -> (Option<u64>, f64) {
+    match server_ms {
+        Some(ms) => {
+            let mut remaining = ms;
+            let mut father = None;
+            while remaining > LEDGER_TOLERANCE_MS {
+                match s.ledger.front_mut() {
+                    Some(e) if e.ms > 0.0 => {
+                        let take = e.ms.min(remaining);
+                        e.ms -= take;
+                        remaining -= take;
+                        father = Some(e.epoch);
+                        if e.ms <= LEDGER_TOLERANCE_MS {
+                            s.ledger.pop_front();
+                        }
+                    }
+                    Some(_) => {
+                        s.ledger.pop_front();
+                    }
+                    None => {
+                        // Mid-turn transcript: the server finalized part of
+                        // the still-open turn. Charge the open epoch.
+                        if s.speaking {
+                            let take = s.current_sent_ms.min(remaining);
+                            s.current_sent_ms -= take;
+                            remaining -= take;
+                            father = Some(s.epoch);
+                        }
+                        break;
+                    }
+                }
+            }
+            (father, ms)
+        }
+        None => {
+            if let Some(e) = s.ledger.pop_front() {
+                (Some(e.epoch), e.ms)
+            } else {
+                let ms = s.current_sent_ms;
+                s.current_sent_ms = 0.0;
+                (s.speaking.then_some(s.epoch), ms)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal connection state
 // ---------------------------------------------------------------------------
 
 struct SarvamSttState {
@@ -211,6 +604,15 @@ impl SarvamSttState {
     }
 }
 
+/// Context shared with the WebSocket receive task.
+struct RxCtx {
+    processor:         FrameProcessor,
+    gate:              Arc<TurnGate>,
+    language_fallback: Option<String>,
+    noise_filter:      Option<Arc<Mutex<RNNoiseFilter>>>,
+    billing:           Option<Arc<dyn BillingCollector>>,
+}
+
 // ---------------------------------------------------------------------------
 // SarvamSttHandler
 // ---------------------------------------------------------------------------
@@ -222,8 +624,8 @@ pub struct SarvamSttHandler {
     noise_filter: Option<Arc<Mutex<RNNoiseFilter>>>,
     /// Optional billing collector — records audio duration per transcript.
     billing: Option<Arc<dyn BillingCollector>>,
-    /// Accumulated raw PCM bytes sent to Sarvam since last transcript.
-    audio_bytes: Arc<AtomicU64>,
+    /// Turn gate — ordering, attribution, audio gating.
+    gate: Arc<TurnGate>,
 }
 
 impl SarvamSttHandler {
@@ -238,12 +640,26 @@ impl SarvamSttHandler {
             None
         };
 
+        let gate = TurnGate::new(config.sample_rate, config.pre_roll_ms);
+
+        if config.audio_gating {
+            log::info!(
+                "SarvamStt: turn-gated audio enabled (pre_roll={}ms, stop_release_timeout={}ms)",
+                config.pre_roll_ms, config.stop_release_timeout_ms
+            );
+        } else {
+            log::warn!(
+                "SarvamStt: audio gating DISABLED — continuous streaming; \
+                 spurious server-VAD transcripts are possible"
+            );
+        }
+
         Self {
             config,
             state: Arc::new(Mutex::new(SarvamSttState::new())),
             noise_filter,
             billing: None,
-            audio_bytes: Arc::new(AtomicU64::new(0)),
+            gate,
         }
     }
 
@@ -304,17 +720,18 @@ impl SarvamSttHandler {
         // Channel carries plain String — Message::Text wrapping happens in send_task.
         let (ws_tx, ws_rx) = mpsc::channel::<String>(64);
 
-        let send_task    = tokio::spawn(run_send_task(sink, ws_rx));
-        let lang_fb      = self.config.language.clone();
-        let nf_clone     = self.noise_filter.clone();
-        let billing      = self.billing.clone();
-        let audio_bytes  = self.audio_bytes.clone();
-        let sample_rate  = self.config.sample_rate;
-        let receive_task = tokio::spawn(run_receive_task(
-            stream, processor, lang_fb, nf_clone, billing, audio_bytes, sample_rate,
-        ));
+        let send_task = tokio::spawn(run_send_task(sink, ws_rx));
 
-        let mut state     = self.state.lock().await;
+        let ctx = Arc::new(RxCtx {
+            processor,
+            gate:              self.gate.clone(),
+            language_fallback: self.config.language.clone(),
+            noise_filter:      self.noise_filter.clone(),
+            billing:           self.billing.clone(),
+        });
+        let receive_task = tokio::spawn(run_receive_task(stream, ctx));
+
+        let mut state      = self.state.lock().await;
         state.ws_tx        = Some(ws_tx);
         state.send_task    = Some(send_task);
         state.receive_task = Some(receive_task);
@@ -340,7 +757,9 @@ impl SarvamSttHandler {
     /// Send audio per AsyncAPI spec:
     /// {"audio": {"data": <base64>, "sample_rate": "<rate>", "encoding": "audio/wav"}}
     async fn send_audio(&self, audio: &[u8]) {
-        self.audio_bytes.fetch_add(audio.len() as u64, Ordering::Relaxed);
+        if audio.is_empty() {
+            return;
+        }
         let msg = serde_json::json!({
             "audio": {
                 "data":        BASE64.encode(audio),
@@ -355,6 +774,18 @@ impl SarvamSttHandler {
     async fn send_flush(&self) {
         let msg = serde_json::json!({ "type": "flush" });
         self.send_json(serde_json::to_string(&msg).unwrap_or_default()).await;
+    }
+
+    /// Denoise one InputAudioRaw payload. Returns the samples ready to be
+    /// admitted by the gate (may be empty while the filter is buffering).
+    async fn denoise(&self, raw: &[u8]) -> Vec<i16> {
+        match &self.noise_filter {
+            Some(nf) => {
+                let pcm = bytes_to_i16(raw);
+                nf.lock().await.filter(&pcm)
+            }
+            None => bytes_to_i16(raw),
+        }
     }
 }
 
@@ -387,6 +818,7 @@ impl FrameHandler for SarvamSttHandler {
     ) -> Result<()> {
         match &frame.inner {
             FrameInner::System(SystemFrame::Start(_)) => {
+                self.gate.reset();
                 processor.push_frame(frame, direction).await?;
                 self.connect(processor.clone()).await;
             }
@@ -394,38 +826,61 @@ impl FrameHandler for SarvamSttHandler {
             FrameInner::System(SystemFrame::InputAudioRaw(ref audio)) => {
                 processor.push_frame(frame.clone(), direction).await?;
 
-                // Denoise then send
-                let out_bytes = if let Some(ref nf) = self.noise_filter {
-                    let pcm = bytes_to_i16(&audio.audio);
-                    let filtered = nf.lock().await.filter(&pcm);
-                    if filtered.is_empty() {
-                        // Buffering — nothing to send yet
-                        return Ok(());
-                    }
-                    i16_to_bytes(&filtered)
-                } else {
-                    audio.audio.clone()
-                };
+                let samples = self.denoise(&audio.audio).await;
+                if samples.is_empty() {
+                    // Filter is buffering — nothing to admit yet.
+                    return Ok(());
+                }
 
-                self.send_audio(&out_bytes).await;
+                if self.gate.admit_audio(&samples, self.config.audio_gating) {
+                    self.send_audio(&i16_to_bytes(&samples)).await;
+                }
+                // else: buffered into the pre-roll ring; sent on VadStart.
+            }
+
+            FrameInner::System(SystemFrame::VADUserStartedSpeaking { .. }) => {
+                // Forwards the frame downstream (under the emit lock) and
+                // returns the pre-roll captured during VAD detection latency.
+                let pre_roll = self
+                    .gate
+                    .on_vad_start(processor, frame, direction)
+                    .await?;
+                if !pre_roll.is_empty() {
+                    log::debug!(
+                        "SarvamStt: sending {:.0}ms pre-roll",
+                        self.gate.ms_of(pre_roll.len())
+                    );
+                    self.send_audio(&i16_to_bytes(&pre_roll)).await;
+                }
             }
 
             FrameInner::System(SystemFrame::VADUserStoppedSpeaking { .. }) => {
-                processor.push_frame(frame, direction).await?;
+                // CONSUMED here — the gate releases it downstream after the
+                // transcript arrives (or the timeout fires). Never forwarded
+                // directly: that is the whole ordering guarantee.
 
-                // Flush noise filter — send any remaining denoised audio
-                if let Some(ref nf) = self.noise_filter {
-                    let tail = nf.lock().await.flush();
-                    if !tail.is_empty() {
-                        self.send_audio(&i16_to_bytes(&tail)).await;
-                    }
+                // Flush the denoiser tail and send it before the flush signal.
+                let tail = match &self.noise_filter {
+                    Some(nf) => nf.lock().await.flush(),
+                    None     => Vec::new(),
+                };
+                let tail_ms = self.gate.ms_of(tail.len());
+                if !tail.is_empty() {
+                    self.send_audio(&i16_to_bytes(&tail)).await;
                 }
 
+                let gen = self.gate.on_vad_stop(frame, tail_ms);
                 self.send_flush().await;
+
+                let gate = self.gate.clone();
+                let proc = processor.clone();
+                let after = Duration::from_millis(self.config.stop_release_timeout_ms);
+                tokio::spawn(gate.release_pending_after(proc, gen, after));
             }
 
             FrameInner::Control(ControlFrame::End { .. })
             | FrameInner::System(SystemFrame::Cancel { .. }) => {
+                self.gate.reset();
                 self.disconnect().await;
                 processor.push_frame(frame, direction).await?;
             }
@@ -469,37 +924,21 @@ async fn run_send_task(mut sink: WsSink, mut rx: mpsc::Receiver<String>) {
     log::debug!("SarvamStt: send task exited");
 }
 
-async fn run_receive_task(
-    mut stream:          WsStream,
-    processor:           FrameProcessor,
-    language_fallback:   Option<String>,
-    noise_filter:        Option<Arc<Mutex<RNNoiseFilter>>>,
-    billing:             Option<Arc<dyn BillingCollector>>,
-    audio_bytes:         Arc<AtomicU64>,
-    sample_rate:         u32,
-) {
+async fn run_receive_task(mut stream: WsStream, ctx: Arc<RxCtx>) {
     log::debug!("SarvamStt: receive task started");
 
     while let Some(result) = stream.next().await {
         match result {
             Ok(Message::Text(text)) => {
-                handle_message(
-                    text.as_str(),
-                    &processor,
-                    &language_fallback,
-                    &noise_filter,
-                    &billing,
-                    &audio_bytes,
-                    sample_rate,
-                )
-                .await;
+                handle_message(text.as_str(), &ctx).await;
             }
             Ok(Message::Close(_)) => {
                 log::info!("SarvamStt: server closed WebSocket");
                 break;
             }
             Err(e) => {
-                let _ = processor
+                let _ = ctx
+                    .processor
                     .push_error(format!("SarvamStt: receive error: {}", e), false)
                     .await;
                 break;
@@ -511,15 +950,7 @@ async fn run_receive_task(
     log::debug!("SarvamStt: receive task exited");
 }
 
-async fn handle_message(
-    text:              &str,
-    processor:         &FrameProcessor,
-    language_fallback: &Option<String>,
-    noise_filter:      &Option<Arc<Mutex<RNNoiseFilter>>>,
-    billing:           &Option<Arc<dyn BillingCollector>>,
-    audio_bytes:       &Arc<AtomicU64>,
-    sample_rate:       u32,
-) {
+async fn handle_message(text: &str, ctx: &Arc<RxCtx>) {
     log::debug!("SarvamStt: raw message: {}", text);
 
     let msg: SarvamMessage = match serde_json::from_str(text) {
@@ -532,7 +963,7 @@ async fn handle_message(
 
     match msg.msg_type.as_str() {
         "data" => {
-            handle_transcript(msg.data, processor, language_fallback, noise_filter, billing, audio_bytes, sample_rate).await;
+            handle_transcript(msg.data, ctx).await;
         }
         "events" => {
             if let Some(data) = msg.data {
@@ -556,15 +987,7 @@ async fn handle_message(
     }
 }
 
-async fn handle_transcript(
-    data:              Option<serde_json::Value>,
-    processor:         &FrameProcessor,
-    language_fallback: &Option<String>,
-    noise_filter:      &Option<Arc<Mutex<RNNoiseFilter>>>,
-    billing:           &Option<Arc<dyn BillingCollector>>,
-    audio_bytes:       &Arc<AtomicU64>,
-    sample_rate:       u32,
-) {
+async fn handle_transcript(data: Option<serde_json::Value>, ctx: &Arc<RxCtx>) {
     let data = match data {
         Some(d) => d,
         None    => return,
@@ -575,44 +998,68 @@ async fn handle_transcript(
         Err(e) => { log::warn!("SarvamStt: transcript parse: {}", e); return; }
     };
 
-    let text = match t.transcript {
-        Some(s) if !s.trim().is_empty() => s,
-        _ => return,
+    // Empty / missing text still counts as the answer to our flush: it must
+    // claim and release the pending stop so the turn closes promptly instead
+    // of waiting for the timeout.
+    let text: Option<String> = match t.transcript {
+        Some(s) if !s.trim().is_empty() => Some(s),
+        _ => None,
     };
 
-    // Swap the byte counter to zero and emit a billing event for this utterance.
-    // PCM i16 LE: 2 bytes per sample, mono → duration_ms = bytes / 2 / sample_rate * 1000
-    let bytes = audio_bytes.swap(0, Ordering::Relaxed);
-    if bytes > 0 {
-        if let Some(bc) = billing {
-            let duration_ms = (bytes as f64) / (2.0 * sample_rate as f64) * 1000.0;
+    let server_ms = t
+        .metrics
+        .as_ref()
+        .and_then(|m| m.audio_duration)
+        .map(|secs| secs * 1000.0);
+
+    let language = t.language_code.or_else(|| ctx.language_fallback.clone());
+
+    let frame_data = text.as_ref().map(|txt| {
+        let mut fd = TranscriptionData::new(txt.clone(), "", time_now_iso8601());
+        fd.language  = language.clone();
+        fd.finalized = true;
+        fd
+    });
+
+    let outcome = match ctx
+        .gate
+        .on_transcript(&ctx.processor, frame_data, server_ms)
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            log::error!("SarvamStt: gate emission failed: {}", e);
+            return;
+        }
+    };
+
+    log::info!(
+        "SarvamStt: transcript='{}' lang={:?} epoch={:?} dur={:.0}ms req_id={:?} released_stop={}",
+        text.as_deref().unwrap_or("<empty>"),
+        language,
+        outcome.father_epoch,
+        outcome.billed_ms,
+        t.request_id,
+        outcome.released_stop,
+    );
+
+    // Billing: prefer the server-reported duration (what Sarvam will bill);
+    // fall back to our ledger-consumed estimate for legacy models.
+    if outcome.billed_ms > 0.0 {
+        if let Some(bc) = &ctx.billing {
             bc.record(BillingEvent::SttUsage {
                 session_id:        bc.session_id(),
                 provider:          "sarvam".to_string(),
-                audio_duration_ms: duration_ms,
+                audio_duration_ms: outcome.billed_ms,
                 occurred_at:       Utc::now(),
             });
         }
     }
 
-    let language = t.language_code.or_else(|| language_fallback.clone());
-
-    // Reset noise filter — Sarvam's server-side VAD may have finalised
-    // this transcript without local VAD firing, so clear any buffered
-    // audio to start clean for the next utterance.
-    if let Some(ref nf) = noise_filter {
+    // Reset noise filter so the next utterance starts from a clean state.
+    if let Some(nf) = &ctx.noise_filter {
         nf.lock().await.reset();
     }
-
-    let mut frame_data = TranscriptionData::new(text, "", time_now_iso8601());
-    frame_data.language  = language;
-    frame_data.finalized = true;
-
-    log::info!("SarvamStt: transcript='{}' lang={:?}", frame_data.text, frame_data.language);
-
-    let _ = processor
-        .push_frame(Frame::transcription(frame_data), FrameDirection::Downstream)
-        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -644,59 +1091,210 @@ mod tests {
     use super::*;
     use crate::billing::{BillingCollector, BillingEvent, NoopBillingCollector};
 
-    // ---- Duration formula ---------------------------------------------------
+    fn dummy_proc() -> FrameProcessor {
+        FrameProcessor::new("test", Box::new(crate::frames::PassthroughHandler), false)
+    }
+
+    fn stop_frame() -> Frame {
+        Frame::vad_user_stopped_speaking(0.0, 0.0)
+    }
+
+    fn start_frame() -> Frame {
+        Frame::vad_user_started_speaking(0.0, 0.0)
+    }
+
+    // ---- ms_of ---------------------------------------------------------------
 
     #[test]
-    fn audio_duration_formula_16khz_1000ms() {
-        // 16000 samples/s × 2 bytes/sample = 32000 bytes → 1000 ms
-        let bytes: u64 = 32_000;
-        let sample_rate: u32 = 16_000;
-        let ms = (bytes as f64) / (2.0 * sample_rate as f64) * 1000.0;
-        assert!((ms - 1000.0).abs() < 0.001, "expected 1000ms, got {ms}");
+    fn ms_of_16khz_one_second() {
+        let gate = TurnGate::new(16_000, 500);
+        assert!((gate.ms_of(16_000) - 1000.0).abs() < 0.001);
     }
 
     #[test]
-    fn audio_duration_formula_8khz_500ms() {
-        // 8000 samples/s × 2 bytes × 0.5s = 8000 bytes → 500 ms
-        let bytes: u64 = 8_000;
-        let sample_rate: u32 = 8_000;
-        let ms = (bytes as f64) / (2.0 * sample_rate as f64) * 1000.0;
-        assert!((ms - 500.0).abs() < 0.001, "expected 500ms, got {ms}");
+    fn ms_of_8khz_half_second() {
+        let gate = TurnGate::new(8_000, 500);
+        assert!((gate.ms_of(4_000) - 500.0).abs() < 0.001);
+    }
+
+    // ---- pre-roll ring -------------------------------------------------------
+
+    #[test]
+    fn pre_roll_ring_is_capped() {
+        // 16kHz × 100ms cap = 1600 samples
+        let gate = TurnGate::new(16_000, 100);
+        let chunk = vec![1i16; 800];
+        for _ in 0..5 {
+            let sent = gate.admit_audio(&chunk, true);
+            assert!(!sent, "quiet audio must be buffered, not sent");
+        }
+        let s = gate.inner.lock().unwrap();
+        assert_eq!(s.pre_roll.len(), 1600, "ring must be capped at pre_roll_cap");
     }
 
     #[test]
-    fn audio_duration_formula_24khz_250ms() {
-        // 24000 samples/s × 2 bytes × 0.25s = 12000 bytes → 250ms
-        let bytes: u64 = 12_000;
-        let sample_rate: u32 = 24_000;
-        let ms = (bytes as f64) / (2.0 * sample_rate as f64) * 1000.0;
-        assert!((ms - 250.0).abs() < 0.001, "expected 250ms, got {ms}");
+    fn admit_audio_sends_while_speaking_and_accounts_duration() {
+        let gate = TurnGate::new(16_000, 100);
+        {
+            let mut s = gate.inner.lock().unwrap();
+            s.speaking = true;
+        }
+        let chunk = vec![0i16; 16_000]; // 1000ms
+        assert!(gate.admit_audio(&chunk, true));
+        let s = gate.inner.lock().unwrap();
+        assert!((s.current_sent_ms - 1000.0).abs() < 0.001);
     }
-
-    // ---- AtomicU64 counter --------------------------------------------------
 
     #[test]
-    fn audio_bytes_atomic_increments_and_swap_resets() {
-        let counter = Arc::new(AtomicU64::new(0));
-        counter.fetch_add(1024, Ordering::Relaxed);
-        counter.fetch_add(2048, Ordering::Relaxed);
-        let total = counter.swap(0, Ordering::Relaxed);
-        assert_eq!(total, 3072);
-        assert_eq!(counter.load(Ordering::Relaxed), 0, "counter must be zero after swap");
+    fn admit_audio_ungated_always_sends() {
+        let gate = TurnGate::new(16_000, 100);
+        let chunk = vec![0i16; 1600];
+        assert!(gate.admit_audio(&chunk, false), "ungated mode must always send");
     }
 
-    // ---- with_billing builder -----------------------------------------------
+    // ---- stash / claim / drop -------------------------------------------------
+
+    #[tokio::test]
+    async fn vad_start_drops_pending_stop_and_bumps_epoch() {
+        let gate = TurnGate::new(16_000, 100);
+        let gen = gate.on_vad_stop(stop_frame(), 0.0);
+        assert!(gate.inner.lock().unwrap().pending_stop.is_some());
+
+        let pre = gate
+            .on_vad_start(&dummy_proc(), start_frame(), FrameDirection::Downstream)
+            .await
+            .unwrap();
+        assert!(pre.is_empty());
+
+        let s = gate.inner.lock().unwrap();
+        assert!(s.pending_stop.is_none(), "barge-in must drop the pending stop");
+        assert_eq!(s.epoch, 1);
+        assert_ne!(s.timeout_gen, gen, "drop must disarm the release timer");
+    }
+
+    #[tokio::test]
+    async fn transcript_claims_pending_stop_exactly_once() {
+        let gate = TurnGate::new(16_000, 100);
+        gate.on_vad_stop(stop_frame(), 0.0);
+
+        let o1 = gate
+            .on_transcript(&dummy_proc(), None, Some(0.0))
+            .await
+            .unwrap();
+        assert!(o1.released_stop, "first claim must win");
+
+        let o2 = gate
+            .on_transcript(&dummy_proc(), None, Some(0.0))
+            .await
+            .unwrap();
+        assert!(!o2.released_stop, "second claim must find nothing");
+    }
+
+    #[tokio::test]
+    async fn stale_timeout_generation_cannot_steal_newer_stash() {
+        let gate = TurnGate::new(16_000, 100);
+        let old_gen = gate.on_vad_stop(stop_frame(), 0.0);
+
+        // Transcript claims it (and bumps the generation)...
+        let o = gate.on_transcript(&dummy_proc(), None, None).await.unwrap();
+        assert!(o.released_stop);
+
+        // ...then a NEW turn is stashed.
+        gate.on_vad_start(&dummy_proc(), start_frame(), FrameDirection::Downstream)
+            .await
+            .unwrap();
+        gate.on_vad_stop(stop_frame(), 0.0);
+
+        // The old timer fires with its stale generation: must be a no-op.
+        gate.clone()
+            .release_pending_after(dummy_proc(), old_gen, Duration::from_millis(0))
+            .await;
+        assert!(
+            gate.inner.lock().unwrap().pending_stop.is_some(),
+            "stale timer must not release a newer turn's pending stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_transcript_still_releases_pending_stop() {
+        let gate = TurnGate::new(16_000, 100);
+        gate.on_vad_stop(stop_frame(), 0.0);
+        // data: None models an empty/whitespace transcript from Sarvam.
+        let o = gate.on_transcript(&dummy_proc(), None, Some(40.0)).await.unwrap();
+        assert!(o.released_stop, "empty answer must still close the turn");
+        assert!(gate.inner.lock().unwrap().pending_stop.is_none());
+    }
+
+    // ---- ledger ----------------------------------------------------------------
+
+    fn gate_with_ledger(entries: &[(u64, f64)]) -> Arc<TurnGate> {
+        let gate = TurnGate::new(16_000, 100);
+        {
+            let mut s = gate.inner.lock().unwrap();
+            for &(epoch, ms) in entries {
+                s.ledger.push_back(LedgerEntry { epoch, ms });
+            }
+        }
+        gate
+    }
 
     #[test]
-    fn with_billing_sets_field() {
-        let h = SarvamSttHandler::new(SarvamSttConfig {
-            noise_reduction: false,
-            ..Default::default()
-        }).with_billing(Arc::new(NoopBillingCollector));
-        assert!(h.billing.is_some());
+    fn ledger_exact_consume_attributes_to_single_epoch() {
+        let gate = gate_with_ledger(&[(3, 1840.0)]);
+        let mut s = gate.inner.lock().unwrap();
+        let (father, billed) = consume_ledger(&mut s, Some(1840.0));
+        assert_eq!(father, Some(3));
+        assert!((billed - 1840.0).abs() < 0.001);
+        assert!(s.ledger.is_empty(), "fully consumed entry must be popped");
     }
 
-    // ---- handle_transcript billing integration ------------------------------
+    #[test]
+    fn ledger_tolerates_server_silence_trim() {
+        // Sent 2000ms, server reports 1900ms (trimmed 100ms < tolerance):
+        // the 100ms remainder must not linger and pollute the next turn.
+        let gate = gate_with_ledger(&[(4, 2000.0)]);
+        let mut s = gate.inner.lock().unwrap();
+        let (father, _) = consume_ledger(&mut s, Some(1900.0));
+        assert_eq!(father, Some(4));
+        assert!(s.ledger.is_empty(), "sub-tolerance remainder must be dropped");
+    }
+
+    #[test]
+    fn ledger_spanning_consume_attributes_to_last_epoch_touched() {
+        let gate = gate_with_ledger(&[(5, 500.0), (6, 1500.0)]);
+        let mut s = gate.inner.lock().unwrap();
+        let (father, _) = consume_ledger(&mut s, Some(1000.0));
+        assert_eq!(father, Some(6), "consumption ends in epoch 6");
+        assert_eq!(s.ledger.len(), 1);
+        assert!((s.ledger[0].ms - 1000.0).abs() < 0.001, "epoch 6 keeps its remainder");
+    }
+
+    #[test]
+    fn ledger_fallback_without_metrics_consumes_oldest_turn_whole() {
+        let gate = gate_with_ledger(&[(7, 800.0), (8, 600.0)]);
+        let mut s = gate.inner.lock().unwrap();
+        let (father, billed) = consume_ledger(&mut s, None);
+        assert_eq!(father, Some(7));
+        assert!((billed - 800.0).abs() < 0.001);
+        assert_eq!(s.ledger.len(), 1);
+    }
+
+    #[test]
+    fn ledger_mid_turn_transcript_charges_open_epoch() {
+        let gate = TurnGate::new(16_000, 100);
+        {
+            let mut s = gate.inner.lock().unwrap();
+            s.speaking = true;
+            s.epoch = 9;
+            s.current_sent_ms = 3000.0;
+        }
+        let mut s = gate.inner.lock().unwrap();
+        let (father, _) = consume_ledger(&mut s, Some(1200.0));
+        assert_eq!(father, Some(9));
+        assert!((s.current_sent_ms - 1800.0).abs() < 0.001);
+    }
+
+    // ---- billing integration ----------------------------------------------------
 
     struct MockCollector {
         session_id: uuid::Uuid,
@@ -716,79 +1314,79 @@ mod tests {
         fn session_id(&self) -> uuid::Uuid { self.session_id }
     }
 
-    fn dummy_proc() -> FrameProcessor {
-        FrameProcessor::new("test", Box::new(crate::frames::PassthroughHandler), false)
+    fn rx_ctx(gate: Arc<TurnGate>, billing: Option<Arc<dyn BillingCollector>>) -> Arc<RxCtx> {
+        Arc::new(RxCtx {
+            processor:         dummy_proc(),
+            gate,
+            language_fallback: None,
+            noise_filter:      None,
+            billing,
+        })
     }
 
     #[tokio::test]
-    async fn billing_transcript_emits_stt_usage_with_correct_duration() {
-        // 16kHz, 32000 bytes = 1000ms
-        let audio_bytes = Arc::new(AtomicU64::new(32_000));
-        let mock    = MockCollector::new();
-        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
-        let data    = serde_json::json!({ "transcript": "hello world", "language_code": "en-IN" });
+    async fn billing_prefers_server_reported_duration() {
+        let gate = gate_with_ledger(&[(1, 2000.0)]);
+        let mock = MockCollector::new();
+        let ctx  = rx_ctx(gate, Some(mock.clone()));
 
-        handle_transcript(Some(data), &dummy_proc(), &None, &None, &billing, &audio_bytes, 16_000).await;
+        // Server says 1.84s even though we sent 2.0s.
+        let data = serde_json::json!({
+            "transcript": "namaskaram",
+            "language_code": "ml-IN",
+            "request_id": "req-123",
+            "metrics": { "audio_duration": 1.84, "processing_latency": 0.21 }
+        });
+        handle_transcript(Some(data), &ctx).await;
 
         let evs = mock.events();
-        assert_eq!(evs.len(), 1, "expected exactly one SttUsage event");
+        assert_eq!(evs.len(), 1);
         match &evs[0] {
             BillingEvent::SttUsage { provider, audio_duration_ms, .. } => {
                 assert_eq!(provider, "sarvam");
-                assert!((audio_duration_ms - 1000.0).abs() < 0.001, "expected 1000ms, got {audio_duration_ms}");
+                assert!((audio_duration_ms - 1840.0).abs() < 0.001);
             }
             other => panic!("expected SttUsage, got {:?}", other),
         }
-        // Counter swapped to zero
-        assert_eq!(audio_bytes.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
-    async fn billing_transcript_with_zero_bytes_emits_no_event() {
-        let audio_bytes = Arc::new(AtomicU64::new(0));
-        let mock    = MockCollector::new();
-        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
-        let data    = serde_json::json!({ "transcript": "hello", "language_code": "en-IN" });
+    async fn billing_falls_back_to_ledger_without_metrics() {
+        let gate = gate_with_ledger(&[(2, 750.0)]);
+        let mock = MockCollector::new();
+        let ctx  = rx_ctx(gate, Some(mock.clone()));
 
-        handle_transcript(Some(data), &dummy_proc(), &None, &None, &billing, &audio_bytes, 16_000).await;
-        assert_eq!(mock.events().len(), 0, "zero bytes must not emit billing event");
-    }
-
-    #[tokio::test]
-    async fn billing_no_collector_transcript_does_not_panic() {
-        let audio_bytes = Arc::new(AtomicU64::new(16_000));
-        let billing: Option<Arc<dyn BillingCollector>> = None;
-        let data    = serde_json::json!({ "transcript": "hello", "language_code": "en-IN" });
-
-        handle_transcript(Some(data), &dummy_proc(), &None, &None, &billing, &audio_bytes, 16_000).await;
-        // no panic; counter still reset
-        assert_eq!(audio_bytes.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn billing_transcript_counter_resets_per_utterance() {
-        let audio_bytes = Arc::new(AtomicU64::new(32_000)); // 1st utterance: 1000ms
-        let mock    = MockCollector::new();
-        let billing: Option<Arc<dyn BillingCollector>> = Some(mock.clone());
-        let data1   = serde_json::json!({ "transcript": "first", "language_code": "en-IN" });
-        handle_transcript(Some(data1), &dummy_proc(), &None, &None, &billing, &audio_bytes, 16_000).await;
-
-        // Simulate second utterance
-        audio_bytes.fetch_add(16_000, Ordering::Relaxed); // 500ms
-        let data2 = serde_json::json!({ "transcript": "second", "language_code": "en-IN" });
-        handle_transcript(Some(data2), &dummy_proc(), &None, &None, &billing, &audio_bytes, 16_000).await;
+        let data = serde_json::json!({ "transcript": "hello", "language_code": "en-IN" });
+        handle_transcript(Some(data), &ctx).await;
 
         let evs = mock.events();
-        assert_eq!(evs.len(), 2);
-        let durations: Vec<f64> = evs.iter().filter_map(|e| match e {
-            BillingEvent::SttUsage { audio_duration_ms, .. } => Some(*audio_duration_ms),
-            _ => None,
-        }).collect();
-        assert!((durations[0] - 1000.0).abs() < 0.001, "1st utterance: {}", durations[0]);
-        assert!((durations[1] -  500.0).abs() < 0.001, "2nd utterance: {}", durations[1]);
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            BillingEvent::SttUsage { audio_duration_ms, .. } => {
+                assert!((audio_duration_ms - 750.0).abs() < 0.001);
+            }
+            other => panic!("expected SttUsage, got {:?}", other),
+        }
     }
 
-    // ---- Config / URL helpers -----------------------------------------------
+    #[tokio::test]
+    async fn no_collector_does_not_panic() {
+        let gate = gate_with_ledger(&[(1, 500.0)]);
+        let ctx  = rx_ctx(gate, None);
+        let data = serde_json::json!({ "transcript": "hello" });
+        handle_transcript(Some(data), &ctx).await;
+    }
+
+    // ---- builders / config -------------------------------------------------------
+
+    #[test]
+    fn with_billing_sets_field() {
+        let h = SarvamSttHandler::new(SarvamSttConfig {
+            noise_reduction: false,
+            ..Default::default()
+        }).with_billing(Arc::new(NoopBillingCollector));
+        assert!(h.billing.is_some());
+    }
 
     #[test]
     fn ws_url_contains_model_and_sample_rate() {

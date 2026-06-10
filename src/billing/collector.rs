@@ -243,8 +243,8 @@ mod tests {
             self.0.lock().unwrap().push(e.clone());
             Ok(())
         }
-        async fn finalize_session(&self, s: &SessionSummary) -> crate::error::Result<()> {
-            *self.1.lock().unwrap() = Some(s.clone());
+        async fn finalize_session(&self, summary: &SessionSummary, transcripts: &[TranscriptEntry]) -> crate::error::Result<()> {
+            *self.1.lock().unwrap() = Some(summary.clone());
             Ok(())
         }
     }

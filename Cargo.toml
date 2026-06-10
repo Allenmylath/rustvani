@@ -1,6 +1,6 @@
 [package]
 name = "rustvani"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 license = "BSD-2-Clause"
 description = "Voice AI framework for Rust — real-time speech pipelines with STT, LLM, TTS, and Dhara conversation flows"
