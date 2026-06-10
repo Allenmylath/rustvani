@@ -138,6 +138,19 @@ impl BaseObserver for RaviObserver {
                 self.send(json).await;
             }
 
+            // Bundled closing transcript on the VadStop frame (TurnGate release path).
+            FrameInner::System(SystemFrame::VADUserStoppedSpeaking { transcript: Some(t), .. })
+                if self.params.user_transcription_enabled =>
+            {
+                let json = models::msg_user_transcription(
+                    &t.text,
+                    &t.user_id,
+                    &t.timestamp,
+                    t.finalized,
+                );
+                self.send(json).await;
+            }
+
             // ---- LLM response boundaries ----
             FrameInner::Control(ControlFrame::LLMFullResponseStart)
                 if self.params.bot_llm_enabled =>

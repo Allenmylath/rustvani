@@ -17,14 +17,13 @@
 //!    from a local-VAD-attested turn. Spurious "fatherless" transcripts are
 //!    impossible by construction, not by bookkeeping.
 //!
-//! 2. STOP-FRAME GATING (transcript-before-stop ordering).
+//! 2. STOP-FRAME GATING (transcript bundled onto the released stop).
 //!    VADUserStoppedSpeaking is never forwarded directly. It is stashed in
 //!    the gate; the WebSocket receive task releases it downstream immediately
-//!    AFTER pushing the transcript it was waiting for. Both pushes happen
-//!    sequentially from one task, so downstream FIFO guarantees the
-//!    aggregator always sees Transcript → VadStop, never the reverse.
-//!    A timeout (stop_release_timeout_ms) releases the stop if Sarvam never
-//!    replies, so a turn cannot hang.
+//!    AFTER pushing the transcript it was waiting for. The transcript is
+//!    bundled onto the stop frame itself so that a single frame carries both
+//!    the turn boundary and the text. Separate frames cannot guarantee order
+//!    across the system/data lanes, so one frame is the only structural fix.
 //!
 //! 3. EMISSION LINEARIZATION (the `emit` mutex).
 //!    Turn frames (VadStart, Transcription, released VadStop) can originate
@@ -440,10 +439,10 @@ impl TurnGate {
         false
     }
 
-    /// A Sarvam data message arrived on the receive task. Pushes the
-    /// transcript (if any) downstream, then releases the pending stop (if
-    /// any) immediately after it — both under the emit lock, from this one
-    /// task, so downstream order is Transcript → VadStop, always.
+    /// A Sarvam data message arrived on the receive task. If a pending stop
+    /// is present, the transcript (if any) is bundled onto it and the single
+    /// combined frame is released downstream. If there is no pending stop,
+    /// the transcript is pushed as a standalone data frame (mid-turn partial).
     ///
     /// `server_ms` is metrics.audio_duration × 1000 when present; it drives
     /// ledger attribution and is the preferred billing duration.
@@ -466,21 +465,26 @@ impl TurnGate {
             (stop, father, consumed)
         };
 
-        if let Some(td) = data {
-            processor
-                .push_frame(Frame::transcription(td), FrameDirection::Downstream)
-                .await?;
-        }
-
         let released = stop.is_some();
-        if let Some(stop_frame) = stop {
-            log::debug!(
-                "TurnGate: releasing VadStop after transcript (epoch {:?})",
-                father
-            );
-            processor
-                .push_frame(stop_frame, FrameDirection::Downstream)
-                .await?;
+        match stop {
+            Some(stop_frame) => {
+                // Closing transcript rides the stop — single frame, no lane race.
+                let stop_frame = match data {
+                    Some(td) => stop_frame.with_vad_stop_transcript(td),
+                    None     => stop_frame, // empty answer still closes the turn
+                };
+                log::debug!(
+                    "TurnGate: releasing VadStop (+transcript) for epoch {:?}",
+                    father
+                );
+                processor.push_frame(stop_frame, FrameDirection::Downstream).await?;
+            }
+            None => {
+                // Mid-turn transcript: turn still open, standalone data frame is fine.
+                if let Some(td) = data {
+                    processor.push_frame(Frame::transcription(td), FrameDirection::Downstream).await?;
+                }
+            }
         }
 
         Ok(TranscriptOutcome {

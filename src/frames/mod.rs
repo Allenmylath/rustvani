@@ -210,7 +210,16 @@ pub enum SystemFrame {
     UserStartedSpeaking { emulated: bool },
     UserStoppedSpeaking  { emulated: bool },
     VADUserStartedSpeaking { start_secs: f32, timestamp: f64 },
-    VADUserStoppedSpeaking { stop_secs: f32, timestamp: f64 },
+    VADUserStoppedSpeaking {
+        stop_secs: f32,
+        timestamp: f64,
+        /// Transcript bundled by the STT TurnGate when releasing a gated stop.
+        /// Riding the stop frame makes Transcript→Stop ordering structural:
+        /// system and data frames travel different lanes (system frames are
+        /// processed inline on the input task and jump the process queue),
+        /// so two separate frames WILL reorder. One frame cannot.
+        transcript: Option<TranscriptionData>,
+    },
     ClientVADUserStartedSpeaking { timestamp: f64 },
     ClientVADUserStoppedSpeaking  { timestamp: f64 },
 
@@ -479,7 +488,19 @@ impl Frame {
         Self::make(FrameInner::System(SystemFrame::VADUserStartedSpeaking { start_secs, timestamp }))
     }
     pub fn vad_user_stopped_speaking(stop_secs: f32, timestamp: f64) -> Self {
-        Self::make(FrameInner::System(SystemFrame::VADUserStoppedSpeaking { stop_secs, timestamp }))
+        Self::make(FrameInner::System(SystemFrame::VADUserStoppedSpeaking {
+            stop_secs, timestamp, transcript: None,
+        }))
+    }
+
+    /// Attach a transcript to an existing VadStop frame (TurnGate release path).
+    pub fn with_vad_stop_transcript(mut self, t: TranscriptionData) -> Self {
+        if let FrameInner::System(SystemFrame::VADUserStoppedSpeaking { transcript, .. }) =
+            &mut self.inner
+        {
+            *transcript = Some(t);
+        }
+        self
     }
     pub fn client_vad_user_started_speaking(timestamp: f64) -> Self {
         Self::make(FrameInner::System(SystemFrame::ClientVADUserStartedSpeaking { timestamp }))

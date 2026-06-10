@@ -233,26 +233,31 @@ impl FrameHandler for LLMUserAggregator {
                 }
             }
 
-            FrameInner::System(SystemFrame::VADUserStoppedSpeaking { .. }) => {
-                let was_open = {
+            FrameInner::System(SystemFrame::VADUserStoppedSpeaking { transcript, .. }) => {
+                let (was_open, has_text) = {
                     let mut state = self.state.lock().unwrap();
+                    if let Some(td) = transcript {
+                        let text = td.text.trim();
+                        if !text.is_empty() {
+                            if state.aggregation.is_empty() {
+                                state.aggregation = text.to_string();
+                            } else {
+                                state.aggregation.push(' ');
+                                state.aggregation.push_str(text);
+                            }
+                        }
+                    }
                     let was_open = state.turn_open;
                     state.turn_open = false;
-                    was_open
+                    (was_open, !state.aggregation.is_empty() || !state.deferred.is_empty())
                 };
 
-                // Push VAD frame first so downstream sees it before LLMContextFrame
+                // Forward first — frame still carries the transcript, so downstream
+                // (RaviProcessor) can relay the user transcript to the client UI.
                 processor.push_frame(frame, direction).await?;
 
-                if was_open {
-                    // The ONLY trigger path. The gate guarantees this frame
-                    // arrives after the turn's transcript(s).
+                if was_open || has_text {
                     self.flush_and_trigger(processor).await?;
-                } else {
-                    log::warn!(
-                        "LLMUserAggregator: VadStop with no open turn — ignored \
-                         (gate should make this unreachable)"
-                    );
                 }
             }
 
@@ -310,6 +315,7 @@ impl FrameHandler for LLMUserAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frames::{StartFrameData, TranscriptionData};
 
     #[test]
     fn combine_joins_deferred_and_current() {
@@ -321,5 +327,41 @@ mod tests {
             "cancel cheyyanam of my order"
         );
         assert_eq!(combine("  padded  ", "  text  "), "padded text");
+    }
+
+    #[tokio::test]
+    async fn vad_stop_with_bundled_transcript_triggers_llm() {
+        let ctx = Arc::new(Mutex::new(LLMContext::new(None)));
+        let proc = LLMUserAggregator::new(ctx);
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        proc.on_after_push_frame(move |f| {
+            cap.lock().unwrap().push(f.clone());
+        });
+
+        // StartFrame so push_frame is not blocked by check_started.
+        let _ = proc
+            .process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream)
+            .await;
+
+        // Open turn.
+        let _ = proc
+            .process_frame(Frame::vad_user_started_speaking(0.0, 0.0), FrameDirection::Downstream)
+            .await;
+
+        // Stop with bundled transcript — the gate's release path.
+        let td = TranscriptionData::new("hello world", "user", "2024-01-01T00:00:00Z");
+        let stop = Frame::vad_user_stopped_speaking(0.0, 0.0).with_vad_stop_transcript(td);
+        let _ = proc.process_frame(stop, FrameDirection::Downstream).await;
+
+        let frames = captured.lock().unwrap();
+        let has_context = frames.iter().any(|f| {
+            matches!(f.inner, FrameInner::Data(DataFrame::LLMContextFrame(_)))
+        });
+        assert!(
+            has_context,
+            "expected LLMContextFrame after VadStop with bundled transcript"
+        );
     }
 }
