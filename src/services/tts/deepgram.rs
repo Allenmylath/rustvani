@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log;
 use serde::Deserialize;
@@ -26,6 +27,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::billing::{BillingCollector, BillingEvent};
 use crate::error::Result;
 use crate::frames::{
     AudioRawData, ControlFrame, DataFrame, Frame, FrameDirection, FrameHandler, FrameInner,
@@ -139,6 +141,8 @@ struct TtsState {
     flush_sent_at:      Option<f64>,
     /// True once first audio has arrived after a flush.
     first_audio_logged: bool,
+    /// Accumulated character count since last Flushed confirmation.
+    pending_chars:      usize,
 }
 
 impl TtsState {
@@ -150,6 +154,7 @@ impl TtsState {
             receive_task:       None,
             flush_sent_at:      None,
             first_audio_logged: true,
+            pending_chars:      0,
         }
     }
 }
@@ -162,6 +167,8 @@ pub struct DeepgramTtsHandler {
     config:      DeepgramTtsConfig,
     sample_rate: u32,
     state:       Arc<Mutex<TtsState>>,
+    /// Optional billing collector — records char counts per synthesis flush.
+    billing:     Option<Arc<dyn BillingCollector>>,
 }
 
 impl DeepgramTtsHandler {
@@ -176,7 +183,13 @@ impl DeepgramTtsHandler {
             config,
             sample_rate,
             state: Arc::new(Mutex::new(TtsState::new())),
+            billing: None,
         })
+    }
+
+    pub fn with_billing(mut self, billing: Arc<dyn BillingCollector>) -> Self {
+        self.billing = Some(billing);
+        self
     }
 
     pub fn into_processor(self) -> FrameProcessor {
@@ -243,6 +256,8 @@ impl DeepgramTtsHandler {
             processor.clone(),
             self.sample_rate,
             self.state.clone(),
+            self.billing.clone(),
+            self.config.voice.clone(),
         ));
 
         {
@@ -278,7 +293,11 @@ impl DeepgramTtsHandler {
     }
 
     async fn send_speak(&self, text: &str) {
-        let tx = { self.state.lock().await.ws_tx.clone() };
+        let tx = {
+            let mut s = self.state.lock().await;
+            s.pending_chars += text.chars().count();
+            s.ws_tx.clone()
+        };
         if let Some(tx) = tx {
             let ts = now();
             println!("[{:.3}] [tts] speak  ({} chars): {:?}", ts, text.len(), text);
@@ -427,6 +446,8 @@ async fn run_receive_task(
     processor:   FrameProcessor,
     sample_rate: u32,
     state:       Arc<Mutex<TtsState>>,
+    billing:     Option<Arc<dyn BillingCollector>>,
+    voice:       String,
 ) {
     log::debug!("DeepgramTts: receive task started");
 
@@ -470,7 +491,7 @@ async fn run_receive_task(
 
             // Text messages contain metadata / control signals.
             Ok(Message::Text(text)) => {
-                handle_text_message(text.as_str(), &processor).await;
+                handle_text_message(text.as_str(), &processor, &state, &billing, &voice).await;
             }
 
             Ok(Message::Close(_)) => {
@@ -492,7 +513,13 @@ async fn run_receive_task(
     log::debug!("DeepgramTts: receive task exited");
 }
 
-async fn handle_text_message(text: &str, processor: &FrameProcessor) {
+async fn handle_text_message(
+    text:      &str,
+    processor: &FrameProcessor,
+    state:     &Arc<Mutex<TtsState>>,
+    billing:   &Option<Arc<dyn BillingCollector>>,
+    voice:     &str,
+) {
     log::trace!("DeepgramTts: raw message: {}", text);
 
     let msg: DeepgramMessage = match serde_json::from_str(text) {
@@ -510,13 +537,29 @@ async fn handle_text_message(text: &str, processor: &FrameProcessor) {
 
         "Flushed" => {
             log::debug!("DeepgramTts: Flushed — synthesis complete for current buffer");
-            // The Flushed signal means all audio for the flushed text has been
-            // sent. Downstream transport will handle BotStoppedSpeaking once
-            // audio playout finishes.
+            // Take the accumulated char count and emit a billing event.
+            let chars = {
+                let mut s = state.lock().await;
+                std::mem::replace(&mut s.pending_chars, 0)
+            };
+            if chars > 0 {
+                if let Some(bc) = billing {
+                    bc.record(BillingEvent::TtsUsage {
+                        session_id:  bc.session_id(),
+                        provider:    "deepgram".to_string(),
+                        voice:       voice.to_string(),
+                        char_count:  chars,
+                        occurred_at: Utc::now(),
+                    });
+                }
+            }
+            let _ = processor;
         }
 
         "Cleared" => {
             log::debug!("DeepgramTts: Cleared — buffer cleared after interruption");
+            // Discard pending chars — they were cleared and won't be synthesized.
+            state.lock().await.pending_chars = 0;
         }
 
         "Warning" => {
@@ -647,5 +690,98 @@ mod tests {
     fn test_urlencoding() {
         assert_eq!(urlencoding("aura-2-helena-en"), "aura-2-helena-en");
         assert_eq!(urlencoding("model:v2"), "model%3Av2");
+    }
+
+    // ---- Billing tests -------------------------------------------------------
+
+    struct MockCollector {
+        session_id: uuid::Uuid,
+        events: std::sync::Mutex<Vec<BillingEvent>>,
+    }
+    impl MockCollector {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                session_id: uuid::Uuid::new_v4(),
+                events: std::sync::Mutex::new(vec![]),
+            })
+        }
+        fn events(&self) -> Vec<BillingEvent> { self.events.lock().unwrap().clone() }
+    }
+    impl crate::billing::BillingCollector for MockCollector {
+        fn record(&self, e: BillingEvent) { self.events.lock().unwrap().push(e); }
+        fn session_id(&self) -> uuid::Uuid { self.session_id }
+    }
+
+    fn state_with_chars(n: usize) -> Arc<Mutex<TtsState>> {
+        let mut s = TtsState::new();
+        s.pending_chars = n;
+        Arc::new(Mutex::new(s))
+    }
+
+    fn dummy_proc() -> FrameProcessor {
+        FrameProcessor::new("test", Box::new(crate::frames::PassthroughHandler), false)
+    }
+
+    #[tokio::test]
+    async fn billing_flushed_emits_tts_usage_event() {
+        let state   = state_with_chars(42);
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn crate::billing::BillingCollector>> = Some(mock.clone());
+
+        handle_text_message(r#"{"type":"Flushed"}"#, &dummy_proc(), &state, &billing, "aura-2-helena-en").await;
+
+        let evs = mock.events();
+        assert_eq!(evs.len(), 1, "expected exactly one TtsUsage event");
+        match &evs[0] {
+            BillingEvent::TtsUsage { provider, char_count, voice, .. } => {
+                assert_eq!(provider, "deepgram");
+                assert_eq!(*char_count, 42);
+                assert_eq!(voice, "aura-2-helena-en");
+            }
+            other => panic!("expected TtsUsage, got {:?}", other),
+        }
+        assert_eq!(state.lock().await.pending_chars, 0, "pending_chars must be reset after Flushed");
+    }
+
+    #[tokio::test]
+    async fn billing_flushed_with_zero_chars_emits_no_event() {
+        let state   = state_with_chars(0);
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn crate::billing::BillingCollector>> = Some(mock.clone());
+
+        handle_text_message(r#"{"type":"Flushed"}"#, &dummy_proc(), &state, &billing, "v").await;
+        assert_eq!(mock.events().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn billing_cleared_resets_chars_without_emitting_event() {
+        let state   = state_with_chars(99);
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn crate::billing::BillingCollector>> = Some(mock.clone());
+
+        handle_text_message(r#"{"type":"Cleared"}"#, &dummy_proc(), &state, &billing, "v").await;
+
+        assert_eq!(mock.events().len(), 0, "Cleared must not emit a billing event");
+        assert_eq!(state.lock().await.pending_chars, 0, "pending_chars must be zeroed by Cleared");
+    }
+
+    #[tokio::test]
+    async fn billing_no_collector_flushed_does_not_panic() {
+        let state   = state_with_chars(50);
+        let billing: Option<Arc<dyn crate::billing::BillingCollector>> = None;
+
+        handle_text_message(r#"{"type":"Flushed"}"#, &dummy_proc(), &state, &billing, "v").await;
+        // Still resets pending_chars
+        assert_eq!(state.lock().await.pending_chars, 0);
+    }
+
+    #[test]
+    fn with_billing_sets_field() {
+        use crate::billing::NoopBillingCollector;
+        let h = DeepgramTtsHandler::new(DeepgramTtsConfig {
+            api_key: "key".into(),
+            ..DeepgramTtsConfig::default()
+        }).unwrap().with_billing(Arc::new(NoopBillingCollector));
+        assert!(h.billing.is_some());
     }
 }

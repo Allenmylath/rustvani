@@ -32,15 +32,17 @@
 //! loop and any external observers. It fires at most three times per session
 //! (NotStarted → Running → Finished). Everything else uses direct callbacks.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::future::BoxFuture;
 use tokio::sync::{mpsc, watch, Notify};
 
+use crate::billing::{BillingCollector, BillingEvent};
 use crate::clock::BaseClock;
 
 use crate::error::{PipecatError, Result};
@@ -86,6 +88,14 @@ pub struct PipelineParams {
     /// Frame kinds that reset the idle timer.
     /// Defaults are `BotSpeaking` and `UserSpeaking` — set explicitly to override.
     pub idle_timeout_frames: HashSet<FrameKind>,
+
+    // Billing
+    /// Optional billing collector. When set, `SessionStart` and `SessionEnd`
+    /// events are emitted automatically at pipeline start and finish.
+    pub billing_collector: Option<Arc<dyn BillingCollector>>,
+    /// Key-value metadata forwarded in the `SessionStart` billing event.
+    /// Useful for tagging sessions with user_id, tenant_id, phone_number, etc.
+    pub billing_metadata: HashMap<String, String>,
 }
 
 impl Default for PipelineParams {
@@ -103,6 +113,8 @@ impl Default for PipelineParams {
             idle_timeout:             None,
             cancel_on_idle_timeout:   true,
             idle_timeout_frames,
+            billing_collector:        None,
+            billing_metadata:         HashMap::new(),
         }
     }
 }
@@ -630,6 +642,41 @@ impl PipelineTask {
         self.pipeline
             .setup(FrameProcessorSetup { clock, observer })
             .await?;
+
+        // Register billing lifecycle hooks when a collector is configured.
+        if let Some(bc) = self.params.billing_collector.clone() {
+            let bc_start = bc.clone();
+            let meta = self.params.billing_metadata.clone();
+            self.add_on_pipeline_started(move |_frame| {
+                let bc = bc_start.clone();
+                let m  = meta.clone();
+                Box::pin(async move {
+                    bc.record(BillingEvent::SessionStart {
+                        session_id: bc.session_id(),
+                        started_at: Utc::now(),
+                        metadata:   m,
+                    });
+                })
+            });
+
+            let bc_end = bc.clone();
+            self.add_on_pipeline_finished(move |_frame, reason| {
+                let bc = bc_end.clone();
+                let finish = match &reason {
+                    FinishReason::End        => "end",
+                    FinishReason::Stop       => "stop",
+                    FinishReason::Cancel(_)  => "cancel",
+                }
+                .to_string();
+                Box::pin(async move {
+                    bc.record(BillingEvent::SessionEnd {
+                        session_id:    bc.session_id(),
+                        ended_at:      Utc::now(),
+                        finish_reason: finish,
+                    });
+                })
+            });
+        }
 
         // Push StartFrame — this initialises all processors.
         let start_frame = Frame::start(StartFrameData {

@@ -6,8 +6,12 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use log;
+use uuid::Uuid;
 
+use crate::billing::collector::BillingCollector;
+use crate::billing::events::{TranscriptEntry, TranscriptRole};
 use crate::context::LLMContext;
 use crate::error::Result;
 use crate::frames::{
@@ -25,10 +29,14 @@ struct State {
 ///
 /// LLMTextFrames pass through unchanged — TTS needs each chunk for streaming.
 ///
-/// On interruption mid-response, the partial aggregation is discarded and
-/// not saved to context — the model never "said" the interrupted portion.
+/// On interruption mid-response, the partial aggregation is discarded from
+/// context but recorded to the transcript as `interrupted: true` — the user
+/// heard those words even though the model did not "complete" its turn.
 pub struct LLMAssistantAggregator {
     context: Arc<Mutex<LLMContext>>,
+    billing: Option<Arc<dyn BillingCollector>>,
+    /// Shared with AudioCaptureProcessor — read here to link transcript to audio segment.
+    active_bot_turn_id: Arc<Mutex<Option<Uuid>>>,
     state: Mutex<State>,
 }
 
@@ -38,6 +46,8 @@ impl LLMAssistantAggregator {
             "LLMAssistantAggregator",
             Box::new(Self {
                 context,
+                billing: None,
+                active_bot_turn_id: Arc::new(Mutex::new(None)),
                 state: Mutex::new(State {
                     aggregation: String::new(),
                     in_response: false,
@@ -45,6 +55,46 @@ impl LLMAssistantAggregator {
             }),
             false,
         )
+    }
+
+    /// Create an aggregator that records transcript entries via the billing collector.
+    /// Pass the same `active_bot_turn_id` cell as `AudioCaptureProcessor` so that
+    /// transcript entries share the same `turn_id` as the bot audio segment.
+    pub fn with_billing(
+        context: Arc<Mutex<LLMContext>>,
+        billing: Arc<dyn BillingCollector>,
+        active_bot_turn_id: Arc<Mutex<Option<Uuid>>>,
+    ) -> FrameProcessor {
+        FrameProcessor::new(
+            "LLMAssistantAggregator",
+            Box::new(Self {
+                context,
+                billing: Some(billing),
+                active_bot_turn_id,
+                state: Mutex::new(State {
+                    aggregation: String::new(),
+                    in_response: false,
+                }),
+            }),
+            false,
+        )
+    }
+
+    fn record_turn(&self, text: &str, interrupted: bool) {
+        if let Some(billing) = &self.billing {
+            let turn_id = self.active_bot_turn_id
+                .lock().unwrap()
+                .unwrap_or_else(Uuid::new_v4);
+            billing.record_transcript(TranscriptEntry {
+                turn_id,
+                session_id: billing.session_id(),
+                role: TranscriptRole::Assistant,
+                text: text.to_string(),
+                language: None,
+                interrupted,
+                occurred_at: Utc::now(),
+            });
+        }
     }
 }
 
@@ -96,22 +146,30 @@ impl FrameHandler for LLMAssistantAggregator {
                         .lock()
                         .unwrap()
                         .add_assistant_message(&aggregation);
+                    self.record_turn(&aggregation, false);
                 }
 
                 processor.push_frame(frame, direction).await?;
             }
 
-            // Interrupted mid-response — discard partial, don't save to context
+            // Interrupted mid-response — discard partial from context, but record
+            // to transcript as interrupted (the user heard those words).
             FrameInner::System(SystemFrame::Interruption) => {
-                {
+                let partial = {
                     let mut state = self.state.lock().unwrap();
-                    if state.in_response {
+                    let text = state.aggregation.trim().to_string();
+                    state.aggregation.clear();
+                    let was_in = state.in_response;
+                    state.in_response = false;
+                    if was_in {
                         log::debug!(
                             "LLMAssistantAggregator: interrupted, discarding partial response"
                         );
                     }
-                    state.aggregation.clear();
-                    state.in_response = false;
+                    if was_in { text } else { String::new() }
+                };
+                if !partial.is_empty() {
+                    self.record_turn(&partial, true);
                 }
                 processor.push_frame(frame, direction).await?;
             }

@@ -25,7 +25,7 @@ User speaks → VAD → STT → LLM → TTS → User hears
 
 ```toml
 [dependencies]
-rustvani = "0.2.1"
+rustvani = "0.2.6"
 ```
 
 ```bash
@@ -222,6 +222,8 @@ src/
 ├── adapters/          LLM provider adapters (OpenAI wire format)
 │   └── schemas/       Provider-agnostic tool/function schemas
 ├── audio_process/     Noise suppression (RNNoise) + resampling (rubato)
+├── billing/           Production billing layer — usage tracking + storage backends
+│   └── storage/       LogBillingStorage (JSON logs) + PostgresBillingStorage
 ├── context/           Shared LLMContext (messages, tools, tool_choice)
 ├── dhara/             Conversation flow engine (node-based state machine)
 ├── frames/            Frame types, FrameProcessor, priority queues
@@ -371,6 +373,152 @@ let tail   = nf.flush();  // drain at end of utterance
 nf.reset();               // clean slate for next utterance
 ```
 
+### Billing & Usage Tracking
+
+Production-grade, non-blocking billing layer that captures exactly what you need to cost and invoice voice sessions:
+
+| Signal | Source | Accuracy |
+|---|---|---|
+| Session duration (seconds) | Pipeline start/end hooks | Exact |
+| LLM input + output tokens | OpenAI `stream_options.include_usage` | Exact |
+| LLM tokens (Sarvam) | Character count ÷ 4 | Estimated |
+| TTS characters synthesised | Per-flush confirmation (Deepgram / Sarvam) | Exact |
+| STT audio duration | Server-reported (Gnani / 60db) | Exact |
+| STT audio duration (Sarvam) | PCM byte counter ÷ (2 × sample_rate) | Computed |
+
+**Hot-path design:** `BillingCollector::record()` is a sync, non-blocking call — it does a single `try_send` onto a bounded channel and returns immediately. A background drain task processes events, maintains session totals in a `Mutex<SessionSummary>` held for under 1 µs, and writes to storage asynchronously. Billing overhead is invisible to audio latency.
+
+#### Wire up billing
+
+```rust
+use rustvani::{
+    BillingCollector, BillingEvent, SessionBilling,
+    LogBillingStorage,           // always available — writes JSON to logs
+    // PostgresBillingStorage,   // feature = "db-postgres" (default-on)
+};
+use std::sync::Arc;
+use uuid::Uuid;
+
+// 1. Choose a storage backend
+let storage: Arc<dyn rustvani::billing::BillingStorage> =
+    Arc::new(LogBillingStorage);  // swap for PostgresBillingStorage in production
+
+// 2. Create a per-session collector (returns Arc + background drain handle)
+let session_id = Uuid::new_v4();
+let (billing, drain_handle) = SessionBilling::new(session_id, storage, 256);
+
+// 3. Inject into each service handler
+let stt = SarvamSttHandler::new(SarvamSttConfig { .. })
+    .with_billing(billing.clone())
+    .into_processor();
+
+let llm = OpenAILLMHandler::new(OpenAILLMConfig { .. })
+    .with_billing(billing.clone())
+    .into_processor();
+
+let tts = DeepgramTtsHandler::new(DeepgramTtsConfig { .. })?
+    .with_billing(billing.clone())
+    .into_processor();
+
+// 4. Attach to the pipeline task for session start/end events
+let task = PipelineTask::new(
+    vec![transport.input(), stt, user_agg, llm, assistant_agg, tts, transport.output()],
+    PipelineParams {
+        billing_collector: Some(billing),
+        billing_metadata: [("user_id".into(), "u_123".into())].into_iter().collect(),
+        ..Default::default()
+    },
+);
+
+task.run(system_clock(), None).await.unwrap();
+
+// 5. Await the drain handle — ensures the final Postgres write completes
+drain_handle.await.unwrap();
+```
+
+#### PostgreSQL storage
+
+```rust
+use rustvani::PostgresBillingStorage;
+use tokio_postgres::NoTls;
+
+let (client, conn) = tokio_postgres::connect(&std::env::var("DATABASE_URL")?, NoTls).await?;
+tokio::spawn(conn); // connection driver
+PostgresBillingStorage::run_migrations(&client).await?; // creates tables if not exists
+let storage = Arc::new(PostgresBillingStorage::new(client));
+```
+
+Two tables are created automatically:
+
+```sql
+-- Per-session aggregated totals (one row per session)
+billing_sessions (
+    session_id UUID PRIMARY KEY,
+    started_at TIMESTAMPTZ, ended_at TIMESTAMPTZ, duration_secs FLOAT8,
+    finish_reason TEXT,
+    llm_input_tokens INTEGER, llm_output_tokens INTEGER, llm_calls INTEGER,
+    tts_chars INTEGER, tts_calls INTEGER,
+    stt_audio_ms FLOAT8, stt_calls INTEGER,
+    metadata JSONB,   -- forwarded from PipelineParams.billing_metadata
+    created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
+)
+
+-- Per-event audit log (one row per LLM call / TTS flush / STT transcript)
+billing_events (
+    id BIGSERIAL PRIMARY KEY,
+    session_id UUID REFERENCES billing_sessions ON DELETE CASCADE,
+    event_type TEXT,           -- 'llm_usage' | 'tts_usage' | 'stt_usage' | …
+    provider TEXT, model TEXT,
+    input_tokens INTEGER, output_tokens INTEGER, estimated BOOLEAN,
+    char_count INTEGER, voice TEXT,
+    audio_duration_ms FLOAT8,
+    occurred_at TIMESTAMPTZ,
+    raw_json JSONB
+)
+```
+
+Query examples:
+
+```sql
+-- Cost summary per session
+SELECT session_id, duration_secs,
+       llm_input_tokens + llm_output_tokens AS total_tokens,
+       tts_chars, stt_audio_ms / 1000 AS stt_secs,
+       metadata->>'user_id' AS user_id
+FROM billing_sessions
+ORDER BY started_at DESC;
+
+-- Daily LLM token spend
+SELECT date_trunc('day', occurred_at) AS day,
+       provider, model,
+       SUM(input_tokens) AS total_in,
+       SUM(output_tokens) AS total_out
+FROM billing_events
+WHERE event_type = 'llm_usage'
+GROUP BY 1, 2, 3
+ORDER BY 1 DESC;
+```
+
+#### Log-only mode (no database)
+
+If `DATABASE_URL` is unset or you want structured logs instead, `LogBillingStorage` writes every event and the final session summary as JSON at `INFO` level:
+
+```
+INFO billing_event: {"type":"llm_usage","session_id":"...","provider":"openai","model":"gpt-4o","input_tokens":312,"output_tokens":87,"estimated":false,...}
+INFO billing_summary: {"session_id":"...","duration_secs":47.3,"llm_input_tokens":1204,"tts_chars":2340,"stt_audio_ms":38500,...}
+```
+
+#### Zero overhead when billing is not needed
+
+```rust
+use rustvani::NoopBillingCollector;
+
+let stt = SarvamSttHandler::new(config)
+    .with_billing(Arc::new(NoopBillingCollector))
+    .into_processor();
+// record() is a no-op — zero allocation, zero syscall
+```
+
 ---
 
 ## Testing with ChannelTransport
@@ -452,6 +600,7 @@ rustvani is in active development. Core pipeline, frame system, and all listed s
 - Neon Postgres tool with pgvector
 - WebSocket transport (axum) + ChannelTransport (testing)
 - RNNoise noise suppression + audio resampling
+- **Billing & usage tracking** — session duration, LLM tokens, TTS chars, STT audio duration; PostgreSQL + log storage backends; non-blocking hot path
 - Available on [crates.io](https://crates.io/crates/rustvani)
 
 **Planned:**
@@ -459,7 +608,6 @@ rustvani is in active development. Core pipeline, frame system, and all listed s
 - WebRTC transport
 - Whisper STT
 - ElevenLabs / PlayHT TTS
-- Metrics and observability
 
 ---
 

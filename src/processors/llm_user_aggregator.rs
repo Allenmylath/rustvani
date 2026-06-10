@@ -5,8 +5,12 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use log;
+use uuid::Uuid;
 
+use crate::billing::collector::BillingCollector;
+use crate::billing::events::{TranscriptEntry, TranscriptRole};
 use crate::context::LLMContext;
 use crate::error::Result;
 use crate::frames::{
@@ -34,6 +38,9 @@ struct State {
 /// Everything else passes through unchanged.
 pub struct LLMUserAggregator {
     context: Arc<Mutex<LLMContext>>,
+    billing: Option<Arc<dyn BillingCollector>>,
+    /// Shared with AudioCaptureProcessor — read here to link transcript to audio segment.
+    active_user_turn_id: Arc<Mutex<Option<Uuid>>>,
     state: Mutex<State>,
 }
 
@@ -43,6 +50,31 @@ impl LLMUserAggregator {
             "LLMUserAggregator",
             Box::new(Self {
                 context,
+                billing: None,
+                active_user_turn_id: Arc::new(Mutex::new(None)),
+                state: Mutex::new(State {
+                    aggregation: String::new(),
+                    user_speaking: false,
+                }),
+            }),
+            false,
+        )
+    }
+
+    /// Create an aggregator that records transcript entries via the billing collector.
+    /// Pass the same `active_user_turn_id` cell as `AudioCaptureProcessor` so that
+    /// transcript entries share the same `turn_id` as the audio segment.
+    pub fn with_billing(
+        context: Arc<Mutex<LLMContext>>,
+        billing: Arc<dyn BillingCollector>,
+        active_user_turn_id: Arc<Mutex<Option<Uuid>>>,
+    ) -> FrameProcessor {
+        FrameProcessor::new(
+            "LLMUserAggregator",
+            Box::new(Self {
+                context,
+                billing: Some(billing),
+                active_user_turn_id,
                 state: Mutex::new(State {
                     aggregation: String::new(),
                     user_speaking: false,
@@ -70,6 +102,21 @@ impl LLMUserAggregator {
         log::info!("LLMUserAggregator: user said: '{}'", aggregation);
 
         self.context.lock().unwrap().add_user_message(&aggregation);
+
+        if let Some(billing) = &self.billing {
+            let turn_id = self.active_user_turn_id
+                .lock().unwrap()
+                .unwrap_or_else(Uuid::new_v4);
+            billing.record_transcript(TranscriptEntry {
+                turn_id,
+                session_id: billing.session_id(),
+                role: TranscriptRole::User,
+                text: aggregation.clone(),
+                language: None,
+                interrupted: false,
+                occurred_at: Utc::now(),
+            });
+        }
 
         processor
             .push_frame(

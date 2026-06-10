@@ -329,28 +329,31 @@ async fn run_audio_task(
                                     }
                                 }
                                 VadState::Quiet => {
-                                    if state.emitted_speaking
-                                        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
-                                        .is_ok()
-                                    {
-                                        if !has_smart_turn {
-                                            log::info!("VAD server: → Quiet (confidence={:.3})", confidence);
-                                            let frame = Frame::vad_user_stopped_speaking(
-                                                state.params.vad_params.stop_secs,
-                                                ts,
-                                            );
-                                            if let Err(e) = processor
-                                                .push_frame(frame, FrameDirection::Downstream)
-                                                .await
-                                            {
-                                                log::error!(
-                                                    "BaseInputTransport: VAD push failed: {}", e
-                                                );
-                                            }
-                                        } else {
+                                    if has_smart_turn {
+                                        // Don't consume emitted_speaking — SmartTurn will CAS it
+                                        // when it decides Complete and pushes VADUserStoppedSpeaking.
+                                        if state.emitted_speaking.load(Ordering::Acquire) {
                                             log::info!(
                                                 "VAD server: → Quiet (confidence={:.3}), deferring to SmartTurn",
                                                 confidence
+                                            );
+                                            vad_quiet_transition = true;
+                                        }
+                                    } else if state.emitted_speaking
+                                        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+                                        .is_ok()
+                                    {
+                                        log::info!("VAD server: → Quiet (confidence={:.3})", confidence);
+                                        let frame = Frame::vad_user_stopped_speaking(
+                                            state.params.vad_params.stop_secs,
+                                            ts,
+                                        );
+                                        if let Err(e) = processor
+                                            .push_frame(frame, FrameDirection::Downstream)
+                                            .await
+                                        {
+                                            log::error!(
+                                                "BaseInputTransport: VAD push failed: {}", e
                                             );
                                         }
                                         vad_quiet_transition = true;
