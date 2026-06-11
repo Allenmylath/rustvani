@@ -246,6 +246,53 @@ src/
 
 ## Features
 
+### Speech Enhancement — the Audio Front-End
+
+STT accuracy lives or dies on input audio quality. Real users call from noisy streets on cheap phone mics — too quiet, too loud, full of rumble and background noise. rustvani runs every audio frame through a studio-style processing chain *before* it reaches the STT provider:
+
+```
+raw mic audio
+   │
+   ▼
+┌─────────────────┐   DC offset, rumble, handling noise below 90 Hz
+│ High-pass filter │   (2nd-order Butterworth)
+└─────────────────┘
+   │
+   ▼
+┌─────────────────┐   Neural noise suppression — pure Rust RNNoise,
+│ RNNoise          │   auto-resamples 16k ↔ 48k transparently
+└─────────────────┘
+   │
+   ▼
+┌─────────────────┐   Quiet speakers boosted (up to +30 dB), loud ones
+│ AGC              │   tamed — normalized to −20 dBFS. Fast attack (10 ms),
+└─────────────────┘   slow release (400 ms), gain held during silence so
+   │                  the noise floor is never pumped up between words
+   ▼
+┌─────────────────┐   Peaks compressed smoothly toward full scale —
+│ Soft limiter     │   hard digital clipping is impossible by construction
+└─────────────────┘
+   │
+   ▼
+clean, consistently-levelled audio → STT
+```
+
+The entire chain is **pure Rust, in-process, on by default, and adds zero latency** (the only buffering is RNNoise's 10 ms frame). No Krisp SDK, no external denoising service, no per-minute cleanup fees.
+
+```rust
+// On by default — nothing to wire up:
+let stt = SarvamSttHandler::new(SarvamSttConfig {
+    api_key: std::env::var("SARVAM_API_KEY").unwrap(),
+    noise_reduction: true,   // RNNoise           (default: true)
+    agc:             true,   // HPF + AGC + limiter (default: true)
+    ..Default::default()
+}).into_processor();
+```
+
+The pieces (`RNNoiseFilter`, `AudioEnhancer`) are also usable standalone, and the AGC is fully tunable via `AgcConfig` — target level, max gain, attack/release, noise gate, limiter knee. The adapted gain is remembered across utterances, so the same speaker isn't re-learned from scratch every sentence.
+
+→ Full guide: [doc/audio-enhancement.md](doc/audio-enhancement.md)
+
 ### Voice Activity Detection
 
 Two backends, same API:
@@ -266,7 +313,7 @@ let vad = SileroVadOrt::new(VadBackend::Silero16k)?;
 
 ### Client + Server VAD Coordination (Dioxus Integration)
 
-rustvani's flagship differentiator: the browser/Dioxus client runs its own lightweight VAD and pushes events directly into the server pipeline. A shared atomic toggle ensures exactly one `VADUserStartedSpeaking` is emitted per utterance regardless of which side detects speech first.
+No other voice framework has this: the browser/Dioxus client runs its own lightweight VAD and pushes events directly into the server pipeline. A shared atomic toggle ensures exactly one `VADUserStartedSpeaking` is emitted per utterance regardless of which side detects speech first.
 
 ```rust
 // Called from your WebSocket handler when the Dioxus client reports speech
@@ -285,6 +332,8 @@ The coordination rule: `emitted_speaking` is an `AtomicBool` shared between clie
 - Integrated **speech enhancement chain** — high-pass filter, RNNoise noise suppression, AGC, and soft limiter, all on by default (see [Speech Enhancement](#speech-enhancement--the-audio-front-end))
 - Transparent resampling if source rate ≠ target rate (via `rubato`)
 
+→ Per-service guides: [Sarvam](doc/stt-sarvam.md) · [60db](doc/stt-60db.md) · [Gnani](doc/stt-gnani.md)
+
 ### Large Language Models
 - **OpenAI-compatible** API with SSE streaming
 - **Sarvam LLM** (`sarvam-m`, `sarvam-30b`) with optional CoT thinking mode
@@ -301,6 +350,8 @@ The coordination rule: `emitted_speaking` is an `AtomicBool` shared between clie
   - Shared model across pipeline instances via `Arc<Mutex<PiperModel>>`
 - Sentence-aware text buffering with abbreviation detection (Mr., Dr., IPC., etc.)
 - Indian numbering system preprocessing for TTS (10000 → "ten thousand")
+
+→ Per-service guides: [Sarvam](doc/tts-sarvam.md) · [Deepgram](doc/tts-deepgram.md) · [Piper](doc/tts-piper.md)
 
 ### Function Calling & Tools
 
@@ -349,264 +400,55 @@ dhara.set_initial_node("greeting");
 llm.set_transition_hook(dhara.create_transition_hook());
 ```
 
-### Piper TTS (Local, Zero Network Calls)
-
-```rust
-let tts = PiperTtsHandler::new(PiperTtsConfig {
-    quality:   PiperQuality::Medium,  // ~60 MB, 150–300ms/sentence
-    model_dir: "./piper-models".into(),
-    ..Default::default()
-})?.into_processor();
-
-// Share one model across multiple concurrent sessions
-let shared = tts_handler.shared_model();
-let tts2   = PiperTtsHandler::with_shared_model(config, shared).into_processor();
-```
-
-Requires `espeak-ng` for phonemization (`apt install espeak-ng`).
-
-### Speech Enhancement — the Audio Front-End
-
-STT accuracy lives or dies on input audio quality. Real users call from noisy streets on cheap phone mics — too quiet, too loud, full of rumble and background noise. rustvani runs every audio frame through a studio-style processing chain *before* it reaches the STT provider:
-
-```
-raw mic audio
-   │
-   ▼
-┌─────────────────┐   DC offset, rumble, handling noise below 90 Hz
-│ High-pass filter │   (2nd-order Butterworth)
-└─────────────────┘
-   │
-   ▼
-┌─────────────────┐   Neural noise suppression — pure Rust RNNoise,
-│ RNNoise          │   auto-resamples 16k ↔ 48k transparently
-└─────────────────┘
-   │
-   ▼
-┌─────────────────┐   Quiet speakers boosted (up to +30 dB), loud ones
-│ AGC              │   tamed — normalized to −20 dBFS. Fast attack (10 ms),
-└─────────────────┘   slow release (400 ms), gain held during silence so
-   │                  the noise floor is never pumped up between words
-   ▼
-┌─────────────────┐   Peaks compressed smoothly toward full scale —
-│ Soft limiter     │   hard digital clipping is impossible by construction
-└─────────────────┘
-   │
-   ▼
-clean, consistently-levelled audio → STT
-```
-
-The entire chain is **pure Rust, in-process, on by default, and adds zero latency** (the only buffering is RNNoise's 10 ms frame). No Krisp SDK, no external denoising service, no per-minute cleanup fees.
-
-```rust
-// On by default — nothing to wire up:
-let stt = SarvamSttHandler::new(SarvamSttConfig {
-    api_key: std::env::var("SARVAM_API_KEY").unwrap(),
-    noise_reduction: true,   // RNNoise           (default: true)
-    agc:             true,   // HPF + AGC + limiter (default: true)
-    ..Default::default()
-}).into_processor();
-```
-
-The pieces are also usable standalone:
-
-```rust
-// RNNoise noise suppression — pure Rust, auto-resamples 16k ↔ 48k
-let mut nf = RNNoiseFilter::new(16_000);
-let clean  = nf.filter(&noisy_pcm_i16);
-let tail   = nf.flush();  // drain at end of utterance
-nf.reset();               // clean slate for next utterance
-
-// HPF + AGC + soft limiter — zero latency, output length == input length
-let mut enh = AudioEnhancer::new(16_000);
-let pcm = enh.pre_filter(&raw_pcm);    // high-pass, before the denoiser
-let out = enh.post_filter(&denoised);  // AGC + limiter, after the denoiser
-```
-
-Tuning is exposed through `AgcConfig` (target level, max gain, attack/release, noise gate, limiter knee) via `AudioEnhancer::with_config`. The AGC remembers its adapted gain across utterances — the same speaker isn't re-learned from scratch every sentence.
-
 ### Billing & Usage Tracking
 
-Production-grade, non-blocking billing layer that captures exactly what you need to cost and invoice voice sessions:
+Production-grade, non-blocking billing that captures exactly what you need to cost and invoice voice sessions — session duration, LLM tokens, TTS characters, STT audio duration, and full conversation transcripts, all linked by `session_id` and written to PostgreSQL or structured JSON logs.
 
 | Signal | Source | Accuracy |
 |---|---|---|
 | Session duration (seconds) | Pipeline start/end hooks | Exact |
 | LLM input + output tokens | OpenAI `stream_options.include_usage` | Exact |
-| LLM tokens (Sarvam) | Character count ÷ 4 | Estimated |
 | TTS characters synthesised | Per-flush confirmation (Deepgram / Sarvam) | Exact |
-| STT audio duration | Server-reported (Gnani / 60db) | Exact |
-| STT audio duration (Sarvam) | PCM byte counter ÷ (2 × sample_rate) | Computed |
+| STT audio duration | Server-reported or PCM byte counter | Exact / computed |
 
-**Hot-path design:** `BillingCollector::record()` is a sync, non-blocking call — it does a single `try_send` onto a bounded channel and returns immediately. A background drain task processes events, maintains session totals in a `Mutex<SessionSummary>` held for under 1 µs, and writes to storage asynchronously. Billing overhead is invisible to audio latency.
-
-#### Wire up billing
+`record()` is a single `try_send` onto a bounded channel — billing overhead is invisible to audio latency. Wiring is one builder call per service:
 
 ```rust
-use rustvani::{
-    BillingCollector, BillingEvent, SessionBilling,
-    LogBillingStorage,           // always available — writes JSON to logs
-    // PostgresBillingStorage,   // feature = "db-postgres" (default-on)
-};
-use std::sync::Arc;
-use uuid::Uuid;
-
-// 1. Choose a storage backend
-let storage: Arc<dyn rustvani::billing::BillingStorage> =
-    Arc::new(LogBillingStorage);  // swap for PostgresBillingStorage in production
-
-// 2. Create a per-session collector (returns Arc + background drain handle)
-let session_id = Uuid::new_v4();
 let (billing, drain_handle) = SessionBilling::new(session_id, storage, 256);
 
-// 3. Inject into each service handler
-let stt = SarvamSttHandler::new(SarvamSttConfig { .. })
-    .with_billing(billing.clone())
-    .into_processor();
-
-let llm = OpenAILLMHandler::new(OpenAILLMConfig { .. })
-    .with_billing(billing.clone())
-    .into_processor();
-
-let tts = DeepgramTtsHandler::new(DeepgramTtsConfig { .. })?
-    .with_billing(billing.clone())
-    .into_processor();
-
-// 4. Attach to the pipeline task for session start/end events
-let task = PipelineTask::new(
-    vec![transport.input(), stt, user_agg, llm, assistant_agg, tts, transport.output()],
-    PipelineParams {
-        billing_collector: Some(billing),
-        billing_metadata: [("user_id".into(), "u_123".into())].into_iter().collect(),
-        ..Default::default()
-    },
-);
-
-task.run(system_clock(), None).await.unwrap();
-
-// 5. Await the drain handle — ensures the final Postgres write completes
-drain_handle.await.unwrap();
+let stt = SarvamSttHandler::new(config).with_billing(billing.clone()).into_processor();
+let llm = OpenAILLMHandler::new(config).with_billing(billing.clone()).into_processor();
+// ... attach to PipelineParams { billing_collector: Some(billing), .. }
 ```
 
-#### PostgreSQL storage
+→ Full guide — PostgreSQL schemas, cost queries, transcript capture, log-only mode: [doc/billing.md](doc/billing.md)
+
+### Testing Without a Server
+
+`ChannelTransport` drives a full pipeline through plain `mpsc` channels — feed PCM in, assert on what comes out, no WebSocket server needed:
 
 ```rust
-use rustvani::PostgresBillingStorage;
-use tokio_postgres::NoTls;
-
-let (client, conn) = tokio_postgres::connect(&std::env::var("DATABASE_URL")?, NoTls).await?;
-tokio::spawn(conn); // connection driver
-PostgresBillingStorage::run_migrations(&client).await?; // creates tables if not exists
-let storage = Arc::new(PostgresBillingStorage::new(client));
+let transport = ChannelTransport::new("test", params, incoming_rx);
+incoming_tx.send(ChannelMessage::Audio(pcm_bytes)).await?;
+let result = outgoing_rx.recv().await;  // transcripts, TTS audio, events
 ```
 
-Two tables are created automatically:
-
-```sql
--- Per-session aggregated totals (one row per session)
-billing_sessions (
-    session_id UUID PRIMARY KEY,
-    started_at TIMESTAMPTZ, ended_at TIMESTAMPTZ, duration_secs FLOAT8,
-    finish_reason TEXT,
-    llm_input_tokens INTEGER, llm_output_tokens INTEGER, llm_calls INTEGER,
-    tts_chars INTEGER, tts_calls INTEGER,
-    stt_audio_ms FLOAT8, stt_calls INTEGER,
-    metadata JSONB,   -- forwarded from PipelineParams.billing_metadata
-    created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
-)
-
--- Per-event audit log (one row per LLM call / TTS flush / STT transcript)
-billing_events (
-    id BIGSERIAL PRIMARY KEY,
-    session_id UUID REFERENCES billing_sessions ON DELETE CASCADE,
-    event_type TEXT,           -- 'llm_usage' | 'tts_usage' | 'stt_usage' | …
-    provider TEXT, model TEXT,
-    input_tokens INTEGER, output_tokens INTEGER, estimated BOOLEAN,
-    char_count INTEGER, voice TEXT,
-    audio_duration_ms FLOAT8,
-    occurred_at TIMESTAMPTZ,
-    raw_json JSONB
-)
-```
-
-Query examples:
-
-```sql
--- Cost summary per session
-SELECT session_id, duration_secs,
-       llm_input_tokens + llm_output_tokens AS total_tokens,
-       tts_chars, stt_audio_ms / 1000 AS stt_secs,
-       metadata->>'user_id' AS user_id
-FROM billing_sessions
-ORDER BY started_at DESC;
-
--- Daily LLM token spend
-SELECT date_trunc('day', occurred_at) AS day,
-       provider, model,
-       SUM(input_tokens) AS total_in,
-       SUM(output_tokens) AS total_out
-FROM billing_events
-WHERE event_type = 'llm_usage'
-GROUP BY 1, 2, 3
-ORDER BY 1 DESC;
-```
-
-#### Log-only mode (no database)
-
-If `DATABASE_URL` is unset or you want structured logs instead, `LogBillingStorage` writes every event and the final session summary as JSON at `INFO` level:
-
-```
-INFO billing_event: {"type":"llm_usage","session_id":"...","provider":"openai","model":"gpt-4o","input_tokens":312,"output_tokens":87,"estimated":false,...}
-INFO billing_summary: {"session_id":"...","duration_secs":47.3,"llm_input_tokens":1204,"tts_chars":2340,"stt_audio_ms":38500,...}
-```
-
-#### Zero overhead when billing is not needed
-
-```rust
-use rustvani::NoopBillingCollector;
-
-let stt = SarvamSttHandler::new(config)
-    .with_billing(Arc::new(NoopBillingCollector))
-    .into_processor();
-// record() is a no-op — zero allocation, zero syscall
-```
+→ Full example: [doc/transport.md](doc/transport.md)
 
 ---
 
-## Testing with ChannelTransport
+## Documentation
 
-`ChannelTransport` lets you drive a full pipeline in tests without a WebSocket server:
+Every service and component has a dedicated guide in [doc/](doc/README.md) — exact config fields, environment variables, and feature flags:
 
-```rust
-use rustvani::transport::{ChannelTransport, ChannelMessage, TransportParams};
-use rustvani::pipeline::{PipelineTask, PipelineParams};
-use rustvani::clock::system_clock;
-use tokio::sync::mpsc;
-
-#[tokio::test]
-async fn test_my_pipeline() {
-    let (incoming_tx, incoming_rx) = mpsc::channel::<ChannelMessage>(10);
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<ChannelMessage>(10);
-
-    let transport = ChannelTransport::new("test", TransportParams {
-        audio_in_enabled: true,
-        audio_in_sample_rate: Some(16_000),
-        ..Default::default()
-    }, incoming_rx);
-
-    let task = PipelineTask::new(
-        vec![transport.input(), /* your processors */, transport.output()],
-        PipelineParams::default(),
-    );
-    let push_tx = task.push_sender();
-
-    tokio::spawn(async move { task.run(system_clock(), None).await.ok(); });
-    tokio::spawn(async move { transport.run(push_tx, outgoing_tx).await; });
-
-    incoming_tx.send(ChannelMessage::Audio(pcm_bytes)).await.unwrap();
-    let result = outgoing_rx.recv().await.unwrap();
-}
-```
+| Area | Guides |
+|---|---|
+| Audio front-end | [Speech Enhancement](doc/audio-enhancement.md) · [VAD](doc/vad.md) |
+| STT | [Sarvam](doc/stt-sarvam.md) · [60db](doc/stt-60db.md) · [Gnani](doc/stt-gnani.md) |
+| LLM | [OpenAI](doc/llm-openai.md) · [Sarvam](doc/llm-sarvam.md) |
+| TTS | [Sarvam](doc/tts-sarvam.md) · [Deepgram](doc/tts-deepgram.md) · [Piper (local)](doc/tts-piper.md) |
+| Infrastructure | [Transport](doc/transport.md) · [Postgres tool](doc/tools-postgres.md) |
+| Observability | [Billing](doc/billing.md) · [Audio capture](doc/audio-capture.md) |
 
 ---
 
@@ -651,7 +493,7 @@ rustvani is in active development. Core pipeline, frame system, and all listed s
 - RAVI protocol
 - Neon Postgres tool with pgvector
 - WebSocket transport (axum) + ChannelTransport (testing)
-- **Speech enhancement chain** — high-pass filter → RNNoise → AGC → soft limiter, pure Rust, on by default + audio resampling
+- **Speech enhancement chain** — high-pass filter → RNNoise → AGC → soft limiter (pure Rust, on by default) + streaming resampling
 - **Billing & usage tracking** — session duration, LLM tokens, TTS chars, STT audio duration; PostgreSQL + log storage backends; non-blocking hot path
 - Available on [crates.io](https://crates.io/crates/rustvani)
 

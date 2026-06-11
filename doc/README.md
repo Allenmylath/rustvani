@@ -28,6 +28,7 @@ This folder contains detailed usage documentation for every service and componen
 
 | Component | Documentation | Purpose |
 |---|---|---|
+| [Speech Enhancement](audio-enhancement.md) | `src/audio_process/` | HPF → RNNoise → AGC → soft limiter; clean audio for STT |
 | [VAD](vad.md) | `src/vad/` | Voice Activity Detection (Silero native + ONNX) |
 | [Transport](transport.md) | `src/transport/` | WebSocket I/O, ChannelTransport for testing |
 | [Postgres Tool](tools-postgres.md) | `src/tools/postgres/` | Built-in LLM tool for Neon Postgres + pgvector |
