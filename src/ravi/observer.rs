@@ -89,10 +89,19 @@ impl BaseObserver for RaviObserver {
             return;
         }
 
-        // Deduplicate by frame ID.
+        // Deduplicate by frame ID. One exception: the STT TurnGate re-pushes
+        // the stashed VadStop frame with a transcript bundled on — SAME id,
+        // different content. Key on (id, has_transcript) so the bare pre-gate
+        // sighting doesn't swallow the transcript-carrying release.
+        let dedup_key = match &frame.inner {
+            FrameInner::System(SystemFrame::VADUserStoppedSpeaking { transcript, .. }) => {
+                (frame.id << 1) | transcript.is_some() as u64
+            }
+            _ => frame.id << 1,
+        };
         {
             let mut seen = self.seen.lock().await;
-            if !seen.insert(frame.id) {
+            if !seen.insert(dedup_key) {
                 return;
             }
             if seen.len() > 4096 {
@@ -256,5 +265,73 @@ impl BaseObserver for RaviObserver {
 
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frames::{PassthroughHandler, StartFrameData, TranscriptionData};
+
+    fn pushed(frame: Frame) -> FramePushed {
+        FramePushed {
+            source_name: "vad".into(),
+            destination_name: "stt".into(),
+            frame,
+            direction: FrameDirection::Downstream,
+            timestamp: 0.0,
+        }
+    }
+
+    /// Regression: the STT TurnGate re-pushes the stashed VadStop frame with
+    /// a transcript bundled on — same frame id. The observer's dedup must
+    /// not swallow the transcript-carrying release just because the bare
+    /// pre-gate frame was already seen.
+    #[tokio::test]
+    async fn bundled_vadstop_transcript_survives_dedup() {
+        let proc = FrameProcessor::new("ravi-test", Box::new(PassthroughHandler), true);
+        proc.process_frame(
+            Frame::start(StartFrameData::default()),
+            FrameDirection::Downstream,
+        )
+        .await
+        .unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cap = captured.clone();
+        proc.on_before_push_frame(move |frame| {
+            if let FrameInner::System(SystemFrame::RaviServerMessage { payload }) = &frame.inner {
+                cap.lock().unwrap().push(payload.clone());
+            }
+        });
+
+        let observer = RaviObserver::new(proc.clone(), RaviObserverParams::default());
+
+        // 1. Bare VadStop travels VAD → STT (pre-gate sighting).
+        let stop = Frame::vad_user_stopped_speaking(0.5, 1.0);
+        observer.on_push_frame(pushed(stop.clone())).await;
+
+        // 2. The gate releases the SAME frame (same id) with the transcript.
+        let released = stop.with_vad_stop_transcript(
+            TranscriptionData::new("hello world", "user", "now").finalized(),
+        );
+        observer.on_push_frame(pushed(released.clone())).await;
+
+        let msgs = captured.lock().unwrap().clone();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("user-transcription") && m.contains("hello world")),
+            "bundled closing transcript was not forwarded to the client: {msgs:?}"
+        );
+
+        // 3. Further hops of the released frame are still deduped (no dupes).
+        drop(msgs);
+        observer.on_push_frame(pushed(released)).await;
+        let msgs = captured.lock().unwrap();
+        assert_eq!(
+            msgs.iter().filter(|m| m.contains("user-transcription")).count(),
+            1,
+            "transcript was sent more than once"
+        );
     }
 }
