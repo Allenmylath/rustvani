@@ -11,11 +11,12 @@ an `AgentRunner`. The system is entirely async-native (tokio) with no global sta
 | Component | File | Role |
 |---|---|---|
 | `Agent` trait | `src/agents/base.rs` | Contract every agent must satisfy |
-| `BaseAgent` | `src/agents/base.rs` | Concrete default implementation |
-| `AgentBus` / `LocalAgentBus` | `src/agents/bus.rs` | Message broker with priority queues |
+| `BaseAgent` | `src/agents/base.rs` | Concrete default implementation + task router |
+| `AgentBus` / `LocalAgentBus` | `src/agents/bus.rs` | Message broker with two-priority channels |
 | `BusPayload` | `src/agents/bus.rs` | All message types on the bus |
+| `BusOutputEdge` | `src/agents/edges.rs` | Tail-of-pipeline processor publishing frames to the bus |
 | `AgentRunner` | `src/agents/runner.rs` | Orchestrates agents in parallel tokio tasks |
-| `AgentRegistry` | `src/agents/registry.rs` | Local + remote agent discovery |
+| `AgentRegistry` | `src/agents/registry.rs` | Local + remote agent discovery, finished signals |
 | `TaskContext` | `src/agents/task.rs` | Inter-agent task dispatch and streaming |
 
 ---
@@ -60,12 +61,16 @@ pub trait Agent: BusSubscriber {
 }
 ```
 
-- `setup` — called once before `run`; store bus and registry references here
+- `setup` — called once before `run`; stores bus and registry references
+  (set-once; calling twice errors)
 - `run` — blocks until the pipeline finishes; the tokio task lives here
-- `end` — graceful shutdown; injects `EndFrame` into the pipeline
-- `cancel` — hard abort; injects `CancelFrame` into the pipeline
+- `end` — graceful shutdown; cascades to children, cancels in-flight jobs,
+  then injects `EndFrame` into the pipeline (single-shot — repeats are no-ops)
+- `cancel` — hard abort; same as `end` but propagates to children without
+  waiting and injects `CancelFrame`
 - `bridged` — if `true`, the agent receives `BusPayload::Frame` messages injected
-  from the bus into its pipeline
+  from the bus into its pipeline (on `BaseAgent` this is configured as a peer
+  filter, see below)
 
 ---
 
@@ -75,24 +80,61 @@ pub trait Agent: BusSubscriber {
 inside your own struct.
 
 ```rust
-let pipeline_task = PipelineTask::new(pipeline);
+let pipeline_task = PipelineTask::new(pipeline, PipelineParams::default());
 
 let agent = BaseAgent::new(
     "my-agent",          // name — must be unique on the runner
     pipeline_task,
-    false,               // bridged: receives bus frames?
+    None,                // bridged peer filter (see below)
     true,                // active_on_start
 );
 
 // Optional: declare a parent for hierarchical shutdown
-let child_agent = BaseAgent::new("child", child_task, false, true)
+let child_agent = BaseAgent::new("child", child_task, None, true)
     .with_parent("my-agent");
 ```
 
-`BaseAgent.run()` does three things in order:
+The `bridged` parameter is `Option<Vec<String>>`:
+
+| Value | Meaning |
+|---|---|
+| `None` | not bridged — `BusPayload::Frame` messages are ignored |
+| `Some(vec![])` | accept bridged frames from **any** source |
+| `Some(vec!["voice"])` | accept bridged frames only from the listed peers |
+
+Bridged input is also gated by activation: an **inactive** agent does not
+inject bridged frames (several brains can bridge to one transport with
+exactly one active — Pipecat-style handoff).
+
+### Task handlers — `BaseAgent` is the task router
+
+```rust
+let agent = BaseAgent::new("search-agent", task, None, true)
+    .on_task("web_search", Arc::new(|ctx: TaskRequestCtx| Box::pin(async move {
+        // ctx bundles task_id / payload / source / agent_name / task_ctx
+        ctx.stream_data(Some(json!({ "chunk": "..." }))).await;
+        ctx.complete(TaskStatus::Completed, Some(json!({ "results": [] }))).await;
+    })))
+    .on_task_default(Arc::new(|ctx| Box::pin(async move {
+        ctx.complete(TaskStatus::Failed, None).await;
+    })));
+```
+
+- Each handler runs in its **own tokio task** — the bus dispatch loop is never
+  blocked by job work.
+- A request with no matching handler (and no default) is answered immediately
+  with `TaskStatus::Failed` and a `"no handler"` payload.
+- `TaskCancel` aborts the handler task and always sends the requester a
+  terminal `Cancelled` response.
+- When the agent ends/cancels (or its `run()` returns), every in-flight job is
+  cancelled with a terminal response and every handle the agent itself is
+  awaiting is failed — requesters are never left hanging.
+
+`BaseAgent.run()` does four things in order:
 1. Sets `ready = true`
 2. Broadcasts `AgentReady` on the bus so other agents and the registry know it is live
 3. Awaits `pipeline_task.run()` — blocks until the pipeline finishes
+4. Cleans up jobs/pending handles and signals `finished` in the registry
 
 ---
 
@@ -101,26 +143,34 @@ let child_agent = BaseAgent::new("child", child_task, false, true)
 ### Sending a message
 
 ```rust
-bus.send(BusMessage {
-    source: "sender-name".to_string(),
-    target: Some("target-name".to_string()), // None = broadcast to all
-    payload: BusPayload::Activate { args: None },
-}).await;
+bus.send(BusMessage::new(
+    "sender-name",
+    Some("target-name".to_string()), // None = broadcast to all
+    BusPayload::Activate { args: None },
+)).await;
 ```
 
 Agents never receive their own messages (`source == self.name` is filtered out).
+The bus stamps a `seq: u64` on every message before fan-out (total-order
+debugging across agents) and delivers it as `Arc<BusMessage>` — fan-out never
+deep-clones the payload.
 
-### Priority queues
+### Priority channels and the drop policy
 
-Every subscriber has two queues. The dispatch loop always drains `system_queue`
-first:
+Every subscriber has two channels drained by one dispatch task
+(`biased tokio::select!` — system is always polled first):
 
-| Queue | Payloads routed here |
-|---|---|
-| system | `End`, `Cancel`, `Activate`, `Deactivate`, `AgentReady`, `AgentRegistry`, `AgentError`, `TaskResponseUrgent`, `TaskUpdateUrgent`, `TaskCancel` |
-| data | everything else (`Frame`, `TaskRequest`, `TaskResponse`, `TaskStream*`, `TaskUpdate`) |
+| Channel | Payloads routed here | Behavior |
+|---|---|---|
+| system (unbounded) | `End`, `Cancel`, `Activate`, `Deactivate`, `AgentReady`, `AgentRegistry`, `AgentError`, `TaskResponseUrgent`, `TaskUpdateUrgent`, `TaskCancel` | never blocks, never drops |
+| data (bounded, default 256) | everything else (`Frame`, `TaskRequest`, `TaskResponse`, `TaskStream*`, `TaskUpdate`) | `try_send`; dropped + counted when full |
 
-This guarantees lifecycle signals are never starved behind a backlog of data frames.
+Rationale (realtime voice): **control never drops, data never blocks**. A slow
+background agent must never stall the producer; frames are droppable, control
+messages are not. Drops are counted per subscriber
+(`LocalAgentBus::dropped_count`) and logged (first drop, then every 100th).
+The capacity is configurable via `LocalAgentBus::with_capacity`. Duplicate
+subscriber names are rejected at `subscribe()`.
 
 ---
 
@@ -206,8 +256,13 @@ runner.cancel(Some("user hung up".to_string())).await;    // immediate
 ### Hierarchy
 
 Root agents are agents with no parent. On shutdown, the runner only sends `End` /
-`Cancel` to root agents. Children must propagate shutdown themselves (e.g. by
-watching the parent or reacting to their own pipeline end).
+`Cancel` to root agents — propagation through the tree is automatic: a
+`BaseAgent` receiving `End` first forwards `End` to each of its children
+(looked up via the registry), waits up to 5 s per child for its `run()` to
+return (`AgentRegistry::wait_finished`), and only then pushes its own
+`EndFrame`. `Cancel` propagates the same way but without waiting. The runner's
+10 s join timeout is the backstop. Dangling parent references are warned about
+at `run()` time.
 
 ---
 
@@ -245,11 +300,21 @@ pub struct AgentInfo {
 ## `TaskContext` — inter-agent task dispatch
 
 `TaskContext` wraps the bus and provides a structured request/response pattern with
-streaming and cancellation.
+streaming and cancellation. `BaseAgent` constructs one automatically in
+`setup()` — get it with `agent.task_ctx()`. To build one manually:
 
 ```rust
-let task_ctx = Arc::new(TaskContext::new(bus.clone()));
+let task_ctx = Arc::new(TaskContext::new(bus.clone(), registry.clone()));
 ```
+
+### Ready-gating
+
+`dispatch()` checks the registry first: if the target agent has not announced
+readiness yet, it waits (watch-based, no polling) up to 10 s
+(`DEFAULT_READY_TIMEOUT`) and returns an error on timeout — requests to agents
+that have not subscribed yet are no longer silently dropped. Use
+`dispatch_with(..., ready_timeout)` to change or skip the gate (`None` sends
+immediately).
 
 ### Dispatch and await
 
@@ -296,6 +361,10 @@ task_ctx.on_update(&task_id, Arc::new(|update| Box::pin(async move {
 
 ### Responding to a task (in the receiving agent)
 
+Inside a `BaseAgent` task handler, use the `TaskRequestCtx` helpers
+(`ctx.stream_data(...)`, `ctx.complete(...)`) — they thread the names and id
+for you. The underlying `TaskContext` calls are:
+
 ```rust
 // Send incremental chunks
 task_ctx.stream_data("search-agent", "orchestrator", task_id.clone(), Some(json!({ "chunk": "..." }))).await;
@@ -307,6 +376,8 @@ task_ctx.complete_task(
     Some(json!({ "results": [...] })),
 ).await;
 ```
+
+(`stream_start` / `stream_end` exist for the stream boundary markers.)
 
 ### Urgent responses (system queue)
 
@@ -359,7 +430,7 @@ pub struct MyAgent {
 impl MyAgent {
     pub fn new(pipeline: PipelineTask) -> Arc<Self> {
         Arc::new(Self {
-            inner: BaseAgent::new("my-agent", pipeline, false, true),
+            inner: BaseAgent::new("my-agent", pipeline, None, true),
         })
     }
 }
@@ -368,10 +439,11 @@ impl MyAgent {
 impl rustvani::agents::BusSubscriber for MyAgent {
     fn name(&self) -> &str { self.inner.name() }
 
-    async fn on_bus_message(&self, message: BusMessage) {
-        // Handle custom payloads before delegating to BaseAgent
-        if let BusPayload::TaskRequest { task_id, task_name, payload } = &message.payload {
-            // ... handle the task
+    async fn on_bus_message(&self, message: Arc<BusMessage>) {
+        // Handle custom payloads before delegating to BaseAgent.
+        // (For TaskRequest specifically, prefer BaseAgent::on_task handlers.)
+        if let BusPayload::AgentError { error } = &message.payload {
+            log::warn!("peer error: {error}");
             return;
         }
         self.inner.on_bus_message(message).await;
@@ -397,19 +469,50 @@ impl Agent for MyAgent {
 
 ---
 
+## Bridging pipelines (`BusOutputEdge`)
+
+Any pipeline becomes bridgeable by placing a `BusOutputEdge` at its tail —
+no custom mid-pipeline proxy needed. The easiest wiring:
+
+```rust
+let agent = BaseAgent::bridged_pipeline(
+    "brain",
+    vec![my_processor],          // user processors; edge appended at the tail
+    PipelineParams::default(),
+    vec!["transport".into()],    // peers: accept bridged input from + publish to
+    true,                        // active_on_start
+);
+```
+
+The edge forwards every frame through unchanged and, when the agent is active,
+publishes non-excluded frames as `BusPayload::Frame` to the peers (empty list
+= broadcast). Lifecycle, task-control, processor-control, error and heartbeat
+frames are never published. For manual wiring use `BusOutputEdge::new` /
+`with_exclude` + `to_processor()` + `BaseAgent::with_output_edge`.
+
+**Two-way bridges:** each side must exclude the frame kinds the peer
+publishes (`BusOutputEdge::with_exclude`), or re-injected frames will
+ping-pong between the pipelines forever. See `examples/bridged_agents.rs`.
+
+---
+
 ## Shutdown flow (end-to-end)
 
 ```
 runner.end()
-  → sends BusPayload::End to all root agents
-  → BaseAgent.on_bus_message receives End
-  → injects Frame::end() into PipelineTask via push_tx
+  → sends BusPayload::End to root agents only
+  → BaseAgent.on_bus_message receives End → BaseAgent.end() (single-shot)
+      → forwards End to each child, waits for child run() to return (≤5s each)
+      → cancels in-flight jobs (requesters get TaskResponse::Cancelled)
+      → fails its own pending task handles (no awaiter hangs)
+      → injects Frame::end() into PipelineTask via push_tx
   → pipeline processes EndFrame: tools stop, connections return
-  → pipeline_task.run() returns
+  → pipeline_task.run() returns → registry.mark_finished(agent)
   → agent tokio task exits
   → runner waits (up to 10s) for all tasks
-  → bus.stop() — aborts all dispatch loops
+  → bus.stop() — dispatch loops drain pending system messages, then exit
 ```
 
-Hard cancel follows the same path with `CancelFrame` instead, plus the
-`CancellationToken` cascade in `OpenAILLMHandler` that aborts in-flight tool calls.
+Hard cancel follows the same path with `CancelFrame` instead (children are
+not waited for), plus the `CancellationToken` cascade in `OpenAILLMHandler`
+that aborts in-flight tool calls.

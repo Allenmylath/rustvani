@@ -1,6 +1,6 @@
 [package]
 name = "rustvani"
-version = "0.2.9"
+version = "0.3.0"
 edition = "2021"
 license = "BSD-2-Clause"
 description = "Voice AI framework for Rust — real-time speech pipelines with STT, LLM, TTS, and Dhara conversation flows"
@@ -52,6 +52,8 @@ db-postgres = ["dep:tokio-postgres", "dep:postgres-native-tls", "dep:native-tls"
 # Core (always required)
 tokio           = { version = "1",   features = ["full"] }
 tokio-util      = { version = "0.7", features = ["rt"] }
+arc-swap        = "1"
+bytes           = "1"
 async-trait     = "0.1"
 async-recursion = "1"
 futures         = "0.3"

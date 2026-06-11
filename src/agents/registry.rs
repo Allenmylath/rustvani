@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 // ---------------------------------------------------------------------------
 // AgentInfo
@@ -22,7 +22,8 @@ pub struct AgentInfo {
 // WatchHandler
 // ---------------------------------------------------------------------------
 
-type WatchHandler = Arc<dyn Fn(AgentInfo) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+type WatchHandler =
+    Arc<dyn Fn(AgentInfo) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // AgentRegistry
@@ -33,6 +34,9 @@ pub struct AgentRegistry {
     local: Mutex<HashMap<String, AgentInfo>>,
     remote: Mutex<HashMap<String, AgentInfo>>,
     watches: Mutex<HashMap<String, Vec<WatchHandler>>>,
+    /// Per-agent finished signal, set when the agent's `run()` returns.
+    /// `watch` (not `Notify`) so a waiter that arrives late still resolves.
+    finished: Mutex<HashMap<String, watch::Sender<bool>>>,
 }
 
 impl AgentRegistry {
@@ -42,6 +46,7 @@ impl AgentRegistry {
             local: Mutex::new(HashMap::new()),
             remote: Mutex::new(HashMap::new()),
             watches: Mutex::new(HashMap::new()),
+            finished: Mutex::new(HashMap::new()),
         })
     }
 
@@ -66,7 +71,10 @@ impl AgentRegistry {
 
     pub async fn watch(&self, agent_name: &str, handler: WatchHandler) {
         let mut watches = self.watches.lock().await;
-        watches.entry(agent_name.to_string()).or_default().push(handler);
+        watches
+            .entry(agent_name.to_string())
+            .or_default()
+            .push(handler);
         drop(watches);
 
         if let Some(info) = self.get(agent_name).await {
@@ -110,5 +118,48 @@ impl AgentRegistry {
     pub async fn unregister(&self, name: &str) {
         self.local.lock().await.remove(name);
         self.remote.lock().await.remove(name);
+    }
+
+    /// Names of all registered agents (local and remote) whose `parent` is
+    /// `name`. Used for End/Cancel cascade.
+    pub async fn children_of(&self, name: &str) -> Vec<String> {
+        let mut children = Vec::new();
+        for map in [&self.local, &self.remote] {
+            for info in map.lock().await.values() {
+                if info.parent.as_deref() == Some(name) {
+                    children.push(info.name.clone());
+                }
+            }
+        }
+        children
+    }
+
+    /// Signal that `name`'s `run()` has returned. Late waiters still resolve.
+    pub async fn mark_finished(&self, name: &str) {
+        let mut map = self.finished.lock().await;
+        let tx = map
+            .entry(name.to_string())
+            .or_insert_with(|| watch::channel(false).0);
+        let _ = tx.send(true);
+    }
+
+    /// Wait until [`AgentRegistry::mark_finished`] has been called for
+    /// `name`. Returns immediately if it already was. Callers should wrap
+    /// this in a timeout — an agent that never finishes never signals.
+    pub async fn wait_finished(&self, name: &str) {
+        let mut rx = {
+            let mut map = self.finished.lock().await;
+            map.entry(name.to_string())
+                .or_insert_with(|| watch::channel(false).0)
+                .subscribe()
+        };
+        if *rx.borrow() {
+            return;
+        }
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                return;
+            }
+        }
     }
 }

@@ -118,7 +118,7 @@ fn fast_log10_f32(x: f32) -> f32 {
     let log2 = exponent
         + (-1.4927_8
             + mantissa * (2.1126_4 + mantissa * (-0.7291_04 + mantissa * 0.1096_9)));
-    log2 * 0.301_029_995_7 // log10(2)
+    log2 * std::f32::consts::LOG10_2
 }
 
 // ── Public API ─────────────────────────────────────────────────────────

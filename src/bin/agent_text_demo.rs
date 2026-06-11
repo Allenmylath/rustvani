@@ -54,7 +54,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &question,
     );
     attach_printer(&coord_task, "coordinator");
-    let coordinator = Arc::new(BaseAgent::new("coordinator", coord_task, false, true));
+    let coordinator = Arc::new(BaseAgent::new("coordinator", coord_task, None, true));
 
     // ---- Build critic agent ----
     let critic_task = build_pipeline(
@@ -64,7 +64,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &format!("The question was: {}", question),
     );
     attach_printer(&critic_task, "critic");
-    let critic = Arc::new(BaseAgent::new("critic", critic_task, false, false));
+    let critic = Arc::new(BaseAgent::new("critic", critic_task, None, false));
 
     // ---- Set up runner ----
     let bus = Arc::new(LocalAgentBus::new());

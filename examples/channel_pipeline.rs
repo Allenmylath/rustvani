@@ -187,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for chunk in chunks {
         let data = AudioRawData::new(chunk.to_vec(), 16_000, 1);
-        if incoming_tx.send(ChannelMessage::Audio(data.audio)).await.is_err() {
+        if incoming_tx.send(ChannelMessage::Audio(data.audio.to_vec())).await.is_err() {
             println!("[main] incoming channel closed — stopping feed");
             break;
         }
@@ -216,6 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ChannelMessage::Interruption => {
                 println!("\r[out] interruption — clearing buffers");
             }
+            _ => {}
         }
     }
 

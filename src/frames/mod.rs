@@ -75,9 +75,16 @@ pub enum FrameKind {
 // Audio payload
 // ---------------------------------------------------------------------------
 
+/// Raw PCM audio payload.
+///
+/// `audio` is a [`bytes::Bytes`]: cloning the payload (pipeline fan-out,
+/// bus bridging) is a reference-count bump, not a buffer copy. Constructors
+/// keep accepting `Vec<u8>` — the conversion is zero-copy. Code that needs
+/// to mutate samples in place should convert explicitly via
+/// `BytesMut::from(&data.audio[..])` (one copy, stated at the call site).
 #[derive(Debug, Clone)]
 pub struct AudioRawData {
-    pub audio:            Vec<u8>,
+    pub audio:            bytes::Bytes,
     pub sample_rate:      u32,
     pub num_channels:     u16,
     pub num_frames:       usize,
@@ -85,7 +92,8 @@ pub struct AudioRawData {
 }
 
 impl AudioRawData {
-    pub fn new(audio: Vec<u8>, sample_rate: u32, num_channels: u16) -> Self {
+    pub fn new(audio: impl Into<bytes::Bytes>, sample_rate: u32, num_channels: u16) -> Self {
+        let audio = audio.into();
         let num_frames = if num_channels > 0 {
             audio.len() / (num_channels as usize * 2)
         } else {
@@ -513,13 +521,21 @@ impl Frame {
     pub fn input_audio_raw(data: AudioRawData) -> Self {
         Self::make(FrameInner::System(SystemFrame::InputAudioRaw(data)))
     }
-    pub fn input_audio(audio: Vec<u8>, sample_rate: u32, num_channels: u16) -> Self {
+    pub fn input_audio(
+        audio: impl Into<bytes::Bytes>,
+        sample_rate: u32,
+        num_channels: u16,
+    ) -> Self {
         Self::input_audio_raw(AudioRawData::new(audio, sample_rate, num_channels))
     }
     pub fn output_audio_raw(data: AudioRawData) -> Self {
         Self::make(FrameInner::Data(DataFrame::OutputAudioRaw(data)))
     }
-    pub fn output_audio(audio: Vec<u8>, sample_rate: u32, num_channels: u16) -> Self {
+    pub fn output_audio(
+        audio: impl Into<bytes::Bytes>,
+        sample_rate: u32,
+        num_channels: u16,
+    ) -> Self {
         Self::output_audio_raw(AudioRawData::new(audio, sample_rate, num_channels))
     }
 
@@ -614,5 +630,32 @@ impl Frame {
             client_msg_id: client_msg_id.into(),
             payload:       payload.into(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 5 invariant: cloning an audio frame must not copy the payload —
+    /// the underlying buffer is shared (same pointer).
+    #[test]
+    fn audio_frame_clone_shares_payload() {
+        let frame = Frame::input_audio(vec![0u8; 32_000], 16_000, 1);
+        let cloned = frame.clone();
+
+        let ptr_of = |f: &Frame| match &f.inner {
+            FrameInner::System(SystemFrame::InputAudioRaw(d)) => d.audio.as_ptr(),
+            _ => panic!("not an audio frame"),
+        };
+        assert_eq!(ptr_of(&frame), ptr_of(&cloned), "audio payload was copied");
+
+        let out = Frame::output_audio(vec![1u8; 1024], 16_000, 1);
+        let out_clone = out.clone();
+        let out_ptr = |f: &Frame| match &f.inner {
+            FrameInner::Data(DataFrame::OutputAudioRaw(d)) => d.audio.as_ptr(),
+            _ => panic!("not an output audio frame"),
+        };
+        assert_eq!(out_ptr(&out), out_ptr(&out_clone));
     }
 }

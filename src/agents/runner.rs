@@ -34,11 +34,7 @@ pub struct AgentRunner {
 }
 
 impl AgentRunner {
-    pub fn new(
-        name: impl Into<String>,
-        bus: Arc<dyn AgentBus>,
-        clock: Arc<dyn BaseClock>,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, bus: Arc<dyn AgentBus>, clock: Arc<dyn BaseClock>) -> Self {
         let name = name.into();
         let registry = AgentRegistry::new(&name);
         Self {
@@ -101,19 +97,50 @@ impl AgentRunner {
 
         // Subscribe all agents to bus
         let agents = self.agents.lock().await.clone();
-        for (_, agent) in &agents {
+        for agent in agents.values() {
             let wrapper = Arc::new(AgentSubscriberWrapper(agent.clone()));
             self.bus.subscribe(wrapper).await?;
         }
 
+        // Build the parent → children index. The End/Cancel cascade itself
+        // runs through the registry (BaseAgent::end), so this is primarily
+        // validation: a dangling parent reference means that agent will
+        // never receive a cascaded End.
+        {
+            let mut children_index: HashMap<String, Vec<String>> = HashMap::new();
+            for (name, agent) in &agents {
+                if let Some(parent) = agent.parent() {
+                    if !agents.contains_key(parent) {
+                        log::warn!(
+                            "Agent '{}' declares unknown parent '{}' — it will not \
+                             receive cascaded End/Cancel",
+                            name,
+                            parent
+                        );
+                    }
+                    children_index
+                        .entry(parent.to_string())
+                        .or_default()
+                        .push(name.clone());
+                }
+            }
+            if !children_index.is_empty() {
+                log::debug!(
+                    "AgentRunner '{}' agent tree: {:?}",
+                    self.name,
+                    children_index
+                );
+            }
+        }
+
         // Setup all agents
-        for (_, agent) in &agents {
+        for agent in agents.values() {
             agent.setup(self.bus.clone(), self.registry.clone()).await?;
         }
 
         // Start all agents
         let mut tasks = self.agent_tasks.lock().await;
-        for (_, agent) in &agents {
+        for agent in agents.values() {
             let agent = agent.clone();
             let clock = self.clock.clone();
             let observer = self.observer.clone();
@@ -131,7 +158,7 @@ impl AgentRunner {
 
         // End root agents
         let agents = self.agents.lock().await;
-        for (_, agent) in agents.iter() {
+        for agent in agents.values() {
             if agent.parent().is_none() {
                 agent.end(None).await.ok();
             }
@@ -156,15 +183,15 @@ impl AgentRunner {
         log::debug!("AgentRunner '{}' ending gracefully", self.name);
 
         let agents = self.agents.lock().await;
-        for (_, agent) in agents.iter() {
+        for agent in agents.values() {
             if agent.parent().is_none() {
-                let msg = BusMessage {
-                    source: self.name.clone(),
-                    target: Some(agent.name().to_string()),
-                    payload: BusPayload::End {
+                let msg = BusMessage::new(
+                    self.name.clone(),
+                    Some(agent.name().to_string()),
+                    BusPayload::End {
                         reason: reason.clone(),
                     },
-                };
+                );
                 self.bus.send(msg).await;
             }
         }
@@ -178,15 +205,15 @@ impl AgentRunner {
         log::debug!("AgentRunner '{}' cancelling", self.name);
 
         let agents = self.agents.lock().await;
-        for (_, agent) in agents.iter() {
+        for agent in agents.values() {
             if agent.parent().is_none() {
-                let msg = BusMessage {
-                    source: self.name.clone(),
-                    target: Some(agent.name().to_string()),
-                    payload: BusPayload::Cancel {
+                let msg = BusMessage::new(
+                    self.name.clone(),
+                    Some(agent.name().to_string()),
+                    BusPayload::Cancel {
                         reason: reason.clone(),
                     },
-                };
+                );
                 self.bus.send(msg).await;
             }
         }
@@ -206,7 +233,7 @@ impl BusSubscriber for AgentSubscriberWrapper {
         self.0.name()
     }
 
-    async fn on_bus_message(&self, message: BusMessage) {
+    async fn on_bus_message(&self, message: Arc<BusMessage>) {
         self.0.on_bus_message(message).await;
     }
 }
@@ -229,12 +256,12 @@ impl BusSubscriber for RunnerSubscriber {
         &self.runner_name
     }
 
-    async fn on_bus_message(&self, message: BusMessage) {
+    async fn on_bus_message(&self, message: Arc<BusMessage>) {
         if message.source == self.runner_name {
             return;
         }
 
-        match message.payload {
+        match &message.payload {
             BusPayload::End { .. } => {
                 if self.shutdown_requested.swap(true, Ordering::Relaxed) {
                     return;
@@ -254,16 +281,16 @@ impl BusSubscriber for RunnerSubscriber {
                 bridged,
                 started_at,
             } => {
-                let is_local = runner == self.runner_name;
+                let is_local = *runner == self.runner_name;
 
                 if !is_local {
                     let info = AgentInfo {
                         name: message.source.clone(),
-                        runner,
-                        parent,
-                        active,
-                        bridged,
-                        started_at,
+                        runner: runner.clone(),
+                        parent: parent.clone(),
+                        active: *active,
+                        bridged: *bridged,
+                        started_at: *started_at,
                     };
                     self.registry.register(info).await;
                 }
@@ -289,31 +316,29 @@ impl BusSubscriber for RunnerSubscriber {
                     };
 
                     if !entries.is_empty() {
-                        let msg = BusMessage {
-                            source: self.runner_name.clone(),
-                            target: None,
-                            payload: BusPayload::AgentRegistry {
+                        let msg = BusMessage::new(
+                            self.runner_name.clone(),
+                            None,
+                            BusPayload::AgentRegistry {
                                 runner: self.runner_name.clone(),
                                 agents: entries,
                             },
-                        };
+                        );
                         self.bus.send(msg).await;
                     }
                 }
             }
-            BusPayload::AgentRegistry { runner, agents } => {
-                if runner != self.runner_name {
-                    for entry in agents {
-                        let info = AgentInfo {
-                            name: entry.name,
-                            runner: runner.clone(),
-                            parent: entry.parent,
-                            active: entry.active,
-                            bridged: entry.bridged,
-                            started_at: entry.started_at,
-                        };
-                        self.registry.register(info).await;
-                    }
+            BusPayload::AgentRegistry { runner, agents } if *runner != self.runner_name => {
+                for entry in agents {
+                    let info = AgentInfo {
+                        name: entry.name.clone(),
+                        runner: runner.clone(),
+                        parent: entry.parent.clone(),
+                        active: entry.active,
+                        bridged: entry.bridged,
+                        started_at: entry.started_at,
+                    };
+                    self.registry.register(info).await;
                 }
             }
             _ => {}

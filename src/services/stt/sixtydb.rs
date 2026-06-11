@@ -569,8 +569,8 @@ mod tests {
         let json = config.start_message();
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(val["type"], "start");
-        assert_eq!(val["config"]["encoding"], "mulaw");
-        assert_eq!(val["config"]["sample_rate"], 8000);
+        assert_eq!(val["config"]["encoding"], "linear");
+        assert_eq!(val["config"]["sample_rate"], 16000);
         assert_eq!(val["config"]["continuous_mode"], true);
     }
 

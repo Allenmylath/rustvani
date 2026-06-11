@@ -83,6 +83,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "async-recursion"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1892,12 +1901,14 @@ dependencies = [
 
 [[package]]
 name = "rustvani"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
+ "arc-swap",
  "async-recursion",
  "async-trait",
  "axum",
  "base64",
+ "bytes",
  "chrono",
  "dotenvy",
  "env_logger",
