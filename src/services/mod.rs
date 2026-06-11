@@ -14,5 +14,6 @@ pub use stt::sixtydb::{
 };
 pub use tts::sarvam::{SarvamTtsConfig, SarvamTtsHandler};
 pub use tts::{DeepgramTtsConfig, DeepgramTtsHandler};
+#[cfg(feature = "tts-piper")]
 pub use tts::piper::{PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler};
 pub use llm::FunctionRegistry;
