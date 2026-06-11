@@ -59,8 +59,6 @@ This isn't a wrapper or binding — it's a ground-up Rust implementation that mi
 
 **Client + Server VAD coordination.** rustvani is designed for deep Dioxus frontend integration. The browser client runs its own lightweight VAD and sends `ClientVADUserStartedSpeaking` events directly into the server pipeline. A toggle-switch CAS gate ensures exactly one `VADUserStartedSpeaking` is emitted regardless of which side fires first — no double-triggers, no race conditions. Pipecat has no equivalent.
 
-**SmartTurn end-of-turn prediction.** A local ONNX model predicts whether the user has finished speaking before emitting a stop event. This eliminates false stops on hesitation pauses without adding network round-trips.
-
 **Dhara conversation flow engine.** Node-based state machine where each node owns its own system prompt, tool set, and context strategy. Handlers return `Stay` or `Transition { next_node }` — full multi-turn flow control without orchestration boilerplate.
 
 **Zero-dependency VAD.** The native Silero backend is pure Rust — no ONNX Runtime, no dynamic libraries, no `.so` files to bundle. One binary, everything included.
