@@ -25,7 +25,7 @@ User speaks → VAD → STT → LLM → TTS → User hears
 
 ```toml
 [dependencies]
-rustvani = "0.2.6"
+rustvani = "0.2.9"
 ```
 
 ```bash
@@ -54,6 +54,8 @@ rustvani keeps Pipecat's architecture and fixes the runtime:
 This isn't a wrapper or binding — it's a ground-up Rust implementation that mirrors Pipecat's mental model so you can reason about both codebases interchangeably.
 
 ### What rustvani has that Pipecat doesn't
+
+**Built-in speech enhancement DSP chain.** Every audio frame is cleaned in-process before it reaches STT: high-pass filter (DC offset, rumble, handling noise) → RNNoise neural noise suppression → automatic gain control (quiet speakers boosted, loud speakers tamed, normalized to −20 dBFS) → soft limiter (no hard clipping, ever). Pure Rust, zero external services, no paid noise-suppression SDK, ~zero added latency. Pipecat points you at Krisp (paid SDK) or leaves you to wire filters yourself — rustvani ships the whole chain on by default. See [Speech Enhancement](#speech-enhancement--the-audio-front-end).
 
 **Client + Server VAD coordination.** rustvani is designed for deep Dioxus frontend integration. The browser client runs its own lightweight VAD and sends `ClientVADUserStartedSpeaking` events directly into the server pipeline. A toggle-switch CAS gate ensures exactly one `VADUserStartedSpeaking` is emitted regardless of which side fires first — no double-triggers, no race conditions. Pipecat has no equivalent.
 
@@ -221,7 +223,7 @@ VADUserStoppedSpeaking frames that drive the STT and aggregation.
 src/
 ├── adapters/          LLM provider adapters (OpenAI wire format)
 │   └── schemas/       Provider-agnostic tool/function schemas
-├── audio_process/     Noise suppression (RNNoise) + resampling (rubato)
+├── audio_process/     Speech enhancement: RNNoise + HPF/AGC/limiter + resampling
 ├── billing/           Production billing layer — usage tracking + storage backends
 │   └── storage/       LogBillingStorage (JSON logs) + PostgresBillingStorage
 ├── context/           Shared LLMContext (messages, tools, tool_choice)
@@ -280,7 +282,7 @@ The coordination rule: `emitted_speaking` is an `AtomicBool` shared between clie
 - **Gnani (Vachana) STT** — WebSocket streaming for Indic languages (`hi-IN`, `ta-IN`, `en-IN`, etc.)
 - Supports transcription, translation, verbatim, transliteration, and codemix modes
 - Multi-language: `ml-IN`, `hi-IN`, `en-IN`, auto-detect (`unknown`)
-- Integrated **RNNoise** noise suppression (pure Rust via `nnnoiseless`)
+- Integrated **speech enhancement chain** — high-pass filter, RNNoise noise suppression, AGC, and soft limiter, all on by default (see [Speech Enhancement](#speech-enhancement--the-audio-front-end))
 - Transparent resampling if source rate ≠ target rate (via `rubato`)
 
 ### Large Language Models
@@ -363,7 +365,50 @@ let tts2   = PiperTtsHandler::with_shared_model(config, shared).into_processor()
 
 Requires `espeak-ng` for phonemization (`apt install espeak-ng`).
 
-### Audio Processing
+### Speech Enhancement — the Audio Front-End
+
+STT accuracy lives or dies on input audio quality. Real users call from noisy streets on cheap phone mics — too quiet, too loud, full of rumble and background noise. rustvani runs every audio frame through a studio-style processing chain *before* it reaches the STT provider:
+
+```
+raw mic audio
+   │
+   ▼
+┌─────────────────┐   DC offset, rumble, handling noise below 90 Hz
+│ High-pass filter │   (2nd-order Butterworth)
+└─────────────────┘
+   │
+   ▼
+┌─────────────────┐   Neural noise suppression — pure Rust RNNoise,
+│ RNNoise          │   auto-resamples 16k ↔ 48k transparently
+└─────────────────┘
+   │
+   ▼
+┌─────────────────┐   Quiet speakers boosted (up to +30 dB), loud ones
+│ AGC              │   tamed — normalized to −20 dBFS. Fast attack (10 ms),
+└─────────────────┘   slow release (400 ms), gain held during silence so
+   │                  the noise floor is never pumped up between words
+   ▼
+┌─────────────────┐   Peaks compressed smoothly toward full scale —
+│ Soft limiter     │   hard digital clipping is impossible by construction
+└─────────────────┘
+   │
+   ▼
+clean, consistently-levelled audio → STT
+```
+
+The entire chain is **pure Rust, in-process, on by default, and adds zero latency** (the only buffering is RNNoise's 10 ms frame). No Krisp SDK, no external denoising service, no per-minute cleanup fees.
+
+```rust
+// On by default — nothing to wire up:
+let stt = SarvamSttHandler::new(SarvamSttConfig {
+    api_key: std::env::var("SARVAM_API_KEY").unwrap(),
+    noise_reduction: true,   // RNNoise           (default: true)
+    agc:             true,   // HPF + AGC + limiter (default: true)
+    ..Default::default()
+}).into_processor();
+```
+
+The pieces are also usable standalone:
 
 ```rust
 // RNNoise noise suppression — pure Rust, auto-resamples 16k ↔ 48k
@@ -371,7 +416,14 @@ let mut nf = RNNoiseFilter::new(16_000);
 let clean  = nf.filter(&noisy_pcm_i16);
 let tail   = nf.flush();  // drain at end of utterance
 nf.reset();               // clean slate for next utterance
+
+// HPF + AGC + soft limiter — zero latency, output length == input length
+let mut enh = AudioEnhancer::new(16_000);
+let pcm = enh.pre_filter(&raw_pcm);    // high-pass, before the denoiser
+let out = enh.post_filter(&denoised);  // AGC + limiter, after the denoiser
 ```
+
+Tuning is exposed through `AgcConfig` (target level, max gain, attack/release, noise gate, limiter knee) via `AudioEnhancer::with_config`. The AGC remembers its adapted gain across utterances — the same speaker isn't re-learned from scratch every sentence.
 
 ### Billing & Usage Tracking
 
@@ -599,7 +651,7 @@ rustvani is in active development. Core pipeline, frame system, and all listed s
 - RAVI protocol
 - Neon Postgres tool with pgvector
 - WebSocket transport (axum) + ChannelTransport (testing)
-- RNNoise noise suppression + audio resampling
+- **Speech enhancement chain** — high-pass filter → RNNoise → AGC → soft limiter, pure Rust, on by default + audio resampling
 - **Billing & usage tracking** — session duration, LLM tokens, TTS chars, STT audio duration; PostgreSQL + log storage backends; non-blocking hot path
 - Available on [crates.io](https://crates.io/crates/rustvani)
 

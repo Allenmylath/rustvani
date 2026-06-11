@@ -93,6 +93,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::audio_process::agc::AudioEnhancer;
 use crate::audio_process::noisefilter::RNNoiseFilter;
 use crate::billing::{BillingCollector, BillingEvent};
 use crate::error::Result;
@@ -165,6 +166,11 @@ pub struct SarvamSttConfig {
     /// Default: true.
     pub noise_reduction: bool,
 
+    /// Enable the speech enhancement chain: high-pass filter (before the
+    /// denoiser) plus AGC and soft limiter (after it), so Sarvam receives
+    /// consistently-levelled, clip-free audio. Default: true.
+    pub agc: bool,
+
     /// Forward audio to Sarvam only during local-VAD-attested turns
     /// (plus pre-roll). Eliminates spurious server-VAD transcripts by
     /// construction and cuts STT cost. Default: true.
@@ -195,6 +201,7 @@ impl Default for SarvamSttConfig {
             high_vad_sensitivity:    false,
             vad_signals:             false,
             noise_reduction:         true,
+            agc:                     true,
             audio_gating:            true,
             pre_roll_ms:             500,
             stop_release_timeout_ms: 1_200,
@@ -614,6 +621,7 @@ struct RxCtx {
     gate:              Arc<TurnGate>,
     language_fallback: Option<String>,
     noise_filter:      Option<Arc<Mutex<RNNoiseFilter>>>,
+    enhancer:          Option<Arc<Mutex<AudioEnhancer>>>,
     billing:           Option<Arc<dyn BillingCollector>>,
 }
 
@@ -626,6 +634,8 @@ pub struct SarvamSttHandler {
     state:  Arc<Mutex<SarvamSttState>>,
     /// Noise filter shared with the receive task (for reset on transcript).
     noise_filter: Option<Arc<Mutex<RNNoiseFilter>>>,
+    /// Speech enhancer (HPF + AGC + limiter) shared with the receive task.
+    enhancer: Option<Arc<Mutex<AudioEnhancer>>>,
     /// Optional billing collector — records audio duration per transcript.
     billing: Option<Arc<dyn BillingCollector>>,
     /// Turn gate — ordering, attribution, audio gating.
@@ -640,6 +650,17 @@ impl SarvamSttHandler {
                 config.sample_rate
             );
             Some(Arc::new(Mutex::new(RNNoiseFilter::new(config.sample_rate))))
+        } else {
+            None
+        };
+
+        let enhancer = if config.agc {
+            log::info!(
+                "SarvamStt: speech enhancement enabled — HPF + AGC + limiter \
+                 (sample_rate={})",
+                config.sample_rate
+            );
+            Some(Arc::new(Mutex::new(AudioEnhancer::new(config.sample_rate))))
         } else {
             None
         };
@@ -662,6 +683,7 @@ impl SarvamSttHandler {
             config,
             state: Arc::new(Mutex::new(SarvamSttState::new())),
             noise_filter,
+            enhancer,
             billing: None,
             gate,
         }
@@ -731,6 +753,7 @@ impl SarvamSttHandler {
             gate:              self.gate.clone(),
             language_fallback: self.config.language.clone(),
             noise_filter:      self.noise_filter.clone(),
+            enhancer:          self.enhancer.clone(),
             billing:           self.billing.clone(),
         });
         let receive_task = tokio::spawn(run_receive_task(stream, ctx));
@@ -780,16 +803,30 @@ impl SarvamSttHandler {
         self.send_json(serde_json::to_string(&msg).unwrap_or_default()).await;
     }
 
-    /// Denoise one InputAudioRaw payload. Returns the samples ready to be
-    /// admitted by the gate (may be empty while the filter is buffering).
+    /// Run one InputAudioRaw payload through the enhancement chain:
+    /// high-pass → RNNoise → AGC + limiter. Returns the samples ready to be
+    /// admitted by the gate (may be empty while the denoiser is buffering).
     async fn denoise(&self, raw: &[u8]) -> Vec<i16> {
-        match &self.noise_filter {
-            Some(nf) => {
-                let pcm = bytes_to_i16(raw);
-                nf.lock().await.filter(&pcm)
-            }
-            None => bytes_to_i16(raw),
+        let mut pcm = bytes_to_i16(raw);
+
+        // 1. DC removal + high-pass (before the denoiser).
+        if let Some(enh) = &self.enhancer {
+            pcm = enh.lock().await.pre_filter(&pcm);
         }
+
+        // 2. RNNoise (may buffer — empty output is normal here).
+        if let Some(nf) = &self.noise_filter {
+            pcm = nf.lock().await.filter(&pcm);
+        }
+
+        // 3. AGC + soft limiter (after the denoiser).
+        if !pcm.is_empty() {
+            if let Some(enh) = &self.enhancer {
+                pcm = enh.lock().await.post_filter(&pcm);
+            }
+        }
+
+        pcm
     }
 }
 
@@ -864,10 +901,15 @@ impl FrameHandler for SarvamSttHandler {
                 // directly: that is the whole ordering guarantee.
 
                 // Flush the denoiser tail and send it before the flush signal.
-                let tail = match &self.noise_filter {
+                let mut tail = match &self.noise_filter {
                     Some(nf) => nf.lock().await.flush(),
                     None     => Vec::new(),
                 };
+                if !tail.is_empty() {
+                    if let Some(enh) = &self.enhancer {
+                        tail = enh.lock().await.post_filter(&tail);
+                    }
+                }
                 let tail_ms = self.gate.ms_of(tail.len());
                 if !tail.is_empty() {
                     self.send_audio(&i16_to_bytes(&tail)).await;
@@ -1063,6 +1105,12 @@ async fn handle_transcript(data: Option<serde_json::Value>, ctx: &Arc<RxCtx>) {
     // Reset noise filter so the next utterance starts from a clean state.
     if let Some(nf) = &ctx.noise_filter {
         nf.lock().await.reset();
+    }
+
+    // Reset the enhancer's filter state too (adapted AGC gain is kept —
+    // the speaker's level rarely changes between utterances).
+    if let Some(enh) = &ctx.enhancer {
+        enh.lock().await.reset();
     }
 }
 
@@ -1324,6 +1372,7 @@ mod tests {
             gate,
             language_fallback: None,
             noise_filter:      None,
+            enhancer:          None,
             billing,
         })
     }
