@@ -21,7 +21,6 @@ pub mod turn;
 // Feature-gated modules
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "vad-silero")]
 pub mod vad;
 
 #[cfg(feature = "transport-websocket")]
@@ -66,9 +65,10 @@ pub use processors::llm_assistant_aggregator::LLMAssistantAggregator;
 // Feature-gated re-exports
 // ---------------------------------------------------------------------------
 
-// VAD
-#[cfg(feature = "vad-silero")]
-pub use vad::{SileroVadNative, SileroVadOrt, VadAnalyzer, VadBackend, VadParams, VadProcessor, VadState};
+// VAD (pure-Rust parts always available; ONNX backend gated behind vad-silero-ort)
+pub use vad::{SileroVadNative, VadAnalyzer, VadBackend, VadParams, VadProcessor, VadState};
+#[cfg(feature = "vad-silero-ort")]
+pub use vad::SileroVadOrt;
 
 // Transport
 #[cfg(feature = "transport-websocket")]
@@ -93,4 +93,5 @@ pub use services::{DeepgramTtsConfig, DeepgramTtsHandler};
 #[cfg(feature = "tts-sarvam")]
 pub use services::{SarvamTtsConfig, SarvamTtsHandler};
 
+#[cfg(feature = "tts-piper")]
 pub use services::{PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler};

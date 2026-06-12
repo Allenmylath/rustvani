@@ -71,5 +71,5 @@ Enabled by default (shares `stt-sarvam` feature gate). To disable Sarvam service
 
 ```toml
 [dependencies]
-rustvani = { version = "0.2", default-features = false, features = ["vad-silero", "transport-websocket", "stt-60db", "llm-openai", "tts-deepgram", "tts-sarvam", "dhara"] }
+rustvani = { version = "0.2", default-features = false, features = ["vad-silero-ort", "transport-websocket", "stt-60db", "llm-openai", "tts-deepgram", "tts-sarvam", "dhara"] }
 ```
