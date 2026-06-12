@@ -1,7 +1,7 @@
 # Voice Activity Detection (VAD)
 
 **Files:** `src/vad/silero_native.rs`, `src/vad/silero_ort.rs`  
-**Feature:** `vad-silero` (enabled by default)
+**Feature:** `vad-silero-ort` (enabled by default) — gates **only the ONNX (ort) backend** and its `ort`/C-C++ dependency, not Silero VAD itself. The pure-Rust `SileroVadNative` backend is always available and needs no feature.
 
 Two backends for Silero VAD with the same API. Detects speech start/stop and drives the pipeline via `VADUserStartedSpeaking` / `VADUserStoppedSpeaking` frames.
 

@@ -94,5 +94,5 @@ Enabled by default. To disable:
 
 ```toml
 [dependencies]
-rustvani = { version = "0.2", default-features = false, features = ["vad-silero", "transport-websocket", "stt-sarvam", "stt-60db", "llm-openai", "tts-deepgram", "dhara"] }
+rustvani = { version = "0.2", default-features = false, features = ["vad-silero-ort", "transport-websocket", "stt-sarvam", "stt-60db", "llm-openai", "tts-deepgram", "dhara"] }
 ```

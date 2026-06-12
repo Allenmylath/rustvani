@@ -20,10 +20,12 @@ exclude = [
 # Features
 # ---------------------------------------------------------------------------
 [features]
-default = ["vad-silero", "transport-websocket", "stt-sarvam", "stt-60db", "stt-deepgram", "llm-openai", "tts-deepgram", "dhara", "db-postgres"]
+default = ["vad-silero-ort", "transport-websocket", "stt-sarvam", "stt-60db", "stt-deepgram", "llm-openai", "tts-deepgram", "dhara", "db-postgres"]
 
-# Core VAD
-vad-silero = ["dep:ort", "dep:ndarray"]
+# Silero VAD — ONNX (ort) inference backend. Gates only the ort-based path
+# (`SileroVadOrt`) and its `ort`/C-C++ dependency; the pure-Rust `SileroVadNative`
+# backend is always compiled and needs no feature.
+vad-silero-ort = ["dep:ort", "dep:ndarray"]
 
 # Transport
 transport-websocket = ["dep:axum", "dep:tower-http", "dep:tokio-tungstenite"]

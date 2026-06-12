@@ -86,5 +86,5 @@ Enabled by default. To disable:
 
 ```toml
 [dependencies]
-rustvani = { version = "0.2", default-features = false, features = ["vad-silero", "stt-sarvam", "stt-60db", "llm-openai", "tts-deepgram", "tts-sarvam", "dhara"] }
+rustvani = { version = "0.2", default-features = false, features = ["vad-silero-ort", "stt-sarvam", "stt-60db", "llm-openai", "tts-deepgram", "tts-sarvam", "dhara"] }
 ```

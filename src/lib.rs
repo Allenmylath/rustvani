@@ -65,9 +65,9 @@ pub use processors::llm_assistant_aggregator::LLMAssistantAggregator;
 // Feature-gated re-exports
 // ---------------------------------------------------------------------------
 
-// VAD (pure-Rust parts always available; ONNX backend gated behind vad-silero)
+// VAD (pure-Rust parts always available; ONNX backend gated behind vad-silero-ort)
 pub use vad::{SileroVadNative, VadAnalyzer, VadBackend, VadParams, VadProcessor, VadState};
-#[cfg(feature = "vad-silero")]
+#[cfg(feature = "vad-silero-ort")]
 pub use vad::SileroVadOrt;
 
 // Transport

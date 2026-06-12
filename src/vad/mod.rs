@@ -1,7 +1,7 @@
 pub mod analyzer;
 pub mod params;
 pub mod processor;
-#[cfg(feature = "vad-silero")]
+#[cfg(feature = "vad-silero-ort")]
 pub mod silero_ort;
 pub mod silero_native;
 pub mod state;
@@ -9,7 +9,7 @@ pub mod state;
 pub use analyzer::VadAnalyzer;
 pub use params::{VadParams, VAD_CONFIDENCE, VAD_MIN_VOLUME, VAD_START_SECS, VAD_STOP_SECS};
 pub use processor::VadProcessor;
-#[cfg(feature = "vad-silero")]
+#[cfg(feature = "vad-silero-ort")]
 pub use silero_ort::SileroVadOrt;
 pub use silero_native::SileroVadNative;
 pub use state::{StateMachine, VadState, calculate_audio_volume, exp_smoothing};
@@ -39,12 +39,12 @@ pub fn create_vad(
             let vad = SileroVadNative::new(sample_rate)?;
             Ok(Arc::new(vad))
         }
-        #[cfg(feature = "vad-silero")]
+        #[cfg(feature = "vad-silero-ort")]
         VadBackend::Ort => {
             let vad = SileroVadOrt::new(sample_rate)?;
             Ok(Arc::new(vad))
         }
-        #[cfg(not(feature = "vad-silero"))]
-        VadBackend::Ort => Err("ort VAD backend not compiled; enable feature \"vad-silero\"".to_string()),
+        #[cfg(not(feature = "vad-silero-ort"))]
+        VadBackend::Ort => Err("ort VAD backend not compiled; enable feature \"vad-silero-ort\"".to_string()),
     }
 }
