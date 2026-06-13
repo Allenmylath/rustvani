@@ -171,6 +171,10 @@ impl FrameHandler for LLMAssistantAggregator {
                 if !partial.is_empty() {
                     self.record_turn(&partial, true);
                 }
+                // Discard any tool round the LLM staged but did not commit, so an
+                // interrupted round leaves no orphaned tool_calls in the context
+                // the next turn sends. (doc/turn-acid.md)
+                self.context.lock().unwrap().rollback();
                 processor.push_frame(frame, direction).await?;
             }
 

@@ -568,6 +568,10 @@ impl OpenAILLMHandler {
         context: Arc<Mutex<LLMContext>>,
         processor: &FrameProcessor,
     ) -> Result<()> {
+        // Discard any messages staged by a previously interrupted round so this
+        // inference starts from clean committed history. (doc/turn-acid.md)
+        context.lock().unwrap().rollback();
+
         let mut round = 0;
 
         loop {
@@ -587,11 +591,14 @@ impl OpenAILLMHandler {
             match self.run_stream(&context, processor).await? {
                 InferenceOutcome::Text => break,
                 InferenceOutcome::ToolCalls(tool_calls) => {
-                    // Append assistant message with tool_calls
+                    // Stage the assistant tool_calls message. It is committed
+                    // into context only once all its results are staged too (at
+                    // the round boundary below), so an interruption mid-round
+                    // never leaves an orphaned tool_calls. (doc/turn-acid.md)
                     context
                         .lock()
                         .unwrap()
-                        .add_assistant_tool_calls(None, tool_calls.clone());
+                        .stage_assistant_tool_calls(None, tool_calls.clone());
 
                     processor
                         .push_frame(Frame::function_call_start(), FrameDirection::Downstream)
@@ -674,13 +681,19 @@ impl OpenAILLMHandler {
                             )
                             .await?;
 
-                        // Only summary goes into LLM context
-                        context.lock().unwrap().add_tool_result(&tc.id, &summary);
+                        // Only summary goes into LLM context — staged alongside
+                        // the assistant tool_calls message above.
+                        context.lock().unwrap().stage_tool_result(&tc.id, &summary);
                     }
 
                     processor
                         .push_frame(Frame::function_call_end(), FrameDirection::Downstream)
                         .await?;
+
+                    // Commit the staged round (assistant tool_calls + results)
+                    // into context atomically. Done BEFORE the transition hook,
+                    // which reads/clears `messages` directly. (doc/turn-acid.md)
+                    context.lock().unwrap().commit();
 
                     // --- Transition hook ---
                     if let Some(hook) = self.transition_hook.read().unwrap().as_ref() {

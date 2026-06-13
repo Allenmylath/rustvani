@@ -171,7 +171,13 @@ impl LLMUserAggregator {
 
         log::info!("LLMUserAggregator: user said: '{}'", text);
 
-        self.context.lock().unwrap().add_user_message(&text);
+        {
+            let mut ctx = self.context.lock().unwrap();
+            // Open the new turn: bump the epoch and discard any staged round left
+            // over from a previously interrupted turn. (doc/turn-acid.md)
+            ctx.begin_turn();
+            ctx.add_user_message(&text);
+        }
 
         if let Some(billing) = &self.billing {
             let turn_id = self.active_user_turn_id

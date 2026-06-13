@@ -1,7 +1,8 @@
 # Rustvani Architecture Reference
 
 Complete reference for Frames, FrameProcessor, Pipeline, PipelineTask, Processors,
-Services, Context, Tools, and Dhara. For the multi-agent layer see `agents.md`.
+Services, Context, Tools, and Dhara. For the multi-agent layer see `agents.md`. For the
+design of turn-level ACID (transactional conversation context) see `doc/turn-acid.md`.
 
 ---
 
