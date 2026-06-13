@@ -15,8 +15,10 @@ use crate::pipeline::{PipelineParams, PipelineTask};
 
 use super::base::{Agent, BaseAgent, TaskHandler, TaskRequestCtx};
 use super::bus::{AgentBus, BusMessage, BusPayload, LocalAgentBus, TaskStatus};
+use super::coordinator::{AgenticCoordinator, FenceOutcome};
 use super::edges::BusOutputEdge;
 use super::runner::AgentRunner;
+use crate::context::{LLMContext, Message};
 
 /// An empty pipeline (TaskSource → TaskSink) that runs until EndFrame.
 fn idle_task() -> PipelineTask {
@@ -635,6 +637,238 @@ async fn bridged_peer_filter() {
         1,
         "only the frame from 'voice' should be injected"
     );
+
+    runner.end(None).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
+// ===========================================================================
+// Phase 2: turn-level ACID across the bus — epoch fencing + coordinator.
+// See doc/turn-acid-phase2.md.
+// ===========================================================================
+
+/// A worker that echoes the turn epoch it observed back to the requester,
+/// so a test can prove the fence threaded `turn_epoch` end-to-end.
+fn epoch_reporting_handler() -> TaskHandler {
+    Arc::new(|ctx: TaskRequestCtx| {
+        Box::pin(async move {
+            let saw = ctx.turn_epoch;
+            ctx.complete(TaskStatus::Completed, Some(json!({ "saw_epoch": saw })))
+                .await;
+        })
+    })
+}
+
+fn shared_ctx() -> Arc<std::sync::Mutex<LLMContext>> {
+    Arc::new(std::sync::Mutex::new(LLMContext::new(None)))
+}
+
+/// Phase 2 unit: the bus message builder stamps and clears the turn epoch.
+#[test]
+fn bus_message_carries_turn_epoch() {
+    let plain = BusMessage::new("a", Some("b".into()), BusPayload::Deactivate);
+    assert_eq!(plain.turn_epoch, None);
+    let fenced = plain.with_turn_epoch(7);
+    assert_eq!(fenced.turn_epoch, Some(7));
+}
+
+/// Phase 2 test: `dispatch_fenced` stamps the epoch on the request and the
+/// executor sees it on `TaskRequestCtx` and echoes it back.
+#[tokio::test]
+async fn fenced_dispatch_threads_epoch_to_executor() {
+    let coord = Arc::new(BaseAgent::new("coord", idle_task(), None, true));
+    let worker = Arc::new(
+        BaseAgent::new("worker", idle_task(), None, true)
+            .on_task("report", epoch_reporting_handler()),
+    );
+
+    let bus = Arc::new(LocalAgentBus::new());
+    let runner = Arc::new(AgentRunner::new("r", bus, system_clock()));
+    runner.add_agent(coord.clone()).await.unwrap();
+    runner.add_agent(worker).await.unwrap();
+    let run = start_and_wait(&runner, &["coord", "worker"]).await;
+
+    let context = shared_ctx();
+    // Simulate the user aggregator opening a turn (epoch 0 -> 1).
+    let epoch = context.lock().unwrap().begin_turn();
+    let coordinator = AgenticCoordinator::new("coord", context.clone(), coord.task_ctx().unwrap());
+    assert_eq!(coordinator.open_turn(), epoch);
+
+    let handle = coordinator
+        .dispatch("worker", Some("report".into()), None)
+        .await
+        .unwrap();
+    let result = handle
+        .await_completion(Some(Duration::from_secs(2)))
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, TaskStatus::Completed);
+    assert_eq!(result.response, Some(json!({ "saw_epoch": epoch })));
+
+    runner.end(None).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
+/// Phase 2 test: a result for the current epoch is staged and commits into
+/// the shared context.
+#[tokio::test]
+async fn current_result_is_staged_and_committed() {
+    let coord = Arc::new(BaseAgent::new("coord", idle_task(), None, true));
+    let worker = Arc::new(
+        BaseAgent::new("worker", idle_task(), None, true)
+            .on_task("report", epoch_reporting_handler()),
+    );
+
+    let bus = Arc::new(LocalAgentBus::new());
+    let runner = Arc::new(AgentRunner::new("r", bus, system_clock()));
+    runner.add_agent(coord.clone()).await.unwrap();
+    runner.add_agent(worker).await.unwrap();
+    let run = start_and_wait(&runner, &["coord", "worker"]).await;
+
+    let context = shared_ctx();
+    context.lock().unwrap().begin_turn();
+    let coordinator = AgenticCoordinator::new("coord", context.clone(), coord.task_ctx().unwrap());
+    coordinator.open_turn();
+
+    let handle = coordinator
+        .dispatch("worker", Some("report".into()), None)
+        .await
+        .unwrap();
+    let tid = handle.task_id.clone();
+    let _ = handle
+        .await_completion(Some(Duration::from_secs(2)))
+        .await
+        .unwrap();
+
+    // The coordinator integrates the worker's answer as an assistant turn.
+    let outcome = coordinator.stage_result(
+        &tid,
+        Message::Assistant {
+            content: Some("the answer is 42".into()),
+            tool_calls: None,
+        },
+    );
+    assert_eq!(outcome, FenceOutcome::Staged);
+    assert_eq!(context.lock().unwrap().staged_len(), 1);
+
+    let committed = coordinator.commit();
+    assert_eq!(committed, 1);
+    assert_eq!(context.lock().unwrap().messages.len(), 1);
+    assert_eq!(context.lock().unwrap().staged_len(), 0);
+
+    runner.end(None).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
+/// Phase 2 test (the load-bearing one): a result whose turn was superseded by
+/// a barge-in is quarantined and never reaches the context.
+#[tokio::test]
+async fn stale_result_is_quarantined() {
+    let coord = Arc::new(BaseAgent::new("coord", idle_task(), None, true));
+    let worker = Arc::new(
+        BaseAgent::new("worker", idle_task(), None, true)
+            .on_task("report", epoch_reporting_handler()),
+    );
+
+    let bus = Arc::new(LocalAgentBus::new());
+    let runner = Arc::new(AgentRunner::new("r", bus, system_clock()));
+    runner.add_agent(coord.clone()).await.unwrap();
+    runner.add_agent(worker).await.unwrap();
+    let run = start_and_wait(&runner, &["coord", "worker"]).await;
+
+    let context = shared_ctx();
+    context.lock().unwrap().begin_turn(); // turn N
+    let coordinator = AgenticCoordinator::new("coord", context.clone(), coord.task_ctx().unwrap());
+    coordinator.open_turn();
+
+    // Dispatch turn N's work, then await its (slow) answer.
+    let handle = coordinator
+        .dispatch("worker", Some("report".into()), None)
+        .await
+        .unwrap();
+    let tid = handle.task_id.clone();
+    let _ = handle
+        .await_completion(Some(Duration::from_secs(2)))
+        .await
+        .unwrap();
+
+    // Barge-in: a new turn opens (epoch N -> N+1) before we stage turn N's answer.
+    context.lock().unwrap().begin_turn();
+    coordinator.open_turn();
+
+    let outcome = coordinator.stage_result(
+        &tid,
+        Message::Assistant {
+            content: Some("stale answer from turn N".into()),
+            tool_calls: None,
+        },
+    );
+    assert_eq!(outcome, FenceOutcome::Quarantined);
+    assert_eq!(context.lock().unwrap().staged_len(), 0);
+    assert_eq!(coordinator.commit(), 0);
+    assert!(
+        context.lock().unwrap().messages.is_empty(),
+        "stale turn-N answer must not contaminate turn N+1"
+    );
+
+    runner.end(None).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
+/// Phase 2 test: on barge-in the coordinator cancels in-flight workers and
+/// rolls back staged context; the worker resolves Cancelled.
+#[tokio::test]
+async fn interruption_cancels_and_rolls_back() {
+    let sleepy: TaskHandler = Arc::new(|ctx: TaskRequestCtx| {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            ctx.complete(TaskStatus::Completed, None).await;
+        })
+    });
+
+    let coord = Arc::new(BaseAgent::new("coord", idle_task(), None, true));
+    let worker =
+        Arc::new(BaseAgent::new("worker", idle_task(), None, true).on_task("sleep", sleepy));
+
+    let bus = Arc::new(LocalAgentBus::new());
+    let runner = Arc::new(AgentRunner::new("r", bus, system_clock()));
+    runner.add_agent(coord.clone()).await.unwrap();
+    runner.add_agent(worker).await.unwrap();
+    let run = start_and_wait(&runner, &["coord", "worker"]).await;
+
+    let context = shared_ctx();
+    context.lock().unwrap().begin_turn();
+    let coordinator = AgenticCoordinator::new("coord", context.clone(), coord.task_ctx().unwrap());
+    coordinator.open_turn();
+
+    // Pre-stage a half-written round, then dispatch slow work.
+    context.lock().unwrap().stage_message(Message::Assistant {
+        content: Some("partial".into()),
+        tool_calls: None,
+    });
+    let handle = coordinator
+        .dispatch("worker", Some("sleep".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(coordinator.in_flight(), 1);
+
+    // Give the worker a moment to start, then barge in.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    coordinator
+        .on_interruption(Some("user barged in".into()))
+        .await;
+
+    // Staging rolled back, nothing in flight.
+    assert_eq!(context.lock().unwrap().staged_len(), 0);
+    assert_eq!(coordinator.in_flight(), 0);
+
+    // The worker received TaskCancel and resolved Cancelled.
+    let result = handle
+        .await_completion(Some(Duration::from_secs(2)))
+        .await
+        .unwrap();
+    assert_eq!(result.status, TaskStatus::Cancelled);
 
     runner.end(None).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), run).await;

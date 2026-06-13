@@ -213,4 +213,6 @@ flights are $800"). **Barge-in starts a new turn; it must not by itself cancel a
 A later, separately-scoped effort extends this turn epoch across the agent bus (coordinator
 as transaction manager, stale-epoch fencing) and adds a durable side-effect tier
 (transactional outbox; a durable workflow engine only for genuine multi-step side-effect
-DAGs). Not part of this doc. See [`agents.md`](../agents.md) for the multi-agent layer.
+DAGs). The bus-fencing + coordinator half is now specified and landed as the Phase 2
+foundation — see [`turn-acid-phase2.md`](turn-acid-phase2.md). The durable side-effect tier
+remains Phase 3. See [`agents.md`](../agents.md) for the multi-agent layer.

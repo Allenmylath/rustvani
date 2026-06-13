@@ -232,6 +232,46 @@ impl TaskContext {
         payload: Option<Value>,
         ready_timeout: Option<Duration>,
     ) -> Result<TaskHandle> {
+        self.dispatch_inner(source, target, task_name, payload, ready_timeout, None)
+            .await
+    }
+
+    /// Dispatch a task **fenced to a turn epoch** (turn-level ACID, Phase 2).
+    ///
+    /// Identical to [`dispatch_with`](Self::dispatch_with) but stamps
+    /// `turn_epoch` on the outgoing `TaskRequest`. The executing agent echoes
+    /// the epoch back onto its replies, letting the coordinator quarantine a
+    /// result whose turn has been superseded by a barge-in. See
+    /// `doc/turn-acid-phase2.md`.
+    pub async fn dispatch_fenced(
+        &self,
+        source: &str,
+        target: &str,
+        task_name: Option<String>,
+        payload: Option<Value>,
+        turn_epoch: u64,
+        ready_timeout: Option<Duration>,
+    ) -> Result<TaskHandle> {
+        self.dispatch_inner(
+            source,
+            target,
+            task_name,
+            payload,
+            ready_timeout,
+            Some(turn_epoch),
+        )
+        .await
+    }
+
+    async fn dispatch_inner(
+        &self,
+        source: &str,
+        target: &str,
+        task_name: Option<String>,
+        payload: Option<Value>,
+        ready_timeout: Option<Duration>,
+        turn_epoch: Option<u64>,
+    ) -> Result<TaskHandle> {
         if let Some(wait) = ready_timeout {
             self.await_target_ready(target, wait).await?;
         }
@@ -244,7 +284,7 @@ impl TaskContext {
             pending.insert(task_id.clone(), tx);
         }
 
-        let msg = BusMessage::new(
+        let mut msg = BusMessage::new(
             source.to_string(),
             Some(target.to_string()),
             BusPayload::TaskRequest {
@@ -253,6 +293,9 @@ impl TaskContext {
                 payload,
             },
         );
+        if let Some(epoch) = turn_epoch {
+            msg = msg.with_turn_epoch(epoch);
+        }
 
         self.bus.send(msg).await;
 
@@ -409,7 +452,22 @@ impl TaskContext {
         status: TaskStatus,
         response: Option<Value>,
     ) {
-        let msg = BusMessage::new(
+        self.complete_task_fenced(source, target, task_id, status, response, None)
+            .await;
+    }
+
+    /// Mark a task as complete, echoing a turn epoch back to the requester so
+    /// the coordinator can fence a stale reply (turn-level ACID, Phase 2).
+    pub async fn complete_task_fenced(
+        &self,
+        source: &str,
+        target: &str,
+        task_id: String,
+        status: TaskStatus,
+        response: Option<Value>,
+        turn_epoch: Option<u64>,
+    ) {
+        let mut msg = BusMessage::new(
             source.to_string(),
             Some(target.to_string()),
             BusPayload::TaskResponse {
@@ -418,6 +476,9 @@ impl TaskContext {
                 response,
             },
         );
+        if let Some(epoch) = turn_epoch {
+            msg = msg.with_turn_epoch(epoch);
+        }
         self.bus.send(msg).await;
     }
 

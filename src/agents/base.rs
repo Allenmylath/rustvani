@@ -50,20 +50,26 @@ pub struct TaskRequestCtx {
     pub source: String,
     /// Name of the agent executing the handler.
     pub agent_name: String,
+    /// Turn epoch the request was fenced to, echoed back on replies so the
+    /// requesting coordinator can quarantine a stale result (turn-level ACID,
+    /// Phase 2). `None` for unfenced requests.
+    pub turn_epoch: Option<u64>,
     /// The executing agent's task context, for replies and nested dispatch.
     pub task_ctx: Arc<TaskContext>,
 }
 
 impl TaskRequestCtx {
-    /// Send the terminal response for this task back to the requester.
+    /// Send the terminal response for this task back to the requester,
+    /// echoing the request's `turn_epoch` so it can be fenced.
     pub async fn complete(&self, status: TaskStatus, response: Option<Value>) {
         self.task_ctx
-            .complete_task(
+            .complete_task_fenced(
                 &self.agent_name,
                 &self.source,
                 self.task_id.clone(),
                 status,
                 response,
+                self.turn_epoch,
             )
             .await;
     }
@@ -331,6 +337,7 @@ impl BaseAgent {
         task_name: &Option<String>,
         payload: &Option<Value>,
         source: &str,
+        turn_epoch: Option<u64>,
     ) {
         let task_ctx = match self.task_ctx.get() {
             Some(ctx) => ctx.clone(),
@@ -360,7 +367,7 @@ impl BaseAgent {
                     task_id
                 );
                 task_ctx
-                    .complete_task(
+                    .complete_task_fenced(
                         &self.name,
                         source,
                         task_id.to_string(),
@@ -369,6 +376,7 @@ impl BaseAgent {
                             "error": "no handler",
                             "task_name": task_name,
                         })),
+                        turn_epoch,
                     )
                     .await;
                 return;
@@ -381,6 +389,7 @@ impl BaseAgent {
             payload: payload.clone(),
             source: source.to_string(),
             agent_name: self.name.clone(),
+            turn_epoch,
             task_ctx,
         };
 
@@ -545,8 +554,14 @@ impl BusSubscriber for BaseAgent {
                 task_name,
                 payload,
             } => {
-                self.handle_task_request(task_id, task_name, payload, &message.source)
-                    .await;
+                self.handle_task_request(
+                    task_id,
+                    task_name,
+                    payload,
+                    &message.source,
+                    message.turn_epoch,
+                )
+                .await;
             }
             BusPayload::TaskCancel { task_id, reason } => {
                 self.handle_task_cancel(task_id, reason).await;

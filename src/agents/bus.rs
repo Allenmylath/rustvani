@@ -229,17 +229,35 @@ pub struct BusMessage {
     /// sees the same value for the same message. The value passed in by the
     /// caller is ignored.
     pub seq: u64,
+    /// Turn epoch this message belongs to (turn-level ACID, Phase 2).
+    ///
+    /// `None` for epoch-agnostic traffic (lifecycle, registry, bridged
+    /// frames). The coordinator stamps `Some(epoch)` on task dispatches it
+    /// fences ([`TaskContext::dispatch_fenced`]); the executing agent echoes
+    /// the same epoch back onto its replies. Lets a late result for turn `N`
+    /// be quarantined instead of contaminating turn `N+1`. See
+    /// `doc/turn-acid-phase2.md`.
+    pub turn_epoch: Option<u64>,
 }
 
 impl BusMessage {
-    /// Create a message. `seq` is initialised to 0 and stamped by the bus.
+    /// Create a message. `seq` is initialised to 0 and stamped by the bus;
+    /// `turn_epoch` defaults to `None` (use [`with_turn_epoch`](Self::with_turn_epoch)).
     pub fn new(source: impl Into<String>, target: Option<String>, payload: BusPayload) -> Self {
         Self {
             source: source.into(),
             target,
             payload,
             seq: 0,
+            turn_epoch: None,
         }
+    }
+
+    /// Stamp this message with a turn epoch (builder). Used by the coordinator
+    /// to fence async agent work to a single turn.
+    pub fn with_turn_epoch(mut self, epoch: u64) -> Self {
+        self.turn_epoch = Some(epoch);
+        self
     }
 
     /// Whether this message travels the unbounded system (priority) channel.

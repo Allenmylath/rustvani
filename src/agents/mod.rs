@@ -6,6 +6,7 @@
 
 pub mod base;
 pub mod bus;
+pub mod coordinator;
 pub mod edges;
 pub mod registry;
 pub mod runner;
@@ -15,6 +16,7 @@ pub mod task;
 mod tests;
 
 pub use base::{Agent, BaseAgent, TaskHandler, TaskRequestCtx};
+pub use coordinator::{AgenticCoordinator, FenceOutcome};
 pub use bus::{
     AgentBus, AgentRegistryEntry, BusMessage, BusPayload, BusSubscriber, LocalAgentBus, TaskStatus,
     DEFAULT_DATA_CAPACITY,
