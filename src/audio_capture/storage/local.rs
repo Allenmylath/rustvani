@@ -52,14 +52,12 @@ impl AudioStorage for LocalAudioStorage {
             return Ok(());
         }
 
-        let session_start = segments.iter().map(|s| s.started_at).min().unwrap();
         let owned: Vec<OwnedSeg> = segments
             .iter()
             .map(|s| OwnedSeg {
                 pcm:          s.pcm.clone(),
                 sample_rate:  s.sample_rate,
                 num_channels: s.num_channels,
-                offset_ms:    (s.started_at - session_start).num_milliseconds().max(0) as u64,
             })
             .collect();
 
@@ -100,51 +98,108 @@ struct OwnedSeg {
     pcm:          Vec<u8>,
     sample_rate:  u32,
     num_channels: u16,
-    offset_ms:    u64,
 }
 
+/// Overlay (mix) all tracks on a shared timeline starting at index 0.
+///
+/// `AudioCaptureProcessor` emits the session as two equal-length,
+/// time-synchronised tracks (user and bot) where each is silent while the other
+/// speaks. Summing them sample-for-sample reconstructs the conversation as one
+/// mono stream — voices only overlap where a real barge-in occurred. Tracks of
+/// unequal length are handled by sizing the buffer to the longest.
 fn mix_timeline(segments: Vec<OwnedSeg>) -> Vec<u8> {
-    // Determine total buffer size needed (in mono samples at TARGET_RATE).
-    let mut total_samples = 0usize;
-    for seg in &segments {
-        if seg.pcm.is_empty() || seg.sample_rate == 0 { continue; }
-        let offset = ms_to_samples(seg.offset_ms);
-        let mono_len = seg.pcm.len() / seg.num_channels.max(1) as usize;
-        let out_len = resampled_count(mono_len / 2, seg.sample_rate);
-        total_samples = total_samples.max(offset + out_len);
+    let tracks: Vec<Vec<u8>> = segments
+        .into_iter()
+        .filter(|s| !s.pcm.is_empty() && s.sample_rate != 0)
+        .map(|s| {
+            let mono = downmix_to_mono(&s.pcm, s.num_channels);
+            resample_pcm(&mono, s.sample_rate, TARGET_RATE)
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let total_samples = tracks.iter().map(|t| t.len() / 2).max().unwrap_or(0);
+    if total_samples == 0 {
+        return Vec::new();
     }
-    if total_samples == 0 { return Vec::new(); }
 
     // Accumulate in i32 so overlapping turns don't clip during addition.
     let mut buf = vec![0i32; total_samples];
-
-    for seg in segments {
-        if seg.pcm.is_empty() || seg.sample_rate == 0 { continue; }
-        let offset = ms_to_samples(seg.offset_ms);
-        let mono  = downmix_to_mono(&seg.pcm, seg.num_channels);
-        let resampled = resample_pcm(&mono, seg.sample_rate, TARGET_RATE);
-        for (i, chunk) in resampled.chunks_exact(2).enumerate() {
-            let pos = offset + i;
-            if pos < buf.len() {
-                buf[pos] += i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
-            }
+    for track in &tracks {
+        for (i, chunk) in track.chunks_exact(2).enumerate() {
+            buf[i] += i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
         }
     }
 
-    // Clamp and convert to little-endian i16 bytes.
     buf.iter()
-        .flat_map(|&s| {
-            (s.clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_le_bytes()
-        })
+        .flat_map(|&s| (s.clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_le_bytes())
         .collect()
 }
 
-#[inline]
-fn ms_to_samples(ms: u64) -> usize {
-    (ms * TARGET_RATE as u64 / 1000) as usize
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
-#[inline]
-fn resampled_count(n_in: usize, from_rate: u32) -> usize {
-    ((n_in as f64) * (TARGET_RATE as f64) / (from_rate as f64)).ceil() as usize
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `n` mono samples of constant value, as little-endian i16 bytes @ 16 kHz.
+    fn seg(value: i16, n: usize) -> OwnedSeg {
+        let pcm: Vec<u8> = std::iter::repeat(value.to_le_bytes())
+            .take(n)
+            .flatten()
+            .collect();
+        OwnedSeg { pcm, sample_rate: TARGET_RATE, num_channels: 1 }
+    }
+
+    /// A mono @ 16 kHz track from explicit samples.
+    fn seg_from(samples: &[i16]) -> OwnedSeg {
+        let pcm: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        OwnedSeg { pcm, sample_rate: TARGET_RATE, num_channels: 1 }
+    }
+
+    #[test]
+    fn mix_overlays_tracks_sample_for_sample() {
+        // Two equal-length tracks: one silent where the other speaks (the
+        // normal user/bot case) → the sum reproduces each without clipping.
+        let mut user = vec![1000i16; 100];
+        user.extend(std::iter::repeat(0).take(100)); // silent while bot speaks
+        let mut bot = vec![0i16; 100];               // silent while user speaks
+        bot.extend(std::iter::repeat(-1000).take(100));
+
+        let out = mix_timeline(vec![seg_from(&user), seg_from(&bot)]);
+        let samples: Vec<i16> = out
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+
+        assert_eq!(samples.len(), 200, "overlay length = longest track");
+        assert!(samples[..100].iter().all(|&s| s == 1000), "user region");
+        assert!(samples[100..].iter().all(|&s| s == -1000), "bot region");
+    }
+
+    #[test]
+    fn mix_sums_overlapping_audio_with_clamp() {
+        let a = vec![20000i16; 10];
+        let b = vec![20000i16; 10];
+        let out = mix_timeline(vec![seg_from(&a), seg_from(&b)]);
+        let samples: Vec<i16> = out
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        // 40000 clamps to i16::MAX.
+        assert!(samples.iter().all(|&s| s == i16::MAX));
+    }
+
+    #[test]
+    fn mix_handles_unequal_lengths() {
+        let out = mix_timeline(vec![seg(500, 50), seg(500, 30)]);
+        assert_eq!(out.len() / 2, 50, "sized to the longest track");
+    }
+
+    #[test]
+    fn mix_empty_is_empty() {
+        assert!(mix_timeline(vec![]).is_empty());
+    }
 }

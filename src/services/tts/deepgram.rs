@@ -283,6 +283,28 @@ impl DeepgramTtsHandler {
         log::info!("DeepgramTts: disconnected");
     }
 
+    /// Bill any text submitted to Deepgram that has not yet been confirmed by a
+    /// `Flushed`/`Cleared` message. Called on session end: the WebSocket is
+    /// about to close, so those confirmations will never arrive — without this
+    /// the chars Deepgram already synthesized would never be billed.
+    async fn bill_pending_chars(&self) {
+        let chars = {
+            let mut s = self.state.lock().await;
+            std::mem::replace(&mut s.pending_chars, 0)
+        };
+        if chars > 0 {
+            if let Some(bc) = &self.billing {
+                bc.record(BillingEvent::TtsUsage {
+                    session_id:  bc.session_id(),
+                    provider:    "deepgram".to_string(),
+                    voice:       self.config.voice.clone(),
+                    char_count:  chars,
+                    occurred_at: Utc::now(),
+                });
+            }
+        }
+    }
+
     // ---- WS message helpers ----
 
     async fn send_ws_json(&self, json: &str) {
@@ -394,6 +416,9 @@ impl FrameHandler for DeepgramTtsHandler {
 
             FrameInner::Control(ControlFrame::End { .. })
             | FrameInner::System(SystemFrame::Cancel { .. }) => {
+                // Bill in-flight text before the socket closes — the Flushed
+                // confirmation that would normally trigger billing won't arrive.
+                self.bill_pending_chars().await;
                 self.disconnect().await;
                 processor.push_frame(frame, direction).await?;
             }
@@ -558,8 +583,25 @@ async fn handle_text_message(
 
         "Cleared" => {
             log::debug!("DeepgramTts: Cleared — buffer cleared after interruption");
-            // Discard pending chars — they were cleared and won't be synthesized.
-            state.lock().await.pending_chars = 0;
+            // The text was already submitted to Deepgram for synthesis (and
+            // partially delivered as audio before the Clear took effect), so
+            // Deepgram bills for it. Record it as usage rather than discarding,
+            // otherwise every barge-in silently under-bills TTS.
+            let chars = {
+                let mut s = state.lock().await;
+                std::mem::replace(&mut s.pending_chars, 0)
+            };
+            if chars > 0 {
+                if let Some(bc) = billing {
+                    bc.record(BillingEvent::TtsUsage {
+                        session_id:  bc.session_id(),
+                        provider:    "deepgram".to_string(),
+                        voice:       voice.to_string(),
+                        char_count:  chars,
+                        occurred_at: Utc::now(),
+                    });
+                }
+            }
         }
 
         "Warning" => {
@@ -754,15 +796,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn billing_cleared_resets_chars_without_emitting_event() {
+    async fn billing_cleared_bills_submitted_chars_then_resets() {
         let state   = state_with_chars(99);
         let mock    = MockCollector::new();
         let billing: Option<Arc<dyn crate::billing::BillingCollector>> = Some(mock.clone());
 
         handle_text_message(r#"{"type":"Cleared"}"#, &dummy_proc(), &state, &billing, "v").await;
 
-        assert_eq!(mock.events().len(), 0, "Cleared must not emit a billing event");
+        // Submitted chars were billed by Deepgram before the Clear took effect,
+        // so we record them rather than silently under-billing the barge-in.
+        let events = mock.events();
+        assert_eq!(events.len(), 1, "Cleared must bill the submitted chars");
+        match &events[0] {
+            BillingEvent::TtsUsage { char_count, .. } => assert_eq!(*char_count, 99),
+            other => panic!("expected TtsUsage, got {other:?}"),
+        }
         assert_eq!(state.lock().await.pending_chars, 0, "pending_chars must be zeroed by Cleared");
+    }
+
+    #[tokio::test]
+    async fn billing_cleared_with_zero_chars_emits_no_event() {
+        let state   = state_with_chars(0);
+        let mock    = MockCollector::new();
+        let billing: Option<Arc<dyn crate::billing::BillingCollector>> = Some(mock.clone());
+
+        handle_text_message(r#"{"type":"Cleared"}"#, &dummy_proc(), &state, &billing, "v").await;
+
+        assert_eq!(mock.events().len(), 0, "no chars submitted → no event");
     }
 
     #[tokio::test]

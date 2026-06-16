@@ -208,6 +208,86 @@ enum InferenceOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Billing guard
+// ---------------------------------------------------------------------------
+
+/// Records LLM usage for one streamed inference round, surviving cancellation.
+///
+/// A barge-in interruption `abort()`s the in-flight inference task, dropping
+/// the stream future mid-flight — so the `record()` call that would normally
+/// run after the loop never executes, and the usage-only chunk OpenAI sends
+/// *after* the content may never arrive. This guard records on `Drop`, so an
+/// interrupted (or usage-less) round is still billed from an estimate instead
+/// of leaking revenue. A normal completion calls `commit_real` with the exact
+/// counts, which disarms the estimate.
+struct LlmBillingGuard {
+    billing:           Option<Arc<dyn BillingCollector>>,
+    model:             String,
+    est_input_tokens:  u32,
+    output_chars:      usize,
+    recorded:          bool,
+}
+
+impl LlmBillingGuard {
+    fn new(
+        billing: Option<Arc<dyn BillingCollector>>,
+        model: String,
+        est_input_tokens: u32,
+    ) -> Self {
+        Self { billing, model, est_input_tokens, output_chars: 0, recorded: false }
+    }
+
+    fn add_output_chars(&mut self, n: usize) {
+        self.output_chars += n;
+    }
+
+    /// Record the exact token counts reported by the provider and disarm the
+    /// drop-time estimate.
+    fn commit_real(&mut self, input_tokens: u32, output_tokens: u32) {
+        if let Some(bc) = &self.billing {
+            bc.record(BillingEvent::LlmUsage {
+                session_id:    bc.session_id(),
+                provider:      "openai".to_string(),
+                model:         self.model.clone(),
+                input_tokens,
+                output_tokens,
+                estimated:     false,
+                occurred_at:   Utc::now(),
+            });
+        }
+        self.recorded = true;
+    }
+}
+
+impl Drop for LlmBillingGuard {
+    fn drop(&mut self) {
+        if self.recorded {
+            return;
+        }
+        let Some(bc) = &self.billing else { return };
+        // ~4 chars per token is the standard rough heuristic for English text.
+        let output_tokens = self.output_chars.div_ceil(4) as u32;
+        if self.est_input_tokens == 0 && output_tokens == 0 {
+            return;
+        }
+        bc.record(BillingEvent::LlmUsage {
+            session_id:    bc.session_id(),
+            provider:      "openai".to_string(),
+            model:         self.model.clone(),
+            input_tokens:  self.est_input_tokens,
+            output_tokens,
+            estimated:     true,
+            occurred_at:   Utc::now(),
+        });
+    }
+}
+
+/// Rough token estimate for billing fallback: ~4 characters per token.
+fn estimate_tokens(serialized_chars: usize) -> u32 {
+    serialized_chars.div_ceil(4) as u32
+}
+
+// ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
@@ -394,6 +474,18 @@ impl OpenAILLMHandler {
             (converted, tools, tool_choice)
         };
 
+        // Estimate input tokens from the serialized prompt before the messages
+        // are moved into the request body — used as the billing fallback if the
+        // round is interrupted before OpenAI returns real usage counts.
+        let est_input_tokens = if self.billing.is_some() {
+            let chars = serde_json::to_string(&api_messages)
+                .map(|s| s.chars().count())
+                .unwrap_or(0);
+            estimate_tokens(chars)
+        } else {
+            0
+        };
+
         let url = format!("{}/chat/completions", self.config.base_url);
         log::info!(
             "OpenAILLM: {} messages -> {} (model={})",
@@ -443,6 +535,10 @@ impl OpenAILLMHandler {
         let mut tool_accum: HashMap<u32, PartialToolCall> = HashMap::new();
         let mut last_usage: Option<(u32, u32)> = None;
 
+        // Records usage even if this task is aborted mid-stream by a barge-in.
+        let mut billing_guard =
+            LlmBillingGuard::new(self.billing.clone(), self.config.model.clone(), est_input_tokens);
+
         'outer: while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| {
                 PipecatError::pipeline(format!("OpenAILLM: stream read error: {}", e))
@@ -481,6 +577,7 @@ impl OpenAILLMHandler {
                         if let Some(choice) = chunk.choices.first() {
                             if let Some(content) = &choice.delta.content {
                                 if !content.is_empty() {
+                                    billing_guard.add_output_chars(content.chars().count());
                                     processor.push_frame(
                                         Frame::llm_text(content.clone()),
                                         FrameDirection::Downstream,
@@ -518,24 +615,15 @@ impl OpenAILLMHandler {
             }
         }
 
-        // Emit billing event with real token counts if available.
-        if let Some(bc) = &self.billing {
-            match last_usage {
-                Some((inp, out)) => {
-                    bc.record(BillingEvent::LlmUsage {
-                        session_id:    bc.session_id(),
-                        provider:      "openai".to_string(),
-                        model:         self.config.model.clone(),
-                        input_tokens:  inp,
-                        output_tokens: out,
-                        estimated:     false,
-                        occurred_at:   Utc::now(),
-                    });
-                }
-                None => {
-                    log::debug!("OpenAILLM: no usage data in stream (billing not recorded)");
-                }
-            }
+        // Emit billing with real token counts when the provider reported them.
+        // Otherwise the guard's Drop records an estimate (covers a stream that
+        // ended without a usage chunk; a mid-stream abort is handled the same
+        // way when the task is cancelled).
+        match last_usage {
+            Some((inp, out)) => billing_guard.commit_real(inp, out),
+            None => log::debug!(
+                "OpenAILLM: no usage chunk — billing will be estimated on drop"
+            ),
         }
 
         if tool_accum.is_empty() {
@@ -778,5 +866,89 @@ impl FrameHandler for OpenAILLMHandler {
 
     fn can_generate_metrics(&self) -> bool {
         true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    struct MockCollector {
+        events: Arc<StdMutex<Vec<BillingEvent>>>,
+        id: uuid::Uuid,
+    }
+    impl MockCollector {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { events: Arc::new(StdMutex::new(Vec::new())), id: uuid::Uuid::new_v4() })
+        }
+        fn events(&self) -> Vec<BillingEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+    impl BillingCollector for MockCollector {
+        fn record(&self, e: BillingEvent) { self.events.lock().unwrap().push(e); }
+        fn session_id(&self) -> uuid::Uuid { self.id }
+    }
+
+    #[test]
+    fn guard_commit_real_records_exact_counts_and_disarms_drop() {
+        let mock = MockCollector::new();
+        {
+            let mut g = LlmBillingGuard::new(Some(mock.clone()), "gpt-4o-mini".into(), 100);
+            g.add_output_chars(40);
+            g.commit_real(56, 32);
+        } // drop here must NOT record again
+        let events = mock.events();
+        assert_eq!(events.len(), 1, "exactly one usage event");
+        match &events[0] {
+            BillingEvent::LlmUsage { input_tokens, output_tokens, estimated, .. } => {
+                assert_eq!(*input_tokens, 56);
+                assert_eq!(*output_tokens, 32);
+                assert!(!*estimated);
+            }
+            other => panic!("expected LlmUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guard_drop_without_commit_records_estimate() {
+        let mock = MockCollector::new();
+        {
+            let mut g = LlmBillingGuard::new(Some(mock.clone()), "gpt-4o-mini".into(), 100);
+            g.add_output_chars(40); // ~10 tokens
+            // no commit_real — simulates a barge-in abort mid-stream
+        }
+        let events = mock.events();
+        assert_eq!(events.len(), 1, "drop must record an estimated usage");
+        match &events[0] {
+            BillingEvent::LlmUsage { input_tokens, output_tokens, estimated, .. } => {
+                assert_eq!(*input_tokens, 100);
+                assert_eq!(*output_tokens, 10);
+                assert!(*estimated, "interrupted round must be flagged estimated");
+            }
+            other => panic!("expected LlmUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guard_drop_with_no_usage_records_nothing() {
+        let mock = MockCollector::new();
+        {
+            let _g = LlmBillingGuard::new(Some(mock.clone()), "gpt-4o-mini".into(), 0);
+            // no input estimate, no output → nothing billable
+        }
+        assert_eq!(mock.events().len(), 0);
+    }
+
+    #[test]
+    fn guard_without_collector_does_not_panic_on_drop() {
+        let mut g = LlmBillingGuard::new(None, "m".into(), 50);
+        g.add_output_chars(8);
+        drop(g);
     }
 }
