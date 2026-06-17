@@ -33,6 +33,7 @@ use rustvani::{
     audio_capture::{AudioCaptureProcessor, LocalAudioStorage, SessionAudioCapture},
     billing::{
         events::{SessionSummary, TranscriptEntry},
+        storage::postgres::PostgresBillingStorage,
         BillingEvent, BillingStorage, SessionBilling,
     },
     context::shared_context,
@@ -58,6 +59,11 @@ const RECORDINGS_DIR: &str = "recordings";
 // ---------------------------------------------------------------------------
 // CapturingBillingStorage — logs like LogBillingStorage AND keeps the final
 // summary + transcripts so we can print them after the drain task finalises.
+//
+// If `inner` is set (when DATABASE_URL is present) every event and the final
+// summary+transcript are ALSO forwarded to a real backend — e.g.
+// PostgresBillingStorage — so the run is persisted to the database while we
+// keep the in-memory copy for the on-screen report.
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -69,11 +75,16 @@ struct Captured {
 
 struct CapturingBillingStorage {
     captured: Mutex<Captured>,
+    inner: Option<Arc<dyn BillingStorage>>,
 }
 
 impl CapturingBillingStorage {
     fn new() -> Self {
-        Self { captured: Mutex::new(Captured::default()) }
+        Self { captured: Mutex::new(Captured::default()), inner: None }
+    }
+
+    fn with_inner(inner: Arc<dyn BillingStorage>) -> Self {
+        Self { captured: Mutex::new(Captured::default()), inner: Some(inner) }
     }
 }
 
@@ -82,6 +93,9 @@ impl BillingStorage for CapturingBillingStorage {
     async fn record_event(&self, event: &BillingEvent) -> PcResult<()> {
         self.captured.lock().unwrap().event_count += 1;
         log::info!("billing_event: {}", serde_json::to_string(event).unwrap_or_default());
+        if let Some(inner) = &self.inner {
+            inner.record_event(event).await?;
+        }
         Ok(())
     }
 
@@ -90,9 +104,14 @@ impl BillingStorage for CapturingBillingStorage {
         summary: &SessionSummary,
         transcripts: &[TranscriptEntry],
     ) -> PcResult<()> {
-        let mut c = self.captured.lock().unwrap();
-        c.summary = Some(summary.clone());
-        c.transcripts = transcripts.to_vec();
+        {
+            let mut c = self.captured.lock().unwrap();
+            c.summary = Some(summary.clone());
+            c.transcripts = transcripts.to_vec();
+        }
+        if let Some(inner) = &self.inner {
+            inner.finalize_session(summary, transcripts).await?;
+        }
         Ok(())
     }
 }
@@ -143,8 +162,32 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // -----------------------------------------------------------------------
     // Billing + audio capture sessions
+    //
+    // If DATABASE_URL is set, connect to Postgres, run the billing migrations
+    // and forward this run into the DB via PostgresBillingStorage. Otherwise
+    // fall back to in-memory capture only (artifacts still land on disk).
     // -----------------------------------------------------------------------
-    let billing_storage = Arc::new(CapturingBillingStorage::new());
+    let billing_storage = match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.trim().is_empty() => {
+            println!("[db] DATABASE_URL found — connecting to Postgres");
+            let connector = native_tls::TlsConnector::builder().build()?;
+            let tls = postgres_native_tls::MakeTlsConnector::new(connector);
+            let (client, connection) = tokio_postgres::connect(&url, tls).await?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    log::error!("[db] connection dropped: {e}");
+                }
+            });
+            PostgresBillingStorage::run_migrations(&client).await?;
+            println!("[db] migrations applied — billing data will be persisted\n");
+            let pg = Arc::new(PostgresBillingStorage::new(client));
+            Arc::new(CapturingBillingStorage::with_inner(pg))
+        }
+        _ => {
+            println!("[db] no DATABASE_URL — running in-memory only (no DB push)\n");
+            Arc::new(CapturingBillingStorage::new())
+        }
+    };
     let (billing, billing_handle) = SessionBilling::new_with_dir(
         session_id,
         billing_storage.clone(),
