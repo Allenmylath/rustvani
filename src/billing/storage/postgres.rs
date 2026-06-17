@@ -36,106 +36,122 @@ impl PostgresBillingStorage {
             .map_err(|e| PipecatError::pipeline(format!("billing migration failed: {e}")))?;
         Ok(())
     }
+
+    /// Appends one billable event to the ledger, idempotently. A retried
+    /// checkpoint re-sends the same `event_id`, so `ON CONFLICT DO NOTHING`
+    /// guarantees no double-insert. Non-billable events (session start/end,
+    /// transcript) are not stored as ledger rows.
+    async fn insert_event(&self, event_id: &uuid::Uuid, event: &BillingEvent) -> Result<()> {
+        let sid = event.session_id();
+        let raw = serde_json::to_value(event).unwrap_or_default();
+        let res = match event {
+            BillingEvent::LlmUsage {
+                provider, model, input_tokens, output_tokens, estimated, occurred_at, ..
+            } => {
+                self.client.execute(
+                    "INSERT INTO billing_events
+                     (event_id, session_id, event_type, provider, model,
+                      input_tokens, output_tokens, estimated, occurred_at, raw_json)
+                     VALUES ($1,$2,'llm',$3,$4,$5,$6,$7,$8,$9)
+                     ON CONFLICT (event_id) DO NOTHING",
+                    &[
+                        event_id, &sid, provider, model,
+                        &(*input_tokens as i32), &(*output_tokens as i32), estimated,
+                        occurred_at, &raw,
+                    ],
+                ).await
+            }
+            BillingEvent::TtsUsage { provider, voice, char_count, occurred_at, .. } => {
+                self.client.execute(
+                    "INSERT INTO billing_events
+                     (event_id, session_id, event_type, provider, voice, char_count,
+                      occurred_at, raw_json)
+                     VALUES ($1,$2,'tts',$3,$4,$5,$6,$7)
+                     ON CONFLICT (event_id) DO NOTHING",
+                    &[event_id, &sid, provider, voice, &(*char_count as i32), occurred_at, &raw],
+                ).await
+            }
+            BillingEvent::SttUsage { provider, audio_duration_ms, occurred_at, .. } => {
+                self.client.execute(
+                    "INSERT INTO billing_events
+                     (event_id, session_id, event_type, provider, audio_duration_ms,
+                      occurred_at, raw_json)
+                     VALUES ($1,$2,'stt',$3,$4,$5,$6)
+                     ON CONFLICT (event_id) DO NOTHING",
+                    &[event_id, &sid, provider, audio_duration_ms, occurred_at, &raw],
+                ).await
+            }
+            // Not stored as ledger rows.
+            BillingEvent::SessionStart { .. }
+            | BillingEvent::SessionEnd { .. }
+            | BillingEvent::Transcript(_) => return Ok(()),
+        };
+        res.map_err(|e| PipecatError::pipeline(format!("billing insert_event: {e}")))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl BillingStorage for PostgresBillingStorage {
-    async fn record_event(&self, event: &BillingEvent) -> Result<()> {
-        let sid = event.session_id();
+    // No-op: durable writes are batched at `checkpoint`, not per event. Keeping
+    // this off the per-event path means a slow/unreachable DB never backs up the
+    // billing queue one event at a time.
+    async fn record_event(&self, _event: &BillingEvent) -> Result<()> {
+        Ok(())
+    }
 
-        // Ensure the session row exists before any FK references.
+    async fn checkpoint(
+        &self,
+        s: &SessionSummary,
+        new_events: &[(uuid::Uuid, BillingEvent)],
+        transcripts: &[TranscriptEntry],
+    ) -> Result<()> {
+        let meta = serde_json::to_value(&s.metadata)
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let transcript_json = serde_json::to_value(transcripts)
+            .unwrap_or(serde_json::Value::Array(vec![]));
+
+        // 1. Absolute snapshot of the running totals + transcript. Idempotent:
+        //    totals are monotonic, so a retried/late checkpoint is last-writer-wins.
+        //    `status` stays 'active' and `last_checkpoint_at` is the crash heartbeat.
         self.client
             .execute(
-                "INSERT INTO billing_sessions (session_id) VALUES ($1)
-                 ON CONFLICT (session_id) DO NOTHING",
-                &[&sid],
+                "INSERT INTO billing_sessions
+                 (session_id, started_at,
+                  llm_input_tokens, llm_output_tokens, llm_calls,
+                  tts_chars, tts_calls, stt_audio_ms, stt_calls,
+                  metadata, transcript_json, status, last_checkpoint_at,
+                  created_at, updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',now(),now(),now())
+                 ON CONFLICT (session_id) DO UPDATE SET
+                   started_at        = COALESCE(billing_sessions.started_at, EXCLUDED.started_at),
+                   llm_input_tokens  = EXCLUDED.llm_input_tokens,
+                   llm_output_tokens = EXCLUDED.llm_output_tokens,
+                   llm_calls         = EXCLUDED.llm_calls,
+                   tts_chars         = EXCLUDED.tts_chars,
+                   tts_calls         = EXCLUDED.tts_calls,
+                   stt_audio_ms      = EXCLUDED.stt_audio_ms,
+                   stt_calls         = EXCLUDED.stt_calls,
+                   metadata          = EXCLUDED.metadata,
+                   transcript_json   = EXCLUDED.transcript_json,
+                   status            = 'active',
+                   last_checkpoint_at= now(),
+                   updated_at        = now()",
+                &[
+                    &s.session_id, &s.started_at,
+                    &(s.llm_input_tokens as i32), &(s.llm_output_tokens as i32),
+                    &(s.llm_calls as i32),
+                    &(s.tts_chars as i32), &(s.tts_calls as i32),
+                    &s.stt_audio_ms, &(s.stt_calls as i32),
+                    &meta, &transcript_json,
+                ],
             )
             .await
-            .map_err(|e| PipecatError::pipeline(format!("billing upsert session: {e}")))?;
+            .map_err(|e| PipecatError::pipeline(format!("billing checkpoint snapshot: {e}")))?;
 
-        match event {
-            BillingEvent::SessionStart { started_at, metadata, .. } => {
-                let meta = serde_json::to_value(metadata)
-                    .unwrap_or(serde_json::Value::Object(Default::default()));
-                self.client
-                    .execute(
-                        "UPDATE billing_sessions
-                         SET started_at = $2, metadata = $3, updated_at = now()
-                         WHERE session_id = $1",
-                        &[&sid, started_at, &meta],
-                    )
-                    .await
-                    .map_err(|e| PipecatError::pipeline(format!("billing session_start: {e}")))?;
-            }
-
-            BillingEvent::SessionEnd { ended_at, finish_reason, .. } => {
-                self.client
-                    .execute(
-                        "UPDATE billing_sessions
-                         SET ended_at = $2, finish_reason = $3,
-                             duration_secs = EXTRACT(EPOCH FROM ($2 - started_at)),
-                             updated_at = now()
-                         WHERE session_id = $1",
-                        &[&sid, ended_at, finish_reason],
-                    )
-                    .await
-                    .map_err(|e| PipecatError::pipeline(format!("billing session_end: {e}")))?;
-            }
-
-            BillingEvent::LlmUsage {
-                provider, model,
-                input_tokens, output_tokens, estimated,
-                occurred_at, ..
-            } => {
-                let raw = serde_json::to_value(event).unwrap_or_default();
-                self.client
-                    .execute(
-                        "INSERT INTO billing_events
-                         (session_id, event_type, provider, model,
-                          input_tokens, output_tokens, estimated,
-                          occurred_at, raw_json)
-                         VALUES ($1,'llm',$2,$3,$4,$5,$6,$7,$8)",
-                        &[
-                            &sid, provider, model,
-                            &(*input_tokens as i32), &(*output_tokens as i32), estimated,
-                            occurred_at, &raw,
-                        ],
-                    )
-                    .await
-                    .map_err(|e| PipecatError::pipeline(format!("billing llm_event: {e}")))?;
-            }
-
-            BillingEvent::TtsUsage { provider, voice, char_count, occurred_at, .. } => {
-                let raw = serde_json::to_value(event).unwrap_or_default();
-                self.client
-                    .execute(
-                        "INSERT INTO billing_events
-                         (session_id, event_type, provider, voice, char_count,
-                          occurred_at, raw_json)
-                         VALUES ($1,'tts',$2,$3,$4,$5,$6)",
-                        &[&sid, provider, voice, &(*char_count as i32), occurred_at, &raw],
-                    )
-                    .await
-                    .map_err(|e| PipecatError::pipeline(format!("billing tts_event: {e}")))?;
-            }
-
-            BillingEvent::SttUsage { provider, audio_duration_ms, occurred_at, .. } => {
-                let raw = serde_json::to_value(event).unwrap_or_default();
-                self.client
-                    .execute(
-                        "INSERT INTO billing_events
-                         (session_id, event_type, provider, audio_duration_ms,
-                          occurred_at, raw_json)
-                         VALUES ($1,'stt',$2,$3,$4,$5)",
-                        &[&sid, provider, audio_duration_ms, occurred_at, &raw],
-                    )
-                    .await
-                    .map_err(|e| PipecatError::pipeline(format!("billing stt_event: {e}")))?;
-            }
-
-            // Transcripts are collected and written as a single JSON at session
-            // end via finalize_session — do nothing here.
-            BillingEvent::Transcript(_) => {}
+        // 2. Append the ledger rows for events since the last checkpoint.
+        for (event_id, event) in new_events {
+            self.insert_event(event_id, event).await?;
         }
 
         Ok(())
@@ -161,8 +177,8 @@ impl BillingStorage for PostgresBillingStorage {
                   llm_input_tokens, llm_output_tokens, llm_calls,
                   tts_chars, tts_calls,
                   stt_audio_ms, stt_calls,
-                  metadata, transcript_json, created_at, updated_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)
+                  metadata, transcript_json, status, created_at, updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'complete',$15,$15)
                  ON CONFLICT (session_id) DO UPDATE SET
                    started_at        = COALESCE(EXCLUDED.started_at,        billing_sessions.started_at),
                    ended_at          = COALESCE(EXCLUDED.ended_at,          billing_sessions.ended_at),
@@ -177,6 +193,7 @@ impl BillingStorage for PostgresBillingStorage {
                    stt_calls         = EXCLUDED.stt_calls,
                    metadata          = EXCLUDED.metadata,
                    transcript_json   = EXCLUDED.transcript_json,
+                   status            = 'complete',
                    updated_at        = EXCLUDED.updated_at",
                 &[
                     &s.session_id, &s.started_at, &s.ended_at,
@@ -211,16 +228,29 @@ CREATE TABLE IF NOT EXISTS billing_sessions (
     stt_calls         INTEGER     NOT NULL DEFAULT 0,
     metadata          JSONB       NOT NULL DEFAULT '{}',
     transcript_json   JSONB       NOT NULL DEFAULT '[]',
+    -- Billing lifecycle: 'active' (in flight, not yet billable),
+    -- 'complete' (clean end, exact), 'crashed' (settled at last checkpoint).
+    status            TEXT        NOT NULL DEFAULT 'active',
+    -- Heartbeat: bumped on every checkpoint; the sweeper uses it to detect
+    -- sessions whose process died mid-conversation.
+    last_checkpoint_at TIMESTAMPTZ,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Add transcript_json to existing deployments that pre-date this column.
+-- Add columns to existing deployments that pre-date them.
 ALTER TABLE billing_sessions
-    ADD COLUMN IF NOT EXISTS transcript_json JSONB NOT NULL DEFAULT '[]';
+    ADD COLUMN IF NOT EXISTS transcript_json    JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE billing_sessions
+    ADD COLUMN IF NOT EXISTS status             TEXT  NOT NULL DEFAULT 'active';
+ALTER TABLE billing_sessions
+    ADD COLUMN IF NOT EXISTS last_checkpoint_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS billing_events (
     id                BIGSERIAL   PRIMARY KEY,
+    -- Stable per-event id assigned by the drain task; makes the ledger append
+    -- idempotent so a retried checkpoint never double-inserts.
+    event_id          UUID,
     session_id        UUID        NOT NULL REFERENCES billing_sessions(session_id) ON DELETE CASCADE,
     event_type        TEXT        NOT NULL,
     provider          TEXT,
@@ -235,8 +265,14 @@ CREATE TABLE IF NOT EXISTS billing_events (
     raw_json          JSONB
 );
 
-CREATE INDEX IF NOT EXISTS billing_sessions_started_at  ON billing_sessions (started_at);
-CREATE INDEX IF NOT EXISTS billing_sessions_metadata    ON billing_sessions  USING GIN (metadata);
-CREATE INDEX IF NOT EXISTS billing_events_session_id    ON billing_events    (session_id);
-CREATE INDEX IF NOT EXISTS billing_events_occurred_at   ON billing_events    (occurred_at);
+-- Add event_id to existing deployments that pre-date it.
+ALTER TABLE billing_events
+    ADD COLUMN IF NOT EXISTS event_id UUID;
+
+CREATE INDEX        IF NOT EXISTS billing_sessions_started_at  ON billing_sessions (started_at);
+CREATE INDEX        IF NOT EXISTS billing_sessions_status      ON billing_sessions (status, last_checkpoint_at);
+CREATE INDEX        IF NOT EXISTS billing_sessions_metadata    ON billing_sessions USING GIN (metadata);
+CREATE UNIQUE INDEX IF NOT EXISTS billing_events_event_id      ON billing_events   (event_id);
+CREATE INDEX        IF NOT EXISTS billing_events_session_id    ON billing_events   (session_id);
+CREATE INDEX        IF NOT EXISTS billing_events_occurred_at   ON billing_events   (occurred_at);
 ";

@@ -30,7 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "SELECT session_id, started_at, ended_at, duration_secs, finish_reason,
                     llm_input_tokens, llm_output_tokens, llm_calls,
                     tts_chars, tts_calls, stt_audio_ms, stt_calls,
-                    jsonb_array_length(transcript_json) AS transcript_len
+                    jsonb_array_length(transcript_json) AS transcript_len,
+                    status, last_checkpoint_at
              FROM billing_sessions
              ORDER BY created_at DESC
              LIMIT 5",
@@ -50,8 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let stt_ms: f64 = r.get("stt_audio_ms");
         let stt_calls: i32 = r.get("stt_calls");
         let tlen: Option<i32> = r.get("transcript_len");
+        let status: String = r.get("status");
+        let last_ckpt: Option<chrono::DateTime<chrono::Utc>> = r.get("last_checkpoint_at");
 
-        // event rows for this session
+        // event rows for this session, plus how many carry a stable event_id
         let ev: i64 = client
             .query_one(
                 "SELECT count(*) FROM billing_events WHERE session_id = $1",
@@ -59,12 +62,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?
             .get(0);
+        let ev_with_id: i64 = client
+            .query_one(
+                "SELECT count(*) FROM billing_events WHERE session_id = $1 AND event_id IS NOT NULL",
+                &[&sid],
+            )
+            .await?
+            .get(0);
 
-        println!("session {sid}");
-        println!("  duration={:?}s  finish={:?}", dur, reason);
+        println!("session {sid}  [status={status}]");
+        println!("  duration={:?}s  finish={:?}  last_checkpoint={:?}", dur, reason, last_ckpt);
         println!("  LLM in={llm_in} out={llm_out} calls={llm_calls}");
         println!("  TTS chars={tts_chars} calls={tts_calls}  STT ms={stt_ms:.0} calls={stt_calls}");
-        println!("  billing_events rows={ev}  transcript entries={:?}", tlen);
+        println!("  billing_events rows={ev} (with event_id={ev_with_id})  transcript entries={:?}", tlen);
         println!();
     }
 

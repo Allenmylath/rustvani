@@ -1,11 +1,17 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::events::{BillingEvent, SessionSummary, TranscriptEntry};
 use super::storage::BillingStorage;
+
+/// How often the drain task flushes a durable checkpoint to storage. This is
+/// the upper bound on both the provider's loss and the client's under-billing
+/// if the process crashes mid-session.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Public trait
@@ -39,7 +45,11 @@ pub trait BillingCollector: Send + Sync {
 /// (which closes the channel) and the final `finalize_session` write succeeds.
 pub struct SessionBilling {
     session_id: Uuid,
-    tx: mpsc::Sender<BillingEvent>,
+    // Unbounded so `record()` is sync, non-blocking, and never drops — billing
+    // must never slow down or stall the pipeline. Events are tiny and
+    // turn-paced, so the queue stays shallow; it only grows transiently if the
+    // DB stalls, and the drain task catches up.
+    tx: mpsc::UnboundedSender<BillingEvent>,
     // Summary is shared with the drain task so callers can read totals if needed.
     summary: Arc<Mutex<SessionSummary>>,
 }
@@ -66,7 +76,10 @@ impl SessionBilling {
         channel_capacity: usize,
         session_dir: Option<PathBuf>,
     ) -> (Arc<Self>, tokio::task::JoinHandle<()>) {
-        let (tx, rx) = mpsc::channel(channel_capacity);
+        // `channel_capacity` is retained for API compatibility; the channel is
+        // now unbounded so billing can never block or drop on the hot path.
+        let _ = channel_capacity;
+        let (tx, rx) = mpsc::unbounded_channel();
         let summary = Arc::new(Mutex::new(SessionSummary {
             session_id,
             ..Default::default()
@@ -90,15 +103,11 @@ impl SessionBilling {
 
 impl BillingCollector for SessionBilling {
     fn record(&self, event: BillingEvent) {
-        if let Err(e) = self.tx.try_send(event) {
-            match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    log::warn!("BillingCollector: channel full, dropping event");
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    // Drain task exited early (e.g. panicked). Nothing we can do.
-                }
-            }
+        // Unbounded + sync: never blocks, never drops. Fails only if the drain
+        // task has already exited (e.g. session already torn down), in which
+        // case there is nothing left to persist to.
+        if self.tx.send(event).is_err() {
+            log::debug!("BillingCollector: drain task gone, event ignored");
         }
     }
 
@@ -112,32 +121,75 @@ impl BillingCollector for SessionBilling {
 // ---------------------------------------------------------------------------
 
 async fn drain_task(
-    mut rx: mpsc::Receiver<BillingEvent>,
+    mut rx: mpsc::UnboundedReceiver<BillingEvent>,
     summary: Arc<Mutex<SessionSummary>>,
     storage: Arc<dyn BillingStorage>,
     session_dir: Option<PathBuf>,
 ) {
     let mut transcripts: Vec<TranscriptEntry> = Vec::new();
+    // Billable events accumulated in RAM since the last successful checkpoint.
+    // Each carries a stable id so a retried checkpoint is idempotent.
+    let mut pending: Vec<(Uuid, BillingEvent)> = Vec::new();
 
-    while let Some(event) = rx.recv().await {
-        // Collect transcript entries for the end-of-session JSON file.
-        if let BillingEvent::Transcript(ref entry) = event {
-            transcripts.push(entry.clone());
-        }
+    let mut tick = tokio::time::interval(CHECKPOINT_INTERVAL);
+    // Consume the immediate first tick so the first checkpoint lands one full
+    // interval in, not at t=0.
+    tick.tick().await;
 
-        // Hold the Mutex for microseconds only — never across .await.
-        {
-            let mut s = summary.lock().unwrap();
-            apply_event(&mut s, &event);
-        }
+    loop {
+        tokio::select! {
+            maybe = rx.recv() => match maybe {
+                Some(event) => {
+                    match &event {
+                        // Collected for the transcript snapshot.
+                        BillingEvent::Transcript(entry) => transcripts.push(entry.clone()),
+                        // Billable usage — buffered for the next ledger flush.
+                        BillingEvent::LlmUsage { .. }
+                        | BillingEvent::TtsUsage { .. }
+                        | BillingEvent::SttUsage { .. } => {
+                            pending.push((Uuid::new_v4(), event.clone()));
+                        }
+                        // SessionStart / SessionEnd only move the running totals.
+                        _ => {}
+                    }
 
-        if let Err(e) = storage.record_event(&event).await {
-            log::error!("BillingStorage::record_event failed: {e}");
+                    // Hold the Mutex for microseconds only — never across .await.
+                    {
+                        let mut s = summary.lock().unwrap();
+                        apply_event(&mut s, &event);
+                    }
+
+                    // Per-event observability hook (no DB write for the default
+                    // back-end — durable writes happen at checkpoint).
+                    if let Err(e) = storage.record_event(&event).await {
+                        log::error!("BillingStorage::record_event failed: {e}");
+                    }
+                }
+                // Channel closed — all SessionBilling clones have been dropped.
+                None => break,
+            },
+
+            _ = tick.tick() => {
+                let snap = summary.lock().unwrap().clone();
+                match storage.checkpoint(&snap, &pending, &transcripts).await {
+                    // Only clear the buffer once the events are durably persisted;
+                    // on failure keep them and retry at the next tick (the absolute
+                    // snapshot is idempotent, so re-sending is safe).
+                    Ok(()) => pending.clear(),
+                    Err(e) => log::error!("billing checkpoint failed (will retry): {e}"),
+                }
+            }
         }
     }
 
-    // Channel closed — all SessionBilling clones have been dropped.
+    // ----- Final flush + settle -----
     let final_summary = summary.lock().unwrap().clone();
+
+    // Flush any events accumulated since the last checkpoint.
+    if let Err(e) = storage.checkpoint(&final_summary, &pending, &transcripts).await {
+        log::error!("billing final checkpoint failed: {e}");
+    }
+
     log::info!(
         "billing: session {} ended — {:.2}s | LLM in={} out={} calls={} \
          | TTS chars={} calls={} | STT ms={:.0} calls={}",
@@ -152,6 +204,8 @@ async fn drain_task(
         final_summary.stt_calls,
     );
 
+    // Mark the session settled (complete). Totals are already durable from the
+    // final checkpoint above, so correctness does not depend on this succeeding.
     if let Err(e) = storage.finalize_session(&final_summary, &transcripts).await {
         log::error!("BillingStorage::finalize_session failed: {e}");
     }

@@ -99,6 +99,18 @@ impl BillingStorage for CapturingBillingStorage {
         Ok(())
     }
 
+    async fn checkpoint(
+        &self,
+        summary: &SessionSummary,
+        new_events: &[(Uuid, BillingEvent)],
+        transcripts: &[TranscriptEntry],
+    ) -> PcResult<()> {
+        if let Some(inner) = &self.inner {
+            inner.checkpoint(summary, new_events, transcripts).await?;
+        }
+        Ok(())
+    }
+
     async fn finalize_session(
         &self,
         summary: &SessionSummary,
