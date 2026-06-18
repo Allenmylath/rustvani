@@ -14,6 +14,6 @@ pub mod signaling;
 pub mod transport;
 
 pub use codec::Denoiser48k;
-pub use params::{DenoiserFactory, VaniWebRTCParams};
+pub use params::{build_shared_udp_mux, DenoiserFactory, TurnServer, VaniWebRTCParams};
 pub use signaling::SignalMsg;
 pub use transport::VaniWebRTCTransport;

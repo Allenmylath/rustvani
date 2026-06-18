@@ -16,10 +16,13 @@ use tokio::sync::{mpsc, Mutex};
 
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS};
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice::udp_network::UDPNetwork;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
+use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
@@ -89,16 +92,49 @@ impl VaniWebRTCTransport {
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut media)?;
 
+        // ---- SettingEngine: make ICE work behind an edge (e.g. Fly.io) ----
+        let mut setting = SettingEngine::default();
+
+        // Advertise the configured public IPv4 as the Host candidate, replacing
+        // the (possibly IPv6-only / private) gathered address.
+        if !self.params.nat_1to1_ips.is_empty() {
+            setting.set_nat_1to1_ips(
+                self.params.nat_1to1_ips.clone(),
+                RTCIceCandidateType::Host,
+            );
+        }
+
+        // Pin all media to the one pre-bound UDP port (shared across every
+        // connection — never re-bound here, so concurrent calls don't collide).
+        if let Some(mux) = &self.params.udp_mux {
+            setting.set_udp_network(UDPNetwork::Muxed(mux.clone()));
+        }
+
         let api = APIBuilder::new()
             .with_media_engine(media)
             .with_interceptor_registry(registry)
+            .with_setting_engine(setting)
             .build();
 
-        let config = RTCConfiguration {
-            ice_servers: vec![RTCIceServer {
-                urls: self.params.ice_servers.clone(),
+        // STUN (no creds) + TURN (with creds) merged into one server list.
+        let mut ice_servers: Vec<RTCIceServer> = self
+            .params
+            .ice_servers
+            .iter()
+            .map(|url| RTCIceServer {
+                urls: vec![url.clone()],
                 ..Default::default()
-            }],
+            })
+            .collect();
+        ice_servers.extend(self.params.turn_servers.iter().map(|t| RTCIceServer {
+            urls:       t.urls.clone(),
+            username:   t.username.clone(),
+            credential: t.credential.clone(),
+            ..Default::default()
+        }));
+
+        let config = RTCConfiguration {
+            ice_servers,
             ..Default::default()
         };
 

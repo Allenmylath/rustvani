@@ -15,4 +15,4 @@ pub use output::{BaseOutputTransport, OutputMessage};
 pub use params::TransportParams;
 pub use websocket::{WebSocketParams, WebSocketTransport};
 #[cfg(feature = "vaniwebrtc")]
-pub use vaniwebrtc::{VaniWebRTCParams, VaniWebRTCTransport};
+pub use vaniwebrtc::{build_shared_udp_mux, TurnServer, VaniWebRTCParams, VaniWebRTCTransport};
