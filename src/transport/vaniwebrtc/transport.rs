@@ -23,6 +23,7 @@ use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice::udp_network::UDPNetwork;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
+use webrtc::ice_transport::ice_credential_type::RTCIceCredentialType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
@@ -127,10 +128,10 @@ impl VaniWebRTCTransport {
             })
             .collect();
         ice_servers.extend(self.params.turn_servers.iter().map(|t| RTCIceServer {
-            urls:       t.urls.clone(),
-            username:   t.username.clone(),
-            credential: t.credential.clone(),
-            ..Default::default()
+            urls:            t.urls.clone(),
+            username:        t.username.clone(),
+            credential:      t.credential.clone(),
+            credential_type: RTCIceCredentialType::Password,
         }));
 
         let config = RTCConfiguration {
