@@ -29,6 +29,11 @@ vad-silero-ort = ["dep:ort", "dep:ndarray"]
 
 # Transport
 transport-websocket = ["dep:axum", "dep:tower-http", "dep:tokio-tungstenite"]
+# Peer-to-peer WebRTC transport (webrtc-rs), feature name `vaniwebrtc`. Opt-in:
+# pulls a large dep tree and needs a C build toolchain (audiopus/libopus → cmake
+# + a C compiler; MSVC on Windows). Reuses the already-optional axum/tower-http
+# used by the WS transport.
+vaniwebrtc = ["dep:webrtc", "dep:audiopus", "dep:axum", "dep:tower-http"]
 
 # Services
 stt-sarvam = ["dep:reqwest"]
@@ -81,6 +86,10 @@ axum            = { version = "0.7", features = ["ws"], optional = true }
 tower-http      = { version = "0.5", features = ["cors"], optional = true }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
 
+# Transport — peer-to-peer WebRTC (webrtc-rs RTP/SRTP + audiopus Opus codec)
+webrtc          = { version = "0.11", optional = true }
+audiopus        = { version = "0.2",  optional = true }
+
 # HTTP client (LLM + STT services)
 reqwest         = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"], optional = true }
 
@@ -105,3 +114,10 @@ dotenvy         = "0.15"
 # ---------------------------------------------------------------------------
 [dev-dependencies]
 tokio      = { version = "1", features = ["full", "test-util"] }
+
+# ---------------------------------------------------------------------------
+# Binaries that need opt-in features
+# ---------------------------------------------------------------------------
+[[bin]]
+name = "vaniwebrtc_server"
+required-features = ["vaniwebrtc"]

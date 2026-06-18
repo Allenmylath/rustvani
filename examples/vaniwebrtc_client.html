@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>rustvani — vaniwebrtc P2P client</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; }
+    button { font-size: 1rem; padding: 8px 16px; }
+    #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 12px;
+           height: 280px; overflow-y: auto; margin-top: 16px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>rustvani — peer-to-peer WebRTC</h1>
+  <p>Signaling URL: <input id="url" size="40" value="ws://localhost:8080/rtc" /></p>
+  <button id="start">Connect &amp; talk</button>
+  <button id="stop" disabled>Hang up</button>
+  <audio id="remote" autoplay></audio>
+  <div id="log"></div>
+
+  <script>
+    const log = (...a) => {
+      document.getElementById('log').textContent += a.join(' ') + '\n';
+      console.log(...a);
+    };
+
+    let pc, ws, micStream;
+
+    document.getElementById('start').onclick = async () => {
+      document.getElementById('start').disabled = true;
+      document.getElementById('stop').disabled = false;
+
+      ws = new WebSocket(document.getElementById('url').value);
+      await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+      log('signaling: connected');
+
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      });
+
+      // Trickle our local ICE candidates to the server.
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          ws.send(JSON.stringify({
+            type: 'ice',
+            candidate: e.candidate.candidate,
+            sdpMid: e.candidate.sdpMid,
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+          }));
+        }
+      };
+
+      pc.ontrack = (e) => {
+        log('media: remote audio track');
+        document.getElementById('remote').srcObject = e.streams[0];
+      };
+
+      pc.onconnectionstatechange = () => log('pc state:', pc.connectionState);
+
+      // Control data channel (interruption / RAVI / client VAD).
+      const control = pc.createDataChannel('control');
+      control.onopen = () => log('data channel: open');
+      control.onmessage = (e) => log('control <=', e.data);
+
+      // Mic — disable browser NS/AGC so a server-side full-band denoiser
+      // (DeepFilterNet) gets a natural signal. Keep AEC for barge-in.
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { noiseSuppression: false, autoGainControl: false, echoCancellation: true },
+      });
+      micStream.getTracks().forEach((t) => pc.addTrack(t, micStream));
+
+      // Server messages: answer + trickled ICE.
+      ws.onmessage = async (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'answer') {
+          await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+          log('signaling: answer applied');
+        } else if (msg.type === 'ice') {
+          try {
+            await pc.addIceCandidate({
+              candidate: msg.candidate,
+              sdpMid: msg.sdpMid,
+              sdpMLineIndex: msg.sdpMLineIndex,
+            });
+          } catch (err) { log('addIceCandidate error:', err); }
+        }
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
+      log('signaling: offer sent');
+    };
+
+    document.getElementById('stop').onclick = () => {
+      try { ws && ws.send(JSON.stringify({ type: 'bye' })); } catch (e) {}
+      if (micStream) micStream.getTracks().forEach((t) => t.stop());
+      if (pc) pc.close();
+      if (ws) ws.close();
+      document.getElementById('start').disabled = false;
+      document.getElementById('stop').disabled = true;
+      log('hung up');
+    };
+  </script>
+</body>
+</html>
