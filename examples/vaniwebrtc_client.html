@@ -16,7 +16,28 @@
   <button id="start">Connect &amp; talk</button>
   <button id="stop" disabled>Hang up</button>
   <audio id="remote" autoplay></audio>
+
+  <!-- Live client-VAD speech probability. The red line marks the start
+       threshold; the bar turns green once probability crosses it. -->
+  <div style="margin-top:16px;">
+    VAD speech probability: <strong id="vadProb">0%</strong>
+    &nbsp;(start ≥ <span id="vadStart">50</span>%, end &lt; <span id="vadEnd">35</span>%)
+    <div style="height:18px; background:#222; border-radius:4px; position:relative;
+                overflow:hidden; margin-top:4px;">
+      <div id="vadBar" style="height:100%; width:0%; background:#888;
+                              transition:width 50ms linear;"></div>
+      <div id="vadStartLine" style="position:absolute; top:0; bottom:0; left:50%;
+                                    width:2px; background:#f33;"></div>
+    </div>
+  </div>
+
   <div id="log"></div>
+
+  <!-- Client-side VAD: Silero VAD in the browser via onnxruntime-web.
+       Exposes the global `vad` (UMD bundle). If you bump one version, bump the
+       matching baseAssetPath / onnxWASMBasePath URLs below to the same versions. -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/bundle.min.js"></script>
 
   <script>
     const log = (...a) => {
@@ -24,7 +45,28 @@
       console.log(...a);
     };
 
-    let pc, ws, micStream;
+    let pc, ws, micStream, control, myvad;
+
+    // Client-VAD thresholds (these are the @ricky0123/vad-web defaults, made
+    // explicit so they're visible and easy to tune).
+    const VAD_START_THRESHOLD = 0.5;  // speech STARTS when prob rises above this
+    const VAD_END_THRESHOLD   = 0.35; // speech ENDS when prob falls below this
+
+    // Paint the live probability meter.
+    const showVadProb = (p) => {
+      const pct = Math.round(p * 100);
+      document.getElementById('vadProb').textContent = pct + '%';
+      const bar = document.getElementById('vadBar');
+      bar.style.width = pct + '%';
+      bar.style.background = p >= VAD_START_THRESHOLD ? '#0f0' : '#888';
+    };
+
+    // Send a JSON control message to the server over the data channel (if open).
+    const sendControl = (obj) => {
+      if (control && control.readyState === 'open') {
+        control.send(JSON.stringify(obj));
+      }
+    };
 
     document.getElementById('start').onclick = async () => {
       document.getElementById('start').disabled = true;
@@ -58,16 +100,62 @@
       pc.onconnectionstatechange = () => log('pc state:', pc.connectionState);
 
       // Control data channel (interruption / RAVI / client VAD).
-      const control = pc.createDataChannel('control');
+      control = pc.createDataChannel('control');
       control.onopen = () => log('data channel: open');
       control.onmessage = (e) => log('control <=', e.data);
 
-      // Mic — disable browser NS/AGC so a server-side full-band denoiser
-      // (DeepFilterNet) gets a natural signal. Keep AEC for barge-in.
+      // Mic — keep the browser's full audio processing on:
+      //   echoCancellation : removes the bot's voice from the mic so server-side
+      //                      VAD/STT only hears the user (essential for barge-in).
+      //   noiseSuppression : strips residual echo + room noise the AEC leaves.
+      //   autoGainControl  : normalises the user's level so quiet speech clears
+      //                      the server VAD thresholds (confidence/min_volume).
+      // (If a server-side DeepFilterNet denoiser is ever wired up, revisit NS/AGC
+      //  so it gets a more natural signal.)
       micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { noiseSuppression: false, autoGainControl: false, echoCancellation: true },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
       micStream.getTracks().forEach((t) => pc.addTrack(t, micStream));
+
+      // Client-side VAD (Silero via @ricky0123/vad-web). It runs on the AEC'd
+      // mic locally, so it never hears the bot's voice through the speakers —
+      // the instant the user starts speaking we tell the server, which barges
+      // in (client_vad_start → VADUserStartedSpeaking → interruption). This is
+      // far more reliable than the server detecting speech through echo.
+      if (window.vad) {
+        try {
+          // Keep the meter labels in sync with the configured thresholds.
+          document.getElementById('vadStart').textContent = Math.round(VAD_START_THRESHOLD * 100);
+          document.getElementById('vadEnd').textContent = Math.round(VAD_END_THRESHOLD * 100);
+          document.getElementById('vadStartLine').style.left = (VAD_START_THRESHOLD * 100) + '%';
+
+          myvad = await vad.MicVAD.new({
+            // Reuse the AEC'd capture above (ignored gracefully on versions that
+            // don't support it — they open their own mic, still echo-cancelled).
+            stream: micStream,
+            onnxWASMBasePath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/',
+            baseAssetPath:    'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/',
+            positiveSpeechThreshold: VAD_START_THRESHOLD,
+            negativeSpeechThreshold: VAD_END_THRESHOLD,
+            // Live per-frame probability → drives the on-screen meter.
+            onFrameProcessed: (probs) => showVadProb(probs.isSpeech),
+            onSpeechStart: () => {
+              log('vad: speech start → barge in');
+              sendControl({ type: 'client_vad_start', timestamp: Date.now() / 1000 });
+            },
+            onSpeechEnd: () => {
+              log('vad: speech end');
+              sendControl({ type: 'client_vad_stop', timestamp: Date.now() / 1000 });
+            },
+          });
+          myvad.start();
+          log('vad: client-side VAD started');
+        } catch (err) {
+          log('vad: failed to start —', err);
+        }
+      } else {
+        log('vad: library not loaded — falling back to server VAD only');
+      }
 
       // Server messages: answer + trickled ICE.
       ws.onmessage = async (ev) => {
@@ -94,6 +182,7 @@
 
     document.getElementById('stop').onclick = () => {
       try { ws && ws.send(JSON.stringify({ type: 'bye' })); } catch (e) {}
+      if (myvad) { try { myvad.pause(); } catch (e) {} myvad = null; }
       if (micStream) micStream.getTracks().forEach((t) => t.stop());
       if (pc) pc.close();
       if (ws) ws.close();

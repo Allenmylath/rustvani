@@ -6,6 +6,7 @@
 //! control messages (interruption / RAVI / client-VAD) ride a reliable data
 //! channel. Mirrors `WebSocketTransport::run_socket`.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures::stream::{SplitSink, StreamExt};
 use futures::SinkExt;
 use tokio::sync::{mpsc, Mutex};
+use tokio::time::MissedTickBehavior;
 
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS};
@@ -44,7 +46,7 @@ use super::codec::{OpusInbound, OpusOutbound};
 use super::params::VaniWebRTCParams;
 use super::signaling::{munge_answer_sdp, SignalMsg};
 
-const AUDIO_OUT_CHANNEL_CAP: usize = 150;
+const AUDIO_OUT_CHANNEL_CAP: usize = 600;
 /// Duration of each encoded Opus sample (20 ms frame at 48 kHz).
 const OPUS_SAMPLE_DURATION: Duration = Duration::from_millis(20);
 
@@ -279,6 +281,17 @@ impl VaniWebRTCTransport {
         let mut outbound = OpusOutbound::new();
         let audio_out_rate = self.params.transport.audio_out_sample_rate.unwrap_or(16_000);
 
+        // Encoded 20 ms Opus packets awaiting paced playout. RTP/UDP has no
+        // backpressure, so without pacing `write_sample` would blast the whole
+        // utterance into the client's jitter buffer at once, leaving nothing
+        // server-side to flush on barge-in. We hold packets here and emit one
+        // per 20 ms tick, so an interruption can drop the unplayed tail.
+        let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+        let mut pacer = tokio::time::interval(OPUS_SAMPLE_DURATION);
+        // Never burst-catch-up missed ticks after a silence gap — that would
+        // re-introduce the blast-ahead problem we're pacing to avoid.
+        pacer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 // Signaling: offer / ICE / bye from the client.
@@ -322,45 +335,61 @@ impl VaniWebRTCTransport {
                     }
                 }
 
-                // Pipeline output → client.
+                // Pipeline output → client. TTS runs faster than real time, so
+                // on each wakeup drain *everything* queued into `pending` (which
+                // is unbounded) right away. If we only took one message per
+                // wakeup the bounded channel would back up during a burst and
+                // `BaseOutputTransport` would silently drop chunks — losing
+                // seconds of audio mid-reply. Playout stays paced from `pending`.
                 output_msg = audio_out_rx.recv() => {
-                    match output_msg {
-                        Some(OutputMessage::Audio(pcm)) => {
-                            for packet in outbound.push_pcm(&pcm, audio_out_rate) {
-                                let sample = Sample {
-                                    data:     bytes::Bytes::from(packet),
-                                    duration: OPUS_SAMPLE_DURATION,
-                                    ..Default::default()
-                                };
-                                if local_track.write_sample(&sample).await.is_err() {
-                                    log::warn!("vaniwebrtc: write_sample failed");
+                    let mut next = output_msg;
+                    let mut closed = false;
+                    loop {
+                        match next {
+                            Some(OutputMessage::Audio(pcm)) => {
+                                for packet in outbound.push_pcm(&pcm, audio_out_rate) {
+                                    pending.push_back(packet);
                                 }
                             }
-                        }
-
-                        Some(OutputMessage::Text(json)) => {
-                            if let Some(dc) = dc_slot.lock().await.clone() {
-                                let _ = dc.send_text(json).await;
-                            }
-                        }
-
-                        Some(OutputMessage::Interruption) => {
-                            // Drain audio queued before the marker, then reset
-                            // the encoder so stale frames don't play out.
-                            while let Ok(queued) = audio_out_rx.try_recv() {
-                                match queued {
-                                    OutputMessage::Interruption => break,
-                                    OutputMessage::Audio(_) | OutputMessage::Text(_) => {}
+                            Some(OutputMessage::Text(json)) => {
+                                if let Some(dc) = dc_slot.lock().await.clone() {
+                                    let _ = dc.send_text(json).await;
                                 }
                             }
-                            outbound.reset();
-                            if let Some(dc) = dc_slot.lock().await.clone() {
-                                let _ = dc.send_text(r#"{"type":"interruption"}"#).await;
+                            Some(OutputMessage::Interruption) => {
+                                // Flush the paced backlog — this is what stops the
+                                // bot on barge-in. Processing in order means any
+                                // audio queued *after* the marker is kept. Only the
+                                // ~1 packet already on the wire (+ client jitter
+                                // buffer) plays out.
+                                pending.clear();
+                                outbound.reset();
+                                if let Some(dc) = dc_slot.lock().await.clone() {
+                                    let _ = dc.send_text(r#"{"type":"interruption"}"#).await;
+                                }
+                                log::debug!("vaniwebrtc: sent interruption to client");
                             }
-                            log::debug!("vaniwebrtc: sent interruption to client");
+                            None => { closed = true; break; } // pipeline shut down
                         }
+                        match audio_out_rx.try_recv() {
+                            Ok(m) => next = Some(m),
+                            Err(_) => break, // channel drained (or disconnected)
+                        }
+                    }
+                    if closed { break; }
+                }
 
-                        None => break, // pipeline shut down
+                // Paced playout: emit one buffered Opus packet per 20 ms tick.
+                _ = pacer.tick(), if !pending.is_empty() => {
+                    if let Some(packet) = pending.pop_front() {
+                        let sample = Sample {
+                            data:     bytes::Bytes::from(packet),
+                            duration: OPUS_SAMPLE_DURATION,
+                            ..Default::default()
+                        };
+                        if local_track.write_sample(&sample).await.is_err() {
+                            log::warn!("vaniwebrtc: write_sample failed");
+                        }
                     }
                 }
             }

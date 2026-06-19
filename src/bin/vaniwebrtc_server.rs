@@ -161,6 +161,7 @@ async fn handle_connection(socket: WebSocket, app_state: AppState) {
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let sarvam_api_key = std::env::var("SARVAM_API_KEY").expect("SARVAM_API_KEY env var not set");
