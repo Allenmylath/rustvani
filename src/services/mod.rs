@@ -7,7 +7,7 @@ pub use llm::openai::{OpenAILLMConfig, OpenAILLMHandler};
 pub use llm::sarvam::{SarvamLLMConfig, SarvamLLMHandler};
 pub use stt::deepgram::{DeepgramSttConfig, DeepgramSttHandler};
 pub use stt::gnani::{GnaniSttConfig, GnaniSttHandler};
-pub use stt::sarvam::{SarvamSttConfig, SarvamSttHandler};
+pub use stt::sarvam::{NoiseBackend, SarvamSttConfig, SarvamSttHandler};
 pub use stt::sixtydb::{
     SixtyDbEncoding,
     SixtyDbSttConfig, SixtyDbSttHandler,

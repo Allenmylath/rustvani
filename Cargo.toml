@@ -20,7 +20,7 @@ exclude = [
 # Features
 # ---------------------------------------------------------------------------
 [features]
-default = ["vad-silero-ort", "transport-websocket", "stt-sarvam", "stt-60db", "stt-deepgram", "llm-openai", "tts-deepgram", "dhara", "db-postgres"]
+default = ["vad-silero-ort", "transport-websocket", "serializer-twilio", "stt-sarvam", "stt-60db", "stt-deepgram", "llm-openai", "tts-deepgram", "dhara", "db-postgres"]
 
 # Silero VAD — ONNX (ort) inference backend. Gates only the ort-based path
 # (`SileroVadOrt`) and its `ort`/C-C++ dependency; the pure-Rust `SileroVadNative`
@@ -29,6 +29,10 @@ vad-silero-ort = ["dep:ort", "dep:ndarray"]
 
 # Transport
 transport-websocket = ["dep:axum", "dep:tower-http", "dep:tokio-tungstenite"]
+# Twilio serializer auto-hangup — pulls reqwest for the REST call. The Twilio
+# serializer itself builds under `transport-websocket`; only the hang-up body is
+# gated here.
+serializer-twilio = ["dep:reqwest", "transport-websocket"]
 # Peer-to-peer WebRTC transport (webrtc-rs), feature name `vaniwebrtc`. Opt-in:
 # pulls a large dep tree and needs a C build toolchain (audiopus/libopus → cmake
 # + a C compiler; MSVC on Windows). Reuses the already-optional axum/tower-http

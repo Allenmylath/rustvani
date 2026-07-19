@@ -29,6 +29,10 @@ pub mod transport;
 #[cfg(feature = "transport-websocket")]
 pub mod ravi;
 
+/// Frame serializers — Twilio and other WebSocket wire-protocol adapters.
+#[cfg(feature = "transport-websocket")]
+pub mod serializers;
+
 #[cfg(feature = "dhara")]
 pub mod dhara;
 
@@ -53,8 +57,9 @@ pub use clock::{BaseClock, SystemClock, system_clock};
 pub use error::{PipecatError, Result};
 pub use frames::{
     AudioRawData, ControlFrame, DataFrame, DataFrameData, ErrorFrameData, Frame, FrameDirection,
-    FrameHandler, FrameInner, FrameKind, FrameProcessor, FrameProcessorSetup, PassthroughHandler,
-    StartFrameData, SystemFrame, TranscriptionData, FunctionCallData, FunctionCallResultData,
+    FrameHandler, FrameInner, FrameKind, FrameProcessor, FrameProcessorSetup, KeypadEntry,
+    PassthroughHandler, StartFrameData, SystemFrame, TranscriptionData, FunctionCallData,
+    FunctionCallResultData,
 };
 pub use context::{shared_context, LLMContext, ToolCall};
 pub use pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask};
@@ -74,12 +79,19 @@ pub use vad::SileroVadOrt;
 #[cfg(feature = "transport-websocket")]
 pub use transport::{BaseInputTransport, BaseOutputTransport, BaseTransport, TransportParams};
 
+// Serializers
+#[cfg(feature = "transport-websocket")]
+pub use serializers::{
+    FrameSerializer, SerializedInput, SerializedOutput, TwilioFrameSerializer, TwilioInputParams,
+    TwilioStart,
+};
+
 // Services — each gated by its feature
 #[cfg(feature = "stt-deepgram")]
 pub use services::{DeepgramSttConfig, DeepgramSttHandler};
 
 #[cfg(feature = "stt-sarvam")]
-pub use services::{SarvamSttConfig, SarvamSttHandler};
+pub use services::{NoiseBackend, SarvamSttConfig, SarvamSttHandler};
 
 #[cfg(feature = "llm-openai")]
 pub use services::{OpenAILLMConfig, OpenAILLMHandler, FunctionRegistry};

@@ -5,7 +5,7 @@ pub mod sixtydb;
 
 pub use deepgram::{DeepgramSttConfig, DeepgramSttHandler};
 pub use gnani::{GnaniSttConfig, GnaniSttHandler};
-pub use sarvam::{SarvamSttConfig, SarvamSttHandler};
+pub use sarvam::{NoiseBackend, SarvamSttConfig, SarvamSttHandler};
 pub use sixtydb::{
     SixtyDbEncoding,
     SixtyDbSttConfig, SixtyDbSttHandler,

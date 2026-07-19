@@ -25,3 +25,6 @@ Thumbs.db
 # Local test outputs
 *.wav
 *.log
+
+# Upstream pipecat clone, kept locally for comparison only
+pipecat/

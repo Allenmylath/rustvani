@@ -2,3 +2,6 @@
 .env
 piper-models/
 *.log
+
+# Upstream pipecat clone, kept locally for comparison only
+/pipecat/
