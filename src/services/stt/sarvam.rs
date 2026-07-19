@@ -94,7 +94,9 @@ use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::audio_process::agc::AudioEnhancer;
+use crate::audio_process::hushfilter::HushVaniFilter;
 use crate::audio_process::noisefilter::RNNoiseFilter;
+use crate::audio_process::StreamingDenoiser;
 use crate::billing::{BillingCollector, BillingEvent};
 use crate::error::Result;
 use crate::frames::{
@@ -123,6 +125,19 @@ const LEDGER_TOLERANCE_MS: f64 = 120.0;
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
+
+/// Noise-suppression backend applied on the STT input path.
+///
+/// Selects which denoiser runs when [`SarvamSttConfig::noise_reduction`] is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NoiseBackend {
+    /// RNNoise (`nnnoiseless`) — true streaming filter. The default.
+    #[default]
+    Rnnoise,
+    /// DeepFilterNet3-style (`hush-vani`) — stronger suppression, run via a
+    /// sliding-window wrapper over its batch API. Opt-in.
+    HushVani,
+}
 
 /// Configuration for SarvamSttHandler.
 ///
@@ -162,9 +177,13 @@ pub struct SarvamSttConfig {
     /// Receive VAD signals from server (speech_start / speech_end events).
     pub vad_signals: bool,
 
-    /// Enable RNNoise noise suppression before sending audio to Sarvam.
+    /// Enable noise suppression before sending audio to Sarvam.
     /// Default: true.
     pub noise_reduction: bool,
+
+    /// Which noise-suppression backend to use when `noise_reduction` is on.
+    /// Default: [`NoiseBackend::Rnnoise`].
+    pub noise_backend: NoiseBackend,
 
     /// Enable the speech enhancement chain: high-pass filter (before the
     /// denoiser) plus AGC and soft limiter (after it), so Sarvam receives
@@ -201,6 +220,7 @@ impl Default for SarvamSttConfig {
             high_vad_sensitivity:    false,
             vad_signals:             false,
             noise_reduction:         true,
+            noise_backend:           NoiseBackend::Rnnoise,
             agc:                     true,
             audio_gating:            true,
             pre_roll_ms:             500,
@@ -620,7 +640,7 @@ struct RxCtx {
     processor:         FrameProcessor,
     gate:              Arc<TurnGate>,
     language_fallback: Option<String>,
-    noise_filter:      Option<Arc<Mutex<RNNoiseFilter>>>,
+    noise_filter:      Option<Arc<Mutex<Box<dyn StreamingDenoiser>>>>,
     enhancer:          Option<Arc<Mutex<AudioEnhancer>>>,
     billing:           Option<Arc<dyn BillingCollector>>,
 }
@@ -633,7 +653,7 @@ pub struct SarvamSttHandler {
     config: SarvamSttConfig,
     state:  Arc<Mutex<SarvamSttState>>,
     /// Noise filter shared with the receive task (for reset on transcript).
-    noise_filter: Option<Arc<Mutex<RNNoiseFilter>>>,
+    noise_filter: Option<Arc<Mutex<Box<dyn StreamingDenoiser>>>>,
     /// Speech enhancer (HPF + AGC + limiter) shared with the receive task.
     enhancer: Option<Arc<Mutex<AudioEnhancer>>>,
     /// Optional billing collector — records audio duration per transcript.
@@ -644,12 +664,33 @@ pub struct SarvamSttHandler {
 
 impl SarvamSttHandler {
     pub fn new(config: SarvamSttConfig) -> Self {
-        let noise_filter = if config.noise_reduction {
-            log::info!(
-                "SarvamStt: noise reduction enabled (sample_rate={})",
-                config.sample_rate
-            );
-            Some(Arc::new(Mutex::new(RNNoiseFilter::new(config.sample_rate))))
+        let noise_filter: Option<Arc<Mutex<Box<dyn StreamingDenoiser>>>> = if config.noise_reduction
+        {
+            let filter: Box<dyn StreamingDenoiser> = match config.noise_backend {
+                NoiseBackend::Rnnoise => {
+                    log::info!(
+                        "SarvamStt: noise reduction enabled — RNNoise (sample_rate={})",
+                        config.sample_rate
+                    );
+                    Box::new(RNNoiseFilter::new(config.sample_rate))
+                }
+                NoiseBackend::HushVani => match HushVaniFilter::new(config.sample_rate) {
+                    Ok(f) => {
+                        log::info!(
+                            "SarvamStt: noise reduction enabled — hush-vani (sample_rate={})",
+                            config.sample_rate
+                        );
+                        Box::new(f)
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "SarvamStt: hush-vani init failed ({e}); falling back to RNNoise"
+                        );
+                        Box::new(RNNoiseFilter::new(config.sample_rate))
+                    }
+                },
+            };
+            Some(Arc::new(Mutex::new(filter)))
         } else {
             None
         };

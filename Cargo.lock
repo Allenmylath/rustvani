@@ -1192,6 +1192,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "hush-vani"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecb4e268fa98067141c91e3dbfec95822a3074e57fc79efbd6ffffc69e8f59f9"
+dependencies = [
+ "hound",
+ "rustfft 6.4.1",
+]
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2594,6 +2604,7 @@ dependencies = [
  "flate2",
  "futures",
  "hound",
+ "hush-vani",
  "log",
  "matrixmultiply",
  "native-tls",

@@ -1,6 +1,6 @@
 [package]
 name = "rustvani"
-version = "0.4.0-dev.6"
+version = "0.4.0-dev.7"
 edition = "2021"
 license = "BSD-2-Clause"
 description = "Voice AI framework for Rust — real-time speech pipelines with STT, LLM, TTS, and Dhara conversation flows"
@@ -72,6 +72,7 @@ base64          = "0.22"
 # Audio processing (always required for voice pipeline)
 hound           = "3"
 nnnoiseless     = "0.1"
+hush-vani       = "0.1"
 rubato          = "0.14"
 rustfft         = "6"
 flate2          = "1"
