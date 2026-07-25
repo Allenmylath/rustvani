@@ -58,8 +58,8 @@ pub use error::{PipecatError, Result};
 pub use frames::{
     AudioRawData, ControlFrame, DataFrame, DataFrameData, ErrorFrameData, Frame, FrameDirection,
     FrameHandler, FrameInner, FrameKind, FrameProcessor, FrameProcessorSetup, KeypadEntry,
-    PassthroughHandler, StartFrameData, SystemFrame, TranscriptionData, FunctionCallData,
-    FunctionCallResultData,
+    PassthroughHandler, ProcessorBusHandle, StartFrameData, SystemFrame, TranscriptionData,
+    FunctionCallData, FunctionCallResultData,
 };
 pub use context::{shared_context, LLMContext, ToolCall};
 pub use pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask};

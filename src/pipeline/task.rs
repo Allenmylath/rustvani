@@ -46,7 +46,7 @@ use crate::billing::{BillingCollector, BillingEvent};
 use crate::clock::BaseClock;
 
 use crate::error::{PipecatError, Result};
-use crate::frames::{ControlFrame, ErrorFrameData, Frame, FrameDirection, FrameHandler, FrameInner, FrameKind, FrameProcessor, FrameProcessorSetup, StartFrameData, SystemFrame};
+use crate::frames::{ControlFrame, ErrorFrameData, Frame, FrameDirection, FrameHandler, FrameInner, FrameKind, FrameProcessor, FrameProcessorSetup, ProcessorBusHandle, StartFrameData, SystemFrame};
 use crate::observer::BaseObserver;
 
 
@@ -466,6 +466,10 @@ pub struct PipelineTask {
 
     /// Lifecycle observer — subscribe before run() to watch state transitions.
     lifecycle_rx: std::sync::Mutex<watch::Receiver<PipelineLifecycle>>,
+
+    /// Optional agent-bus handle, injected by `BaseAgent` before `run()` and
+    /// forwarded into processor setup so coordinator processors can dispatch.
+    bus_handle: std::sync::Mutex<Option<Arc<dyn ProcessorBusHandle>>>,
 }
 
 impl PipelineTask {
@@ -506,7 +510,15 @@ impl PipelineTask {
             push_tx,
             push_rx: std::sync::Mutex::new(Some(push_rx)),
             lifecycle_rx: std::sync::Mutex::new(lifecycle_rx),
+            bus_handle: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Inject an agent-bus handle (a `BaseAgent`'s `TaskContext`) so coordinator
+    /// processors in this pipeline can dispatch to other agents. Call before
+    /// `run()`; standalone pipelines simply never call this and get `None`.
+    pub fn set_bus_handle(&self, handle: Arc<dyn ProcessorBusHandle>) {
+        *self.bus_handle.lock().unwrap() = Some(handle);
     }
 
     // ---- External push ----
@@ -639,8 +651,14 @@ impl PipelineTask {
             .ok_or_else(|| PipecatError::pipeline("PipelineTask::run() called more than once"))?;
 
         // Setup the pipeline.
+        // Clone out of the lock BEFORE the await so no guard is held across it.
+        let bus_handle = self.bus_handle.lock().unwrap().clone();
         self.pipeline
-            .setup(FrameProcessorSetup { clock, observer })
+            .setup(FrameProcessorSetup {
+                clock,
+                observer,
+                bus_handle,
+            })
             .await?;
 
         // Register billing lifecycle hooks when a collector is configured.

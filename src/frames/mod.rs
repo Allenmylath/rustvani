@@ -5,7 +5,7 @@ pub mod queue;
 pub use direction::FrameDirection;
 pub use processor::{
     FrameCallback, FrameHandler, FrameProcessor, FrameProcessorSetup, PassthroughHandler,
-    WeakFrameProcessor,
+    ProcessorBusHandle, WeakFrameProcessor,
 };
 
 use std::collections::HashMap;

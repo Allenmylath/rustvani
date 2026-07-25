@@ -28,11 +28,27 @@ pub type FrameCallback = Box<
 // FrameProcessorSetup
 // ---------------------------------------------------------------------------
 
+/// An opaque handle giving a processor access to the agent bus it runs under.
+///
+/// The frame plane and the agent bus are deliberately separate subsystems. This
+/// trait is the single additive seam between them: a `BaseAgent` injects its
+/// `TaskContext` (which implements this) into the pipeline setup, and a
+/// coordinator-style processor can downcast it back (via [`Self::as_any`]) to
+/// dispatch work to other agents. Processors that don't need the bus ignore it.
+pub trait ProcessorBusHandle: Send + Sync {
+    /// Downcast hook — implementors return `self`; callers recover the concrete
+    /// type (e.g. `TaskContext`) with `as_any().downcast_ref::<T>()`.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 /// Configuration passed to `FrameProcessor::setup()`.
 #[derive(Clone)]
 pub struct FrameProcessorSetup {
     pub clock: Arc<dyn BaseClock>,
     pub observer: Option<Arc<dyn BaseObserver>>,
+    /// Optional agent-bus handle for processors that coordinate other agents.
+    /// `None` for standalone pipelines; set by `BaseAgent` to its `TaskContext`.
+    pub bus_handle: Option<Arc<dyn ProcessorBusHandle>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +157,9 @@ pub(crate) struct Inner {
     clock: RwLock<Option<Arc<dyn BaseClock>>>,
     observer: RwLock<Option<Arc<dyn BaseObserver>>>,
 
+    // Agent-bus handle (optional). Sync RwLock — cloned out before any .await.
+    bus_handle: std::sync::RwLock<Option<Arc<dyn ProcessorBusHandle>>>,
+
     // ---- Event handlers (sync, std Mutex) ----
     on_before_process_frame: std::sync::Mutex<Vec<FrameEventFn>>,
     on_after_process_frame:  std::sync::Mutex<Vec<FrameEventFn>>,
@@ -219,6 +238,7 @@ impl FrameProcessor {
             deprecated_openaillmcontext: AtomicBool::new(false),
             clock: RwLock::new(None),
             observer: RwLock::new(None),
+            bus_handle: std::sync::RwLock::new(None),
             on_before_process_frame: std::sync::Mutex::new(Vec::new()),
             on_after_process_frame:  std::sync::Mutex::new(Vec::new()),
             on_before_push_frame:    std::sync::Mutex::new(Vec::new()),
@@ -278,6 +298,14 @@ impl FrameProcessor {
             .map(FrameProcessor)
     }
 
+    /// The agent-bus handle for this processor, present when it runs inside a
+    /// `BaseAgent` pipeline. Coordinator processors downcast this to a
+    /// `TaskContext` to dispatch work to other agents; standalone pipelines
+    /// return `None`.
+    pub fn bus_handle(&self) -> Option<Arc<dyn ProcessorBusHandle>> {
+        self.0.bus_handle.read().unwrap().clone()
+    }
+
     pub fn metrics_enabled(&self) -> bool {
         self.0.enable_metrics.load(Ordering::Relaxed)
     }
@@ -321,6 +349,7 @@ impl FrameProcessor {
     pub async fn setup(&self, setup: FrameProcessorSetup) -> Result<()> {
         *self.0.clock.write().await = Some(setup.clock.clone());
         *self.0.observer.write().await = setup.observer.clone();
+        *self.0.bus_handle.write().unwrap() = setup.bus_handle.clone();
 
         if !self.0.enable_direct_mode {
             self.create_input_task();

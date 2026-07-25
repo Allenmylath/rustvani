@@ -656,6 +656,12 @@ impl Agent for BaseAgent {
     ) -> Result<()> {
         self.ready.store(true, Ordering::Relaxed);
         self.announce_ready().await;
+        // Expose this agent's TaskContext to its pipeline so coordinator
+        // processors can dispatch to peers over the bus. Set before run() so
+        // it reaches processor setup.
+        if let Some(tc) = self.task_ctx.get() {
+            self.pipeline_task.set_bus_handle(tc.clone());
+        }
         let result = self.pipeline_task.run(clock, observer).await;
         // Never leave a requester (or our own pending handles) hanging.
         self.cleanup_jobs("agent ended").await;

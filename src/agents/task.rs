@@ -182,6 +182,14 @@ pub struct TaskContext {
     // track group membership here, keyed alongside `pending`.
 }
 
+/// Lets a `TaskContext` be injected into a pipeline as a bus handle and
+/// recovered by a coordinator processor via `as_any().downcast_ref()`.
+impl crate::frames::ProcessorBusHandle for TaskContext {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl TaskContext {
     /// Create a task context bound to a bus and the agent registry.
     ///
