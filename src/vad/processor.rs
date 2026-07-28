@@ -144,6 +144,18 @@ impl VadProcessor {
         FrameProcessor::new("VadProcessor", Box::new(self), false)
     }
 
+    /// Feed `pending` into the VAD buffer and take the next complete window.
+    ///
+    /// `pending` is emptied by the first call, so a drain loop feeds the frame
+    /// in once and then keeps pulling whatever is already buffered. Returns
+    /// `None` once less than a full window remains.
+    fn next_vad_window(&self, pending: &mut &[u8]) -> Option<Vec<u8>> {
+        let mut guard = self.state.lock().unwrap();
+        let window = guard.machine.next_window(pending);
+        *pending = &[];
+        window
+    }
+
     fn reset_state(&self) {
         let mut guard = self.state.lock().unwrap();
         guard.emitted_speaking = false;
@@ -219,14 +231,16 @@ impl FrameHandler for VadProcessor {
                     processor.push_frame(frame.clone(), direction).await?;
 
                     // --- VAD window processing ---
-                    let window_opt = {
-                        let mut guard = self.state.lock().unwrap();
-                        guard.machine.next_window(&audio_data.audio)
-                    };
-
+                    // Drain every window this frame completed, not just the
+                    // first. A frame can carry more audio than one window (an
+                    // upsampling input path produces frames wider than the
+                    // 512-sample window), and stopping after one leaves the
+                    // remainder buffered forever, so the VAD falls permanently
+                    // further behind the live call.
                     let mut vad_quiet_transition = false;
+                    let mut pending: &[u8] = &audio_data.audio;
 
-                    if let Some(window) = window_opt {
+                    while let Some(window) = self.next_vad_window(&mut pending) {
                         let model = {
                             self.state.lock().unwrap().model.clone()
                         };

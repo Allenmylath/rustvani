@@ -248,6 +248,18 @@ impl FrameHandler for BaseInputTransport {
     }
 }
 
+/// Feed `pending` into the VAD buffer and take the next complete window.
+///
+/// `pending` is emptied by the first call, so a drain loop feeds the frame in
+/// once and then keeps pulling whatever is already buffered. Returns `None`
+/// once less than a full window remains.
+fn next_vad_window(state: &InputTransportState, pending: &mut &[u8]) -> Option<Vec<u8>> {
+    let mut machine = state.vad_machine.lock().unwrap();
+    let window = machine.as_mut().and_then(|m| m.next_window(pending));
+    *pending = &[];
+    window
+}
+
 async fn run_audio_task(
     state: Arc<InputTransportState>,
     mut rx: mpsc::Receiver<AudioRawData>,
@@ -289,12 +301,15 @@ async fn run_audio_task(
                 let mut vad_quiet_transition = false;
 
                 if let Some(analyzer) = &state.params.vad_analyzer {
-                    let window_opt = {
-                        let mut machine = state.vad_machine.lock().unwrap();
-                        machine.as_mut().and_then(|m| m.next_window(&data.audio))
-                    };
+                    // Drain every window this frame completed, not just the
+                    // first. A frame can carry more audio than one window —
+                    // the Twilio path upsamples 8 kHz to 960-sample frames
+                    // against a 512-sample window — and stopping after one
+                    // leaves the remainder buffered forever, so the VAD falls
+                    // permanently further behind the live call.
+                    let mut pending: &[u8] = &data.audio;
 
-                    if let Some(window) = window_opt {
+                    while let Some(window) = next_vad_window(&state, &mut pending) {
                         let confidence = analyzer.voice_confidence(window.clone()).await;
                         last_is_speech = confidence >= state.params.vad_params.confidence;
 
