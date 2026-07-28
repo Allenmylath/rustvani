@@ -60,7 +60,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::{
+// Via rustvani's re-export rather than a direct axum dependency: the socket
+// from `on_upgrade` is handed straight to `transport.run_socket`, so it has to
+// be the same axum the crate was built against.
+use rustvani::axum::{
     Router,
     extract::{State, WebSocketUpgrade, ws::{Message, WebSocket}},
     http::{HeaderMap, header},

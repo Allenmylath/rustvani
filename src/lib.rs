@@ -26,6 +26,23 @@ pub mod vad;
 #[cfg(feature = "transport-websocket")]
 pub mod transport;
 
+/// The exact `axum` this crate was built against.
+///
+/// [`WebSocketTransport::run_socket`](transport::websocket::WebSocketTransport::run_socket)
+/// takes an [`axum::extract::ws::WebSocket`] by value, so a server that obtains
+/// that socket from its *own* axum dependency only type-checks while both crates
+/// resolve to the same axum. axum is pre-1.0, so 0.7 and 0.8 are separate
+/// packages that Cargo will happily link side by side — and the mismatch shows
+/// up as a confusing "expected `WebSocket`, found `WebSocket`" error.
+///
+/// Build the router off this re-export and the versions cannot drift:
+///
+/// ```ignore
+/// use rustvani::axum::{Router, extract::WebSocketUpgrade, routing::get};
+/// ```
+#[cfg(feature = "transport-websocket")]
+pub use axum;
+
 #[cfg(feature = "transport-websocket")]
 pub mod ravi;
 

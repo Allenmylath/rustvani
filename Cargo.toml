@@ -1,6 +1,6 @@
 [package]
 name = "rustvani"
-version = "0.4.0-dev.8"
+version = "0.4.0-dev.9"
 edition = "2021"
 license = "BSD-2-Clause"
 description = "Voice AI framework for Rust — real-time speech pipelines with STT, LLM, TTS, and Dhara conversation flows"
@@ -49,8 +49,15 @@ tts-deepgram = ["dep:tokio-tungstenite"]
 tts-sarvam = ["dep:tokio-tungstenite"]
 tts-piper = ["dep:ort"]
 
-# Dhara conversation flow system
-dhara = ["dep:thiserror"]
+# Dhara conversation flow system.
+#
+# Does NOT gate `thiserror` — `src/error/mod.rs` derives on it unconditionally,
+# so that is a core dependency (see below).
+#
+# Requires `llm-openai` (dhara's loader/manager use
+# `services::llm::openai::TransitionHook`) and `transport-websocket`
+# (`dhara::dctx` uses `crate::ravi`, which is gated on it).
+dhara = ["llm-openai", "transport-websocket"]
 
 # Database tools (optional — not in default)
 db-postgres = ["dep:tokio-postgres", "dep:postgres-native-tls", "dep:native-tls"]
@@ -98,8 +105,10 @@ audiopus        = { version = "0.2",  optional = true }
 # HTTP client (LLM + STT services)
 reqwest         = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"], optional = true }
 
-# Dhara conversation flow system
-thiserror       = { version = "1", optional = true }
+# Error types. Not optional: `PipecatError` in src/error/mod.rs derives
+# thiserror::Error and is compiled in every configuration, so gating this behind
+# a feature makes the crate uncompilable without that feature.
+thiserror       = "1"
 
 # Database — Postgres (optional tool)
 tokio-postgres      = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"], optional = true }

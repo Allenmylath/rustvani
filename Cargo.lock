@@ -2589,7 +2589,7 @@ dependencies = [
 
 [[package]]
 name = "rustvani"
-version = "0.4.0-dev.8"
+version = "0.4.0-dev.9"
 dependencies = [
  "arc-swap",
  "async-recursion",

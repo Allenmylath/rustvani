@@ -5,3 +5,7 @@ piper-models/
 
 # Upstream pipecat clone, kept locally for comparison only
 /pipecat/
+
+# Fly.io deployment workspace for the Twilio voice bot — holds live secrets
+# and per-deployment config, kept local only
+/cortextwilio/
