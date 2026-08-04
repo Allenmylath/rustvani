@@ -131,7 +131,28 @@ tokio      = { version = "1", features = ["full", "test-util"] }
 
 # ---------------------------------------------------------------------------
 # Binaries that need opt-in features
+#
+# Without these declarations a plain `cargo build` tries to compile every
+# `src/bin/*.rs` under the default feature set and fails on the ones that use a
+# gated service. `required-features` makes cargo skip them instead.
 # ---------------------------------------------------------------------------
 [[bin]]
 name = "vaniwebrtc_server"
-required-features = ["vaniwebrtc"]
+# Uses SarvamTtsHandler in addition to the WebRTC transport.
+required-features = ["vaniwebrtc", "tts-sarvam"]
+
+[[bin]]
+name = "websocket_server"
+required-features = ["tts-sarvam"]
+
+[[bin]]
+name = "ravi_server"
+required-features = ["tts-sarvam"]
+
+[[bin]]
+name = "sarvam_tts_test"
+required-features = ["tts-sarvam"]
+
+[[bin]]
+name = "websocket_server_piper"
+required-features = ["tts-piper"]
