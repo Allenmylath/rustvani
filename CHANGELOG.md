@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.4.0-dev (unreleased)
+
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.9"` —
+since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Telephony — Twilio Media Streams (new)
+
+- New `crate::serializers` module: a `FrameSerializer` trait that sits between
+  `WebSocketTransport` and a telephony provider, encoding outgoing frames into
+  provider messages and decoding incoming ones back into frames.
+- `TwilioFrameSerializer` handles Twilio's Media Streams JSON end to end:
+  inbound `media` events (base64 µ-law @ 8 kHz) are resampled up to the pipeline
+  rate; outbound TTS audio is resampled down and re-encoded; barge-in emits
+  Twilio's `clear` event; `dtmf` events become `InputDTMFFrame`s.
+- `TwilioStart::parse` extracts `stream_sid` / `call_sid` / `account_sid` from
+  the handshake; `TwilioFrameSerializer::from_start` builds a serializer from it.
+- `serializers::g711` — standalone µ-law/A-law codec with optional in-line
+  resampling (`pcm_to_ulaw`, `ulaw_to_pcm`).
+- `WebSocketTransport::set_serializer` installs one; call before `run_socket`.
+- New feature `serializer-twilio` (default) gates only the REST auto-hang-up
+  path, which pulls `reqwest`. The serializer itself builds under
+  `transport-websocket`.
+- New binary `twilio_coordinator_server` — a complete phone agent on default
+  features.
+
+### Transport — peer-to-peer WebRTC (new)
+
+- New opt-in feature `vaniwebrtc` and `crate::transport::vaniwebrtc` module:
+  Opus over RTP/SRTP carried peer-to-peer with **no SFU or media server** in the
+  path. Signaling (SDP offer/answer + trickle ICE) rides a WebSocket; control
+  messages ride a WebRTC data channel.
+- `VaniWebRTCTransport::new(name, params)` mirrors `WebSocketTransport` —
+  `input()`, `output()`, and `run(socket, push_tx)`.
+- `VaniWebRTCParams`: `ice_servers`, `turn_servers` (`TurnServer` with long-term
+  credentials), `nat_1to1_ips`, `udp_mux`, Opus tuning
+  (`opus_max_avg_bitrate`, `opus_fullband`, `opus_dtx`), and a
+  `denoiser_factory` hook for a 48 kHz inbound `Denoiser48k`.
+- `build_shared_udp_mux(bind_addr)` binds one UDP socket at startup so every
+  connection shares a single port — required behind edges that forward only a
+  known port (Fly.io). Call once and clone the `Arc`.
+- `munge_answer_sdp` rewrites the Opus `a=fmtp` line to force high-bitrate,
+  full-band Opus, so a full-band denoise stage isn't starved of high frequencies.
+- Adds optional `webrtc` and `audiopus` dependencies; building this feature
+  needs cmake and a C/C++ toolchain (MSVC on Windows).
+- New binary `vaniwebrtc_server` (`required-features = ["vaniwebrtc"]`) and a
+  browser client at `examples/vaniwebrtc_client.html`.
+
+### Audio — selectable noise-suppression backend
+
+- New `StreamingDenoiser` trait (`filter` / `flush` / `reset`) in
+  `crate::audio_process`, implemented by both denoisers so the STT path can
+  select one at runtime behind a single `Box<dyn>`.
+- New `audio_process::hushfilter::HushVaniFilter` — DeepFilterNet3-style
+  suppression via the `hush-vani` crate. `hush-vani` exposes only a batch
+  `enhance()` whose GRUs reset per call, so the filter wraps it in a sliding
+  window: each call re-runs `enhance` over 200 ms of lookback context plus the
+  new audio to re-prime the GRUs, discards the context region of the output, and
+  holds back the trailing 160 samples (the documented algorithmic lag) until
+  `flush()`. Non-16 kHz input is resampled transparently.
+- New `SarvamSttConfig::noise_backend: NoiseBackend` — `Rnnoise` (default,
+  true streaming) or `HushVani` (opt-in, stronger suppression). A `HushVani`
+  init failure logs and falls back to RNNoise rather than failing the pipeline.
+- Adds `hush-vani` as a regular (non-optional) dependency — no feature flag.
+
+### Agents
+
+- New `CoordinatorProcessor` (`agents::coordinator_processor`): a bus-connected
+  `FrameProcessor` that can sit in the LLM slot and answer from local logic,
+  with or without an agent swarm behind it. Exposes `CoordinatorCtx`,
+  `CoordinatorFn`, `DEFAULT_CALL_TIMEOUT`.
+- `AgenticCoordinator` / `FenceOutcome` for turn-level epoch fencing.
+
+### VAD
+
+- Fixed: the analyzer now drains **every** ready window per audio frame instead
+  of one, so speech transitions are not delayed when frames carry more than one
+  window's worth of samples.
+
+### Documentation
+
+- README rewritten against the current API. The Quick Start is now
+  `examples/quickstart.rs` verbatim and builds on default features; several
+  snippets in the previous README did not compile (`OpenAILLMConfig` has no
+  `context` field, `BaseTransport::new` takes a name, the aggregators' `new`
+  already returns a `FrameProcessor`, and `SarvamTtsHandler` needs the
+  non-default `tts-sarvam` feature).
+- New: a feature-flags table, plus `doc/stt-deepgram.md`,
+  `doc/serializer-twilio.md`, and `doc/vaniwebrtc.md`.
+- `doc/audio-enhancement.md` documents the two noise backends and the
+  hush-vani sliding-window design.
+
 ## 0.3.0 — 2026-06-11
 
 Rust-native rewrite of the agents module internals plus Pipecat-aligned
