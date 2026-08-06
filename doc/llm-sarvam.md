@@ -1,7 +1,7 @@
 # Sarvam LLM
 
 **File:** `src/services/llm/sarvam.rs`  
-**Feature:** `stt-sarvam` (shares feature gate with Sarvam STT; enabled by default)  
+**Feature:** `llm-sarvam` (enabled by default)  
 **Protocol:** SSE HTTP (`POST https://api.sarvam.ai/v1/chat/completions`)
 
 Sarvam AI's OpenAI-compatible chat completions endpoint. Supports Indian language LLMs and an optional CoT thinking mode.
@@ -67,7 +67,10 @@ SARVAM_API_KEY=your_key
 
 ## Cargo Feature
 
-Enabled by default (shares `stt-sarvam` feature gate). To disable Sarvam services:
+Enabled by default. `llm-sarvam` pulls `reqwest`; Sarvam STT is a separate
+feature (`stt-sarvam`, WebSocket). Both read the same `SARVAM_API_KEY`.
+
+To disable Sarvam services:
 
 ```toml
 [dependencies]

@@ -7,6 +7,12 @@ Broader design docs live at the repository root: [architecture.md](../architectu
 ## Services
 
 ### Speech-to-Text (STT)
+
+The shared half of every backend — the `SttProvider` base trait, the generic
+`SttService` that implements `FrameHandler` for all of them, the turn gate and
+the audio front-end — is documented in **[STT abstraction](stt-abstraction.md)**.
+Read that first if you are adding a provider.
+
 | Service | File | Feature | Protocol | Best For |
 |---|---|---|---|---|
 | [Sarvam STT](stt-sarvam.md) | `src/services/stt/sarvam.rs` | `stt-sarvam` ✅ | WebSocket | Indian languages, auto-detect |
@@ -25,7 +31,7 @@ Broader design docs live at the repository root: [architecture.md](../architectu
 | Service | File | Feature | Protocol | Best For |
 |---|---|---|---|---|
 | [OpenAI LLM](llm-openai.md) | `src/services/llm/openai.rs` | `llm-openai` ✅ | SSE HTTP | Function calling, tool loops, any OpenAI-compatible endpoint |
-| [Sarvam LLM](llm-sarvam.md) | `src/services/llm/sarvam.rs` | `stt-sarvam` ✅ | SSE HTTP | Indian language LLM, CoT thinking mode |
+| [Sarvam LLM](llm-sarvam.md) | `src/services/llm/sarvam.rs` | `llm-sarvam` ✅ | SSE HTTP | Indian language LLM, CoT thinking mode |
 
 ✅ = on by default · ❌ = opt-in. See the [feature flags table](../README.md#feature-flags) for the full list.
 

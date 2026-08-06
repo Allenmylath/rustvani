@@ -25,16 +25,16 @@ User speaks → VAD → STT → LLM → TTS → User hears
 
 ```toml
 [dependencies]
-rustvani = "0.4.0-dev.9"
+rustvani = "0.4.0-dev.10"
 ```
 
 `0.4.0-dev.*` is a **prerelease**, so Cargo needs the version spelled out — `cargo add rustvani` alone will resolve to the last stable, `0.3.0`. Use:
 
 ```bash
-cargo add rustvani@0.4.0-dev.9
+cargo add rustvani@0.4.0-dev.10
 ```
 
-Everything in this README describes `0.4.0-dev.9`. The hush-vani noise backend, WebRTC transport, Twilio serializer, and agent swarm do **not** exist in `0.3.0`.
+Everything in this README describes `0.4.0-dev.10`. The hush-vani noise backend, WebRTC transport, Twilio serializer, and agent swarm do **not** exist in `0.3.0`.
 
 ---
 
@@ -42,17 +42,18 @@ Everything in this README describes `0.4.0-dev.9`. The hush-vani noise backend, 
 
 rustvani ships a lot of providers, so services are behind Cargo features. **Half of what people try first is opt-in** — check this table before filing a "cannot find `SarvamTtsHandler`" issue.
 
-**Enabled by default:** `vad-silero-ort`, `transport-websocket`, `serializer-twilio`, `stt-sarvam`, `stt-60db`, `stt-deepgram`, `llm-openai`, `tts-deepgram`, `dhara`, `db-postgres`.
+**Enabled by default:** `vad-silero-ort`, `transport-websocket`, `serializer-twilio`, `stt-sarvam`, `stt-60db`, `stt-deepgram`, `llm-openai`, `llm-sarvam`, `tts-deepgram`, `dhara`, `db-postgres`.
 
 | Feature | Default | Gates | Notes |
 |---|:---:|---|---|
 | `vad-silero-ort` | ✅ | `SileroVadOrt` | ONNX Runtime backend (8 kHz + 16 kHz). `SileroVadNative` is **always** compiled and needs no feature. |
 | `transport-websocket` | ✅ | `WebSocketTransport`, `ravi`, `serializers` | axum 0.7 + tungstenite |
 | `serializer-twilio` | ✅ | Twilio REST auto-hangup | The `TwilioFrameSerializer` itself builds under `transport-websocket` |
-| `stt-sarvam` | ✅ | `SarvamSttHandler`, `SarvamLLMHandler` | |
+| `stt-sarvam` | ✅ | `SarvamSttHandler` | Also gates the shared STT core (`SttProvider`, `SttService`) |
 | `stt-60db` | ✅ | 60db STT | |
 | `stt-deepgram` | ✅ | `DeepgramSttHandler` | |
 | `llm-openai` | ✅ | `OpenAILLMHandler`, `FunctionRegistry` | Any OpenAI-compatible endpoint |
+| `llm-sarvam` | ✅ | `SarvamLLMHandler` | Was gated on `stt-sarvam`; split out because Sarvam STT is WebSocket and no longer pulls `reqwest` |
 | `tts-deepgram` | ✅ | `DeepgramTtsHandler` | Aura-2 |
 | `dhara` | ✅ | `DharaManager` | Implies `llm-openai` + `transport-websocket` |
 | `db-postgres` | ✅ | `NeonPostgresTool`, Postgres billing/audio storage | |
@@ -65,7 +66,7 @@ A common "Sarvam end to end" setup:
 
 ```toml
 [dependencies]
-rustvani = { version = "0.4.0-dev.9", features = ["tts-sarvam"] }
+rustvani = { version = "0.4.0-dev.10", features = ["tts-sarvam"] }
 ```
 
 ---

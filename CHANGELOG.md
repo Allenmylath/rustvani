@@ -2,8 +2,72 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.9"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.10"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### STT — reusable provider abstraction (new)
+
+Every STT backend was the same program with a different wire format, and each
+re-derived ~250–350 lines of plumbing: the WebSocket handshake, the send and
+receive tasks, `WsSink`/`WsStream` aliases, byte helpers, the frame-dispatch
+match, and a billing block whose only difference was a string literal. Worse,
+the turn machinery existed in exactly one of them.
+
+- New `services::stt::core` module:
+  - `SttProvider` — the base trait a service implements. It answers four
+    questions and owns no state: `handshake()`, `encode_audio()`,
+    `finalize_msg()`, `parse()`. All methods take `&self`.
+  - `SttService<P>` — generic over `SttProvider`, and now the **only**
+    `FrameHandler` in the STT subsystem. Owns the WebSocket session, the turn
+    gate, the audio front-end and billing. `SttCoreConfig` carries the
+    provider-independent settings.
+  - `TurnGate` — moved out of `services/stt/sarvam.rs`, unchanged, with its
+    tests. Audio gating, pre-roll ring, stashed `VADUserStoppedSpeaking`,
+    generation-guarded release timeout, and the duration ledger for turn
+    attribution and billing. Every provider built on the core now gets the
+    transcript-before-stop ordering `LLMUserAggregator` depends on.
+  - `AudioFrontend` — resample → high-pass → denoise → AGC + soft limiter, as
+    one reusable struct composing the existing `StreamResampler`,
+    `StreamingDenoiser` and `AudioEnhancer`.
+  - `SttEvent` / `Outgoing` / `Handshake` / `AudioSpec` / `WsMessage` vocabulary
+    types; shared `ws` and `util` helpers.
+- `NoiseBackend` moved to `core::frontend` — it was never Sarvam-specific. It is
+  re-exported from `services::stt::sarvam`, `services::stt`, `services` and the
+  crate root, so every existing path still resolves.
+- **New: input audio is resampled to the provider's rate.** Sarvam and Deepgram
+  previously ignored `AudioRawData.sample_rate` entirely, so a transport/config
+  mismatch mis-transcribed silently.
+- Interim transcripts are first-class: `SttEvent::Partial` plus
+  `SttCoreConfig::interim_policy` (`InterimPolicy::Drop`, the default, or
+  `Emit` for live captions).
+- `SarvamSttHandler` rebuilt on the core — 1508 → 682 lines, with the protocol
+  now unit-testable without a socket (6 → 23 tests). Public API is unchanged.
+- New `SarvamSttConfig::prompt` (recognition biasing) and
+  `SarvamSttConfig::vad_tuning: SarvamVadTuning` — the ten fine-grained
+  `saaras:v3` server-VAD parameters, emitted only when set and only for v3.
+- Deepgram, Gnani and 60db are unchanged and still on the old path.
+
+### Fixed — interim transcripts polluted LLM context
+
+`LLMUserAggregator` appended the text of *any* `TranscriptionFrame` and never
+read `TranscriptionData::finalized`. A provider streaming partials therefore
+concatenated every prefix of the sentence into the user turn
+("he hello hello there"). 60db is the one provider that propagates the real
+`is_final` flag, so this was live. Non-finalized transcripts are now forwarded
+downstream — caption UIs still see them — but never aggregated.
+
+### Fixed — `stt-sarvam` declared the wrong dependency
+
+`stt-sarvam` was declared as `["dep:reqwest"]`, but Sarvam STT is a WebSocket
+service and never used `reqwest`; it only built because the default feature set
+drags in `transport-websocket`. `cargo build --no-default-features --features
+stt-sarvam` failed. It is now `["dep:tokio-tungstenite"]`.
+
+**Breaking under non-default feature sets:** Sarvam's LLM was gated on
+`stt-sarvam` purely because that feature happened to carry `reqwest`. It now has
+its own `llm-sarvam` feature (default-on). A build using
+`--no-default-features --features stt-sarvam` together with `SarvamLLMHandler`
+must add `llm-sarvam`. Default-features builds are unaffected.
 
 ### Telephony — Twilio Media Streams (new)
 
@@ -62,6 +126,8 @@ since Cargo will not resolve a prerelease from a plain version requirement.
 - New `SarvamSttConfig::noise_backend: NoiseBackend` — `Rnnoise` (default,
   true streaming) or `HushVani` (opt-in, stronger suppression). A `HushVani`
   init failure logs and falls back to RNNoise rather than failing the pipeline.
+  (`NoiseBackend` later moved to `services::stt::core::frontend`, where it
+  applies to every provider; the old paths still resolve.)
 - Adds `hush-vani` as a regular (non-optional) dependency — no feature flag.
 
 ### Agents

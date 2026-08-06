@@ -8,14 +8,11 @@
 pub mod function_registry;
 #[cfg(feature = "llm-openai")]
 pub mod openai;
-// Gated on `stt-sarvam` rather than a `llm-sarvam` feature: that is the feature
-// carrying the reqwest dependency this module needs, and it matches how the
-// re-export is gated in lib.rs.
-#[cfg(feature = "stt-sarvam")]
+#[cfg(feature = "llm-sarvam")]
 pub mod sarvam;
 
 pub use function_registry::FunctionRegistry;
 #[cfg(feature = "llm-openai")]
 pub use openai::{OpenAILLMConfig, OpenAILLMHandler};
-#[cfg(feature = "stt-sarvam")]
+#[cfg(feature = "llm-sarvam")]
 pub use sarvam::{SarvamLLMConfig, SarvamLLMHandler};

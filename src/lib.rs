@@ -104,16 +104,37 @@ pub use serializers::{
 };
 
 // Services — each gated by its feature
+
+// The reusable STT core. Implement `SttProvider` and wrap it in `SttService`
+// to get the turn gate, the audio front-end, billing and the WebSocket
+// plumbing for free. See `services::stt::core`.
+#[cfg(any(
+    feature = "stt-deepgram",
+    feature = "stt-gnani",
+    feature = "stt-sarvam",
+    feature = "stt-60db",
+))]
+pub use services::{
+    AudioFrontend, AudioSpec, Handshake, InterimPolicy, NoiseBackend, Outgoing, SttCoreConfig,
+    SttEvent, SttProvider, SttService, TurnGate, WsMessage,
+};
+
 #[cfg(feature = "stt-deepgram")]
 pub use services::{DeepgramSttConfig, DeepgramSttHandler};
 
+#[cfg(feature = "stt-gnani")]
+pub use services::{GnaniSttConfig, GnaniSttHandler};
+
 #[cfg(feature = "stt-sarvam")]
-pub use services::{NoiseBackend, SarvamSttConfig, SarvamSttHandler};
+pub use services::{SarvamSttConfig, SarvamSttHandler};
+
+#[cfg(feature = "stt-60db")]
+pub use services::{SixtyDbEncoding, SixtyDbSttConfig, SixtyDbSttHandler};
 
 #[cfg(feature = "llm-openai")]
 pub use services::{OpenAILLMConfig, OpenAILLMHandler, FunctionRegistry};
 
-#[cfg(feature = "stt-sarvam")]
+#[cfg(feature = "llm-sarvam")]
 pub use services::{SarvamLLMConfig, SarvamLLMHandler};
 
 #[cfg(feature = "tts-deepgram")]

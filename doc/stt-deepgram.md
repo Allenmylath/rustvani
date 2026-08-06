@@ -78,7 +78,7 @@ Enabled by default. To build without it:
 
 ```toml
 [dependencies]
-rustvani = { version = "0.4.0-dev.9", default-features = false, features = [
+rustvani = { version = "0.4.0-dev.10", default-features = false, features = [
     "transport-websocket", "stt-sarvam", "llm-openai", "tts-deepgram",
 ] }
 ```

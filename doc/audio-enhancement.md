@@ -112,7 +112,7 @@ let tail   = hf.flush();                    // drain at end of utterance
 hf.reset();                                 // discard buffered audio + window
 ```
 
-Unlike `RNNoiseFilter::new`, this returns a `Result<_, hush_vani::Error>` because the model is constructed eagerly. Inside `SarvamSttHandler::new`, a failure here logs an error and **falls back to RNNoise** rather than failing the pipeline — so `NoiseBackend::HushVani` is always safe to set.
+Unlike `RNNoiseFilter::new`, this returns a `Result<_, hush_vani::Error>` because the model is constructed eagerly. Inside `AudioFrontend::new` (`src/services/stt/core/frontend.rs`, used by every STT service), a failure here logs an error and **falls back to RNNoise** rather than failing the pipeline — so `NoiseBackend::HushVani` is always safe to set.
 
 Both types implement `StreamingDenoiser` (`rustvani::audio_process::StreamingDenoiser`), so you can hold either behind `Box<dyn StreamingDenoiser>`.
 

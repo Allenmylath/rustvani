@@ -1,6 +1,6 @@
 [package]
 name = "rustvani"
-version = "0.4.0-dev.9"
+version = "0.4.0-dev.10"
 edition = "2021"
 license = "BSD-2-Clause"
 description = "Voice AI framework for Rust — real-time speech pipelines with STT, LLM, TTS, and Dhara conversation flows"
@@ -20,7 +20,7 @@ exclude = [
 # Features
 # ---------------------------------------------------------------------------
 [features]
-default = ["vad-silero-ort", "transport-websocket", "serializer-twilio", "stt-sarvam", "stt-60db", "stt-deepgram", "llm-openai", "tts-deepgram", "dhara", "db-postgres"]
+default = ["vad-silero-ort", "transport-websocket", "serializer-twilio", "stt-sarvam", "stt-60db", "stt-deepgram", "llm-openai", "llm-sarvam", "tts-deepgram", "dhara", "db-postgres"]
 
 # Silero VAD — ONNX (ort) inference backend. Gates only the ort-based path
 # (`SileroVadOrt`) and its `ort`/C-C++ dependency; the pure-Rust `SileroVadNative`
@@ -40,11 +40,15 @@ serializer-twilio = ["dep:reqwest", "transport-websocket"]
 vaniwebrtc = ["dep:webrtc", "dep:audiopus", "dep:axum", "dep:tower-http"]
 
 # Services
-stt-sarvam = ["dep:reqwest"]
+stt-sarvam = ["dep:tokio-tungstenite"]
 stt-60db = ["dep:tokio-tungstenite"]
 stt-deepgram = ["dep:tokio-tungstenite"]
 stt-gnani = ["dep:tokio-tungstenite"]
 llm-openai = ["dep:reqwest"]
+# Sarvam chat-completions (HTTP + SSE). Previously gated on `stt-sarvam`, which
+# only worked while that feature happened to carry reqwest; Sarvam STT is a
+# WebSocket service and no longer does.
+llm-sarvam = ["dep:reqwest"]
 tts-deepgram = ["dep:tokio-tungstenite"]
 tts-sarvam = ["dep:tokio-tungstenite"]
 tts-piper = ["dep:ort"]
@@ -156,3 +160,7 @@ required-features = ["tts-sarvam"]
 [[bin]]
 name = "websocket_server_piper"
 required-features = ["tts-piper"]
+
+[[bin]]
+name = "llm_only_test"
+required-features = ["llm-sarvam"]

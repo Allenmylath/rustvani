@@ -5,7 +5,8 @@
 //! ── Contract with the STT stage ────────────────────────────────────────────
 //!
 //! This aggregator assumes an upstream STT handler that enforces the TurnGate
-//! invariants (see `services/stt/sarvam.rs`):
+//! invariants (see `services/stt/core/turn_gate.rs`, which every provider
+//! built on `services/stt/core` gets for free):
 //!
 //!   1. Transcript-before-stop: a turn's TranscriptionFrame(s) always reach
 //!      this processor BEFORE the VADUserStoppedSpeaking that closes the
@@ -27,7 +28,9 @@
 //!                           buffered (barge-in / continuation), it merges
 //!                           into this turn. Interruption is broadcast as
 //!                           before.
-//! TranscriptionFrame      → consumed (never forwarded).
+//! TranscriptionFrame      → non-finalized (interim) → forwarded untouched,
+//!                           never aggregated. Finalized → consumed (never
+//!                           forwarded):
 //!                           turn open  → appended to the aggregation buffer.
 //!                           turn closed→ disposition by `LateTranscriptPolicy`:
 //!                             Defer (default): held in a deferred buffer and
@@ -268,8 +271,18 @@ impl FrameHandler for LLMUserAggregator {
             }
 
             FrameInner::Data(DataFrame::Transcription(t)) => {
-                // Transcripts are consumed here — never forwarded, and never
-                // a trigger on their own (Path B removed).
+                // Interim hypotheses are for live captions downstream, not for
+                // the LLM turn: a provider streaming partials would otherwise
+                // append every prefix of the sentence into the aggregation
+                // ("he", "hello", "hello there"). Only finalized text counts.
+                //
+                // Forwarded rather than consumed, so UI processors still see it.
+                if !t.finalized {
+                    return processor.push_frame(frame, direction).await;
+                }
+
+                // Final transcripts are consumed here — never forwarded, and
+                // never a trigger on their own (Path B removed).
                 let text = t.text.trim().to_string();
                 if text.is_empty() {
                     return Ok(());
@@ -369,5 +382,71 @@ mod tests {
             has_context,
             "expected LLMContextFrame after VadStop with bundled transcript"
         );
+    }
+
+    /// Providers that stream partials emit every prefix of the sentence. If
+    /// those were aggregated the LLM would see "he hello hello there". They
+    /// must be forwarded (for captions) but never counted.
+    #[tokio::test]
+    async fn interim_transcripts_are_forwarded_but_not_aggregated() {
+        let ctx = Arc::new(Mutex::new(LLMContext::new(None)));
+        let proc = LLMUserAggregator::new(ctx.clone());
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        proc.on_after_push_frame(move |f| {
+            cap.lock().unwrap().push(f.clone());
+        });
+
+        let _ = proc
+            .process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream)
+            .await;
+        let _ = proc
+            .process_frame(Frame::vad_user_started_speaking(0.0, 0.0), FrameDirection::Downstream)
+            .await;
+
+        // Three interim hypotheses, each a prefix of the next.
+        for text in ["he", "hello", "hello there"] {
+            let mut td = TranscriptionData::new(text, "user", "2024-01-01T00:00:00Z");
+            td.finalized = false;
+            let _ = proc
+                .process_frame(Frame::transcription(td), FrameDirection::Downstream)
+                .await;
+        }
+
+        // All three reached downstream.
+        let forwarded = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| matches!(f.inner, FrameInner::Data(DataFrame::Transcription(_))))
+            .count();
+        assert_eq!(forwarded, 3, "interims must be forwarded for captions");
+
+        // Interims alone must not write to the context or trigger inference.
+        assert!(
+            ctx.lock().unwrap().messages.is_empty(),
+            "interims must not reach the context: {:?}",
+            ctx.lock().unwrap().messages
+        );
+
+        // The final closes the turn, and the context gets the final text once —
+        // not every prefix concatenated.
+        let td = TranscriptionData::new("hello there", "user", "2024-01-01T00:00:00Z").finalized();
+        let stop = Frame::vad_user_stopped_speaking(0.0, 0.0).with_vad_stop_transcript(td);
+        let _ = proc.process_frame(stop, FrameDirection::Downstream).await;
+
+        let messages = ctx.lock().unwrap().messages.clone();
+        assert_eq!(
+            messages.len(),
+            1,
+            "expected exactly one user turn, got {messages:?}"
+        );
+        match &messages[0] {
+            crate::context::Message::User { content } => {
+                assert_eq!(content, "hello there", "prefixes must not be concatenated")
+            }
+            other => panic!("expected a user message, got {other:?}"),
+        }
     }
 }
