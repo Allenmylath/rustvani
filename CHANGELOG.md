@@ -2,8 +2,32 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.10"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.11"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### VAD — follows the sample rate of incoming audio (0.4.0-dev.11)
+
+VAD and SmartTurn read every input frame as if it were at
+`TransportParams::audio_in_sample_rate`, so 48 kHz audio (an Opus decode, an
+SFU tap) or stereo was misread and VAD misfired.
+
+- New `vad::VadInput`: converts each frame from the rate and channel count it
+  carries to mono at the model's rate. Audio already in that format is
+  borrowed, not copied; the resampler is rebuilt when the source rate changes.
+  Resampling adds 10 ms of VAD latency at 48 kHz (60 ms at 8 kHz), none at
+  16 kHz.
+- New `VadAnalyzer::sample_rate()` (default method; `SileroVadNative` reports
+  16 kHz, `SileroVadOrt` the rate it was built with). The input transport and
+  `VadProcessor` run the VAD state machine at that rate and feed VAD and
+  SmartTurn the converted audio.
+- New `ChannelMessage::AudioFrame { audio, sample_rate, channels }` for audio
+  tagged with its own format. `ChannelMessage::Audio(bytes)` still uses the
+  configured rate. Exhaustive matches on `ChannelMessage` need a new arm.
+- `SttService` downmixes multi-channel frames before its front-end.
+- New `audio_process::downmix_to_mono`.
+- Passthrough frames keep their original format, so STT resamples once, to
+  the provider's rate. Deepgram, Gnani and 60db are not on the STT core yet
+  and still assume their configured rate.
 
 ### STT — reusable provider abstraction (new)
 
