@@ -10,6 +10,19 @@ pub mod hushfilter;
 pub mod noisefilter;
 pub mod resamplers;
 
+/// Interleaved samples → mono, averaging the channels of each frame.
+/// Mono input (`channels <= 1`) is returned as is; a trailing partial frame
+/// is dropped.
+pub fn downmix_to_mono(samples: &[i16], channels: usize) -> Vec<i16> {
+    if channels <= 1 {
+        return samples.to_vec();
+    }
+    samples
+        .chunks_exact(channels)
+        .map(|frame| (frame.iter().map(|&s| s as i32).sum::<i32>() / channels as i32) as i16)
+        .collect()
+}
+
 /// A streaming noise-suppression filter over PCM i16 audio.
 ///
 /// Both [`RNNoiseFilter`](noisefilter::RNNoiseFilter) and

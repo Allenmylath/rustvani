@@ -13,7 +13,7 @@ use crate::frames::{
     SystemFrame,
 };
 use crate::turn::{EndOfTurnState, SmartTurnAnalyzer};
-use crate::vad::{StateMachine, VadState};
+use crate::vad::{StateMachine, VadInput, VadState};
 
 use super::params::TransportParams;
 
@@ -98,23 +98,27 @@ impl BaseInputTransport {
         let sr = self.state.params.audio_in_sample_rate.unwrap_or(16_000);
         self.state.sample_rate.store(sr, Ordering::Relaxed);
 
-        if self.state.params.vad_analyzer.is_some() {
-            let machine = StateMachine::new(sr, self.state.params.vad_params.clone());
+        // VAD and SmartTurn run at the model's rate. The audio task converts
+        // each frame from whatever rate and channel count it carries.
+        let vad_rate = self.state.params.vad_analyzer.as_ref().map(|a| a.sample_rate());
+
+        if let Some(vad_rate) = vad_rate {
+            let machine = StateMachine::new(vad_rate, self.state.params.vad_params.clone());
             *self.state.vad_machine.lock().unwrap() = Some(machine);
-            log::info!("BaseInputTransport: VAD state machine initialized (sr={})", sr);
+            log::info!(
+                "BaseInputTransport: VAD state machine initialized (vad_sr={}, input_sr={})",
+                vad_rate, sr
+            );
         } else {
             log::warn!("BaseInputTransport: no VAD analyzer configured");
         }
 
         if let Some(config) = &self.state.params.turn_config {
-            if self.state.params.vad_analyzer.is_none() {
-                log::warn!(
-                    "BaseInputTransport: turn_config set but no vad_analyzer — skipping"
-                );
-            } else {
+            if let Some(vad_rate) = vad_rate {
                 match SmartTurnAnalyzer::new(config) {
                     Ok(mut analyzer) => {
-                        analyzer.set_sample_rate(sr);
+                        // Fed the same converted audio as the VAD.
+                        analyzer.set_sample_rate(vad_rate);
                         analyzer.update_vad_start_secs(
                             self.state.params.vad_params.start_secs as f64,
                         );
@@ -129,6 +133,10 @@ impl BaseInputTransport {
                         );
                     }
                 }
+            } else {
+                log::warn!(
+                    "BaseInputTransport: turn_config set but no vad_analyzer — skipping"
+                );
             }
         }
 
@@ -277,6 +285,9 @@ async fn run_audio_task(
 
     let mut last_is_speech = false;
 
+    // Converts each frame to mono at the VAD model's rate.
+    let mut vad_input = state.params.vad_analyzer.as_ref().map(|a| VadInput::new(a.sample_rate()));
+
     loop {
         match tokio::time::timeout(AUDIO_TIMEOUT, rx.recv()).await {
             Ok(Some(data)) => {
@@ -299,15 +310,16 @@ async fn run_audio_task(
 
                 // ── VAD processing ──
                 let mut vad_quiet_transition = false;
+                let vad_audio = vad_input.as_mut().map(|input| input.convert(&data));
 
-                if let Some(analyzer) = &state.params.vad_analyzer {
+                if let (Some(analyzer), Some(vad_audio)) = (&state.params.vad_analyzer, &vad_audio) {
                     // Drain every window this frame completed, not just the
                     // first. A frame can carry more audio than one window —
                     // the Twilio path upsamples 8 kHz to 960-sample frames
                     // against a 512-sample window — and stopping after one
                     // leaves the remainder buffered forever, so the VAD falls
                     // permanently further behind the live call.
-                    let mut pending: &[u8] = &data.audio;
+                    let mut pending: &[u8] = vad_audio;
 
                     while let Some(window) = next_vad_window(&state, &mut pending) {
                         let confidence = analyzer.voice_confidence(window.clone()).await;
@@ -381,8 +393,9 @@ async fn run_audio_task(
                 }
 
                 // ── Smart turn processing ──
-                if let Some(ta) = &mut turn_analyzer {
-                    let turn_state = ta.append_audio(&data.audio, last_is_speech);
+                // SmartTurn exists only with a VAD, so `vad_audio` is set here.
+                if let (Some(ta), Some(vad_audio)) = (&mut turn_analyzer, &vad_audio) {
+                    let turn_state = ta.append_audio(vad_audio, last_is_speech);
 
                     if turn_state == EndOfTurnState::Complete {
                         if state.emitted_speaking

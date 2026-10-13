@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod input;
 pub mod params;
 pub mod processor;
 #[cfg(feature = "vad-silero-ort")]
@@ -7,6 +8,7 @@ pub mod silero_native;
 pub mod state;
 
 pub use analyzer::VadAnalyzer;
+pub use input::VadInput;
 pub use params::{VadParams, VAD_CONFIDENCE, VAD_MIN_VOLUME, VAD_START_SECS, VAD_STOP_SECS};
 pub use processor::VadProcessor;
 #[cfg(feature = "vad-silero-ort")]

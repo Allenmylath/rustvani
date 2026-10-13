@@ -38,6 +38,8 @@ use crate::frames::{
 use super::frontend::{AudioFrontend, FrontendConfig, NoiseBackend};
 use super::provider::{Outgoing, SttEvent, SttProvider, WsMessage};
 use super::turn_gate::TurnGate;
+use crate::audio_process::downmix_to_mono;
+
 use super::util::{bytes_to_i16, i16_to_bytes, timestamp};
 use super::ws;
 
@@ -319,7 +321,8 @@ impl<P: SttProvider> FrameHandler for SttService<P> {
             FrameInner::System(SystemFrame::InputAudioRaw(ref audio)) => {
                 processor.push_frame(frame.clone(), direction).await?;
 
-                let pcm = bytes_to_i16(&audio.audio);
+                // The front-end resamples from the frame's own rate; it expects mono.
+                let pcm = downmix_to_mono(&bytes_to_i16(&audio.audio), audio.num_channels as usize);
                 let samples = self.frontend.lock().await.process(&pcm, audio.sample_rate);
                 if samples.is_empty() {
                     // Front-end is buffering — nothing to admit yet.

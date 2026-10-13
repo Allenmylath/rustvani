@@ -7,6 +7,10 @@ use crate::vad::{VadAnalyzer, VadParams};
 #[derive(Clone)]
 pub struct TransportParams {
     pub audio_in_enabled:         bool,
+    /// Rate of input audio that doesn't carry its own (e.g.
+    /// `ChannelMessage::Audio`). Default 16 kHz. Frames that do carry a rate
+    /// are taken at that rate: VAD and SmartTurn resample to the model's rate
+    /// and STT to the provider's, so any input rate works.
     pub audio_in_sample_rate:     Option<u32>,
     pub audio_in_channels:        u16,
     pub audio_in_passthrough:     bool,

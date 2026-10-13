@@ -17,8 +17,14 @@ use crate::transport::incoming::dispatch_text_message;
 /// (pipeline → outside world).
 #[derive(Debug, Clone)]
 pub enum ChannelMessage {
-    /// Raw PCM audio bytes.
+    /// Raw PCM audio bytes (i16 LE) at the transport's configured
+    /// `audio_in_sample_rate` / `audio_in_channels`.
     Audio(Vec<u8>),
+    /// Raw PCM audio bytes (i16 LE, interleaved) carrying their own format —
+    /// for sources whose rate isn't known up front or changes mid-stream
+    /// (an Opus decode at 48 kHz, a stereo tap). VAD and STT convert from it.
+    /// Incoming only; the transport never emits it.
+    AudioFrame { audio: Vec<u8>, sample_rate: u32, channels: u16 },
     /// Serialised JSON text frame — used by RAVI for protocol messages.
     Text(String),
     /// Interruption signal (legacy).
@@ -123,6 +129,11 @@ impl ChannelTransport {
                     match msg {
                         Some(ChannelMessage::Audio(bytes)) => {
                             let data = AudioRawData::new(bytes, sample_rate, channels);
+                            base.push_audio_frame(data).await;
+                        }
+
+                        Some(ChannelMessage::AudioFrame { audio, sample_rate, channels }) => {
+                            let data = AudioRawData::new(audio, sample_rate, channels.max(1));
                             base.push_audio_frame(data).await;
                         }
 

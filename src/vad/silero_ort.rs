@@ -169,6 +169,10 @@ impl VadAnalyzer for SileroVadOrt {
         self.inner.lock().unwrap().num_samples
     }
 
+    fn sample_rate(&self) -> u32 {
+        self.inner.lock().unwrap().sample_rate as u32
+    }
+
     async fn voice_confidence(&self, audio: Vec<u8>) -> f32 {
         match self.infer_async(audio).await {
             Ok(c) => c,

@@ -237,6 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ChannelMessage::ClientVadStop(ts) => {
                 println!("\r[out] VAD stop detected @ {:.3}s", ts);
             }
+            ChannelMessage::AudioFrame { .. } => {} // incoming only
         }
     }
 

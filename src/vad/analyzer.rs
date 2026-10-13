@@ -12,6 +12,15 @@ pub trait VadAnalyzer: Send + Sync {
     /// 512 @ 16 kHz, 256 @ 8 kHz.
     fn num_frames_required(&self) -> usize;
 
+    /// Sample rate the model runs at. Incoming audio is resampled to it
+    /// ([`VadInput`](super::VadInput)), whatever rate it arrives at.
+    ///
+    /// The default infers it from Silero's window size (256 → 8 kHz,
+    /// anything else → 16 kHz); backends with other rates override it.
+    fn sample_rate(&self) -> u32 {
+        if self.num_frames_required() == 256 { 8_000 } else { 16_000 }
+    }
+
     /// Run inference on one window of PCM audio.
     ///
     /// `audio` is exactly `num_frames_required() * 2` bytes of i16 LE mono PCM.

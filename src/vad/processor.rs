@@ -46,6 +46,7 @@ use crate::frames::{
 use crate::turn::{EndOfTurnState, SmartTurnAnalyzer, SmartTurnConfig};
 
 use super::analyzer::VadAnalyzer;
+use super::input::VadInput;
 use super::params::VadParams;
 use super::state::{StateMachine, VadState};
 use super::{VadBackend, create_vad};
@@ -59,6 +60,8 @@ struct VadProcessorState {
     model: Arc<dyn VadAnalyzer>,
     params: VadParams,
     sample_rate: u32,
+    /// Incoming audio → mono at `sample_rate`, whatever rate it arrives at.
+    input: VadInput,
     last_is_speech: bool,
     emitted_speaking: bool,
     user_speaking: bool,
@@ -79,7 +82,9 @@ pub struct VadProcessor {
 impl VadProcessor {
     /// Create a new VAD processor with the specified backend.
     ///
-    /// `sample_rate` must be 8000 or 16000.
+    /// `sample_rate` is the model's rate and must be 8000 or 16000. Audio
+    /// frames may arrive at any rate and channel count; they are converted
+    /// to mono at this rate before inference.
     /// `backend` selects Native (pure Rust) or Ort (ONNX Runtime).
     pub fn new(
         sample_rate: u32,
@@ -97,6 +102,7 @@ impl VadProcessor {
                 model,
                 params,
                 sample_rate,
+                input: VadInput::new(sample_rate),
                 last_is_speech: false,
                 emitted_speaking: false,
                 user_speaking: false,
@@ -163,6 +169,7 @@ impl VadProcessor {
         guard.bot_speaking = false;
         guard.last_is_speech = false;
         guard.machine = StateMachine::new(guard.sample_rate, guard.params.clone());
+        guard.input.reset();
         if let Some(ref mut ta) = guard.turn_analyzer {
             ta.clear();
         }
@@ -238,7 +245,9 @@ impl FrameHandler for VadProcessor {
                     // remainder buffered forever, so the VAD falls permanently
                     // further behind the live call.
                     let mut vad_quiet_transition = false;
-                    let mut pending: &[u8] = &audio_data.audio;
+                    // Borrows the frame, not the guard, so the lock drops here.
+                    let vad_audio = self.state.lock().unwrap().input.convert(audio_data);
+                    let mut pending: &[u8] = &vad_audio;
 
                     while let Some(window) = self.next_vad_window(&mut pending) {
                         let model = {
@@ -337,7 +346,7 @@ impl FrameHandler for VadProcessor {
                         let turn_state = {
                             let mut guard = self.state.lock().unwrap();
                             if let Some(ref mut ta) = guard.turn_analyzer {
-                                ta.append_audio(&audio_data.audio, last_is_speech)
+                                ta.append_audio(&vad_audio, last_is_speech)
                             } else {
                                 EndOfTurnState::Incomplete
                             }
