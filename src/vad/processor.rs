@@ -378,13 +378,19 @@ impl FrameHandler for VadProcessor {
                         }
 
                         if vad_quiet_transition {
-                            let (result, metrics) = {
-                                let mut guard = self.state.lock().unwrap();
-                                if let Some(ref mut ta) = guard.turn_analyzer {
-                                    ta.analyze_end_of_turn()
-                                } else {
-                                    (EndOfTurnState::Incomplete, None)
-                                }
+                            // Off the runtime and outside the lock: the analyzer goes to a
+                            // blocking thread and comes back. If the inference fails, the turn
+                            // ends and SmartTurn is dropped.
+                            let analyzer = self.state.lock().unwrap().turn_analyzer.take();
+                            let (result, metrics) = match analyzer {
+                                Some(analyzer) => match analyzer.analyze_end_of_turn_blocking().await {
+                                    Some((analyzer, result, metrics)) => {
+                                        self.state.lock().unwrap().turn_analyzer = Some(analyzer);
+                                        (result, metrics)
+                                    }
+                                    None => (EndOfTurnState::Complete, None),
+                                },
+                                None => (EndOfTurnState::Incomplete, None),
                             };
 
                             if let Some(ref m) = metrics {

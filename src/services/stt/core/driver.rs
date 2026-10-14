@@ -97,6 +97,15 @@ pub struct SttCoreConfig {
 
     /// Disposition of non-final transcripts. Default: [`InterimPolicy::Drop`].
     pub interim_policy: InterimPolicy,
+
+    /// Once a turn has sent this much audio (ms), ask the provider to finalise
+    /// what it has heard so far (its [`finalize_msg`](super::SttProvider::finalize_msg))
+    /// without ending the turn; the text arrives as a mid-turn transcript and
+    /// the count starts again. For live captions of speakers who rarely pause
+    /// (a newsreader's turns run 15–25 s, and a caption otherwise waits for the
+    /// turn to end). `None` (the default) never interrupts a turn, which is
+    /// what a voice agent wants: one transcript per turn.
+    pub max_turn_ms: Option<u64>,
 }
 
 impl Default for SttCoreConfig {
@@ -111,6 +120,7 @@ impl Default for SttCoreConfig {
             pre_roll_ms: 500,
             stop_release_timeout_ms: 1_200,
             interim_policy: InterimPolicy::default(),
+            max_turn_ms: None,
         }
     }
 }
@@ -167,6 +177,9 @@ pub struct SttService<P: SttProvider> {
     frontend: Arc<Mutex<AudioFrontend>>,
     gate: Arc<TurnGate>,
     billing: Option<Arc<dyn BillingCollector>>,
+    /// Audio sent in the current turn since it started or was last
+    /// finalised mid-turn ([`SttCoreConfig::max_turn_ms`]).
+    turn_count: std::sync::Mutex<TurnCount>,
 }
 
 impl<P: SttProvider> SttService<P> {
@@ -206,6 +219,7 @@ impl<P: SttProvider> SttService<P> {
             frontend,
             gate,
             billing: None,
+            turn_count: std::sync::Mutex::default(),
         }
     }
 
@@ -296,6 +310,79 @@ impl<P: SttProvider> SttService<P> {
         let encoded = self.provider.encode_audio(&i16_to_bytes(samples));
         self.send(encoded).await;
     }
+
+    /// Counts audio sent in the turn; past [`SttCoreConfig::max_turn_ms`], asks the
+    /// provider to finalise what it has so far, at the next gap between words
+    /// (80 ms of quiet, so no word is cut in two) or, failing one, after
+    /// [`DIP_GRACE_MS`] more; then counts again.
+    async fn count_turn_audio(&self, samples: &[i16]) {
+        let Some(max_ms) = self.config.max_turn_ms else {
+            return;
+        };
+        let finalise = self
+            .turn_count
+            .lock()
+            .unwrap()
+            .add(self.gate.ms_of(samples.len()), samples, max_ms as f64);
+        if let Some(sent_ms) = finalise {
+            if let Some(msg) = self.provider.finalize_msg() {
+                log::info!(
+                    "{}: {:.0} ms into the turn — finalising mid-turn",
+                    self.provider.name(),
+                    sent_ms
+                );
+                self.send(msg).await;
+            }
+        }
+    }
+
+    fn reset_turn_count(&self) {
+        *self.turn_count.lock().unwrap() = TurnCount::default();
+    }
+}
+
+/// Past `max_turn_ms`, how long to wait for a dip in loudness before
+/// finalising anyway.
+const DIP_GRACE_MS: f64 = 2_000.0;
+/// Audio this much quieter than the segment's average is quiet...
+const DIP_RATIO: f64 = 0.35;
+/// ...and quiet this long is a gap between words, not a stop consonant inside one.
+const DIP_MS: f64 = 80.0;
+
+/// Audio sent since the turn started or was last finalised mid-turn.
+#[derive(Debug, Default)]
+struct TurnCount {
+    sent_ms: f64,
+    rms_sum: f64,
+    chunks: u32,
+    /// How long the audio has been quiet, up to now.
+    quiet_ms: f64,
+}
+
+impl TurnCount {
+    /// Adds a chunk; `Some(ms sent)` when the segment should be finalised now
+    /// (and the count restarts).
+    fn add(&mut self, ms: f64, samples: &[i16], max_ms: f64) -> Option<f64> {
+        let rms = if samples.is_empty() {
+            0.0
+        } else {
+            (samples.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / samples.len() as f64).sqrt()
+        };
+        self.sent_ms += ms;
+        let mean = if self.chunks > 0 { self.rms_sum / self.chunks as f64 } else { rms };
+        self.rms_sum += rms;
+        self.chunks += 1;
+        self.quiet_ms = if rms < mean * DIP_RATIO { self.quiet_ms + ms } else { 0.0 };
+        let past = self.sent_ms >= max_ms;
+        let gap = self.quiet_ms >= DIP_MS;
+        if past && (gap || self.sent_ms >= max_ms + DIP_GRACE_MS) {
+            let sent = self.sent_ms;
+            *self = Self::default();
+            Some(sent)
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -331,11 +418,13 @@ impl<P: SttProvider> FrameHandler for SttService<P> {
 
                 if self.gate.admit_audio(&samples, self.config.audio_gating) {
                     self.send_audio(&samples).await;
+                    self.count_turn_audio(&samples).await;
                 }
                 // else: buffered into the pre-roll ring; sent on VadStart.
             }
 
             FrameInner::System(SystemFrame::VADUserStartedSpeaking { .. }) => {
+                self.reset_turn_count();
                 // Forwards the frame downstream (under the emit lock) and
                 // returns the pre-roll captured during VAD detection latency.
                 let pre_roll = self.gate.on_vad_start(processor, frame, direction).await?;
@@ -346,10 +435,12 @@ impl<P: SttProvider> FrameHandler for SttService<P> {
                         self.gate.ms_of(pre_roll.len())
                     );
                     self.send_audio(&pre_roll).await;
+                    self.count_turn_audio(&pre_roll).await;
                 }
             }
 
             FrameInner::System(SystemFrame::VADUserStoppedSpeaking { .. }) => {
+                self.reset_turn_count();
                 // CONSUMED here — the gate releases it downstream after the
                 // transcript arrives (or the timeout fires). Never forwarded
                 // directly: that is the whole ordering guarantee.
@@ -593,6 +684,66 @@ mod tests {
                 _ => SttEvent::Ignore,
             }
         }
+    }
+
+    /// A service whose socket writes are captured.
+    async fn capturing(max_turn_ms: Option<u64>) -> (SttService<MockProvider>, mpsc::Receiver<Outgoing>) {
+        let svc = SttService::new(
+            MockProvider::new(),
+            SttCoreConfig { max_turn_ms, ..SttCoreConfig::default() },
+        );
+        let (tx, rx) = mpsc::channel(16);
+        svc.session.lock().await.ws_tx = Some(tx);
+        (svc, rx)
+    }
+
+    /// `ms` of steady speech-level audio, or of a gap between words.
+    fn speech(ms: usize) -> Vec<i16> {
+        (0..ms * 16).map(|i| if i % 2 == 0 { 3000 } else { -3000 }).collect()
+    }
+    fn gap(ms: usize) -> Vec<i16> {
+        vec![100; ms * 16]
+    }
+
+    #[tokio::test]
+    async fn a_long_turn_is_finalised_at_the_next_gap_between_words() {
+        let (svc, mut sent) = capturing(Some(1_000)).await;
+        for _ in 0..10 {
+            svc.count_turn_audio(&speech(100)).await; // 1000 ms of speech
+        }
+        svc.count_turn_audio(&speech(100)).await; // past the limit, but mid-word: wait
+        assert!(sent.try_recv().is_err(), "no cut in the middle of a word");
+        svc.count_turn_audio(&gap(20)).await; // a stop consonant: still mid-word
+        assert!(sent.try_recv().is_err(), "20 ms of quiet is not a gap between words");
+        svc.count_turn_audio(&gap(80)).await; // a gap: finalise here
+        assert_eq!(sent.try_recv().ok(), Some(Outgoing::Text("finalize".into())));
+        svc.count_turn_audio(&speech(500)).await; // counting restarted
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn without_a_gap_the_turn_is_finalised_after_the_grace() {
+        let (svc, mut sent) = capturing(Some(1_000)).await;
+        for _ in 0..29 {
+            svc.count_turn_audio(&speech(100)).await; // 2900 ms, never a gap
+        }
+        assert!(sent.try_recv().is_err());
+        svc.count_turn_audio(&speech(100)).await; // 3000 ms: the limit plus the grace
+        assert_eq!(sent.try_recv().ok(), Some(Outgoing::Text("finalize".into())));
+        svc.reset_turn_count(); // a new turn
+        svc.count_turn_audio(&speech(1_000)).await;
+        svc.count_turn_audio(&gap(100)).await;
+        assert_eq!(sent.try_recv().ok(), Some(Outgoing::Text("finalize".into())), "a new turn counts from zero");
+    }
+
+    #[tokio::test]
+    async fn without_a_limit_turns_are_never_interrupted() {
+        let (svc, mut sent) = capturing(None).await;
+        for _ in 0..100 {
+            svc.count_turn_audio(&speech(1_000)).await;
+            svc.count_turn_audio(&gap(100)).await;
+        }
+        assert!(sent.try_recv().is_err());
     }
 
     /// A started processor — `push_frame` is a no-op until a StartFrame has

@@ -164,6 +164,28 @@ impl SmartTurnAnalyzer {
         (state, metrics)
     }
 
+    /// [`analyze_end_of_turn`](Self::analyze_end_of_turn) on Tokio's blocking pool. Inference
+    /// takes hundreds of milliseconds of CPU (about 0.8 s on a laptop core); run inline on an
+    /// async task it would hold a runtime worker that long, stalling every other task on it
+    /// (other speakers, the network). The analyzer moves to the blocking thread and comes back
+    /// with the result; if the inference panics it is lost, and `None` is returned.
+    pub async fn analyze_end_of_turn_blocking(
+        mut self,
+    ) -> Option<(Self, EndOfTurnState, Option<TurnMetrics>)> {
+        let joined = tokio::task::spawn_blocking(move || {
+            let (state, metrics) = self.analyze_end_of_turn();
+            (self, state, metrics)
+        })
+        .await;
+        match joined {
+            Ok(result) => Some(result),
+            Err(e) => {
+                log::error!("SmartTurn: inference failed: {e} — falling back to VAD-only");
+                None
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         self.clear_state(EndOfTurnState::Complete);
     }

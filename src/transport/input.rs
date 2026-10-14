@@ -394,7 +394,7 @@ async fn run_audio_task(
 
                 // ── Smart turn processing ──
                 // SmartTurn exists only with a VAD, so `vad_audio` is set here.
-                if let (Some(ta), Some(vad_audio)) = (&mut turn_analyzer, &vad_audio) {
+                if let (Some(ta), Some(vad_audio)) = (turn_analyzer.as_mut(), &vad_audio) {
                     let turn_state = ta.append_audio(vad_audio, last_is_speech);
 
                     if turn_state == EndOfTurnState::Complete {
@@ -420,7 +420,16 @@ async fn run_audio_task(
 
                     if vad_quiet_transition {
                         log::info!("SmartTurn: VAD quiet — running ML inference");
-                        let (result, metrics) = ta.analyze_end_of_turn();
+                        // Off the runtime: the analyzer goes to a blocking thread and comes back.
+                        // If the inference fails, the turn ends and SmartTurn is dropped.
+                        let analyzer = turn_analyzer.take().expect("matched above");
+                        let (result, metrics) = match analyzer.analyze_end_of_turn_blocking().await {
+                            Some((analyzer, result, metrics)) => {
+                                turn_analyzer = Some(analyzer);
+                                (result, metrics)
+                            }
+                            None => (EndOfTurnState::Complete, None),
+                        };
 
                         if let Some(ref m) = metrics {
                             log::info!(

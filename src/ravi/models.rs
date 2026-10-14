@@ -99,22 +99,25 @@ pub fn msg_user_mute_stopped() -> String { envelope("user-mute-stopped", None, N
 
 // ---- Transcription ----
 
+/// `language` is the transcript's language as the STT reported it (BCP-47, e.g. `ml-IN`), sent
+/// as `data.language` when known: with auto-detection it can change phrase by phrase.
 pub fn msg_user_transcription(
     text:      &str,
     user_id:   &str,
     timestamp: &str,
     is_final:  bool,
+    language:  Option<&str>,
 ) -> String {
-    envelope(
-        "user-transcription",
-        None,
-        Some(json!({
-            "text":      text,
-            "user_id":   user_id,
-            "timestamp": timestamp,
-            "final":     is_final,
-        })),
-    )
+    let mut data = json!({
+        "text":      text,
+        "user_id":   user_id,
+        "timestamp": timestamp,
+        "final":     is_final,
+    });
+    if let Some(language) = language {
+        data["language"] = json!(language);
+    }
+    envelope("user-transcription", None, Some(data))
 }
 
 // ---- LLM ----
@@ -167,4 +170,20 @@ pub fn msg_bot_audio_level(value: f32) -> String {
 
 pub fn msg_system_log(text: &str) -> String {
     envelope("system-log", None, Some(json!({ "text": text })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_transcription_carries_the_language_when_known() {
+        let with: Value =
+            serde_json::from_str(&msg_user_transcription("നാളെ", "u", "0", true, Some("ml-IN"))).unwrap();
+        assert_eq!(with["type"], "user-transcription");
+        assert_eq!(with["data"]["language"], "ml-IN");
+        assert_eq!(with["data"]["final"], true);
+        let without: Value = serde_json::from_str(&msg_user_transcription("hi", "u", "0", false, None)).unwrap();
+        assert!(without["data"].get("language").is_none());
+    }
 }

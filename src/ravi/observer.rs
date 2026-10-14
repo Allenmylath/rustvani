@@ -143,6 +143,7 @@ impl BaseObserver for RaviObserver {
                     &t.user_id,
                     &t.timestamp,
                     t.finalized,
+                    t.language.as_deref(),
                 );
                 self.send(json).await;
             }
@@ -156,6 +157,7 @@ impl BaseObserver for RaviObserver {
                     &t.user_id,
                     &t.timestamp,
                     t.finalized,
+                    t.language.as_deref(),
                 );
                 self.send(json).await;
             }

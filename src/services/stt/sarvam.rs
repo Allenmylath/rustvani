@@ -183,6 +183,11 @@ pub struct SarvamSttConfig {
     /// How long (ms) to hold a gated VADUserStoppedSpeaking waiting for
     /// Sarvam's transcript before releasing it anyway. Default: 1200.
     pub stop_release_timeout_ms: u64,
+
+    /// Flush Sarvam mid-turn once a turn has sent this much audio (ms), for
+    /// live captions of speakers who rarely pause. `None` (default): one
+    /// transcript per turn. See [`SttCoreConfig::max_turn_ms`].
+    pub max_turn_ms: Option<u64>,
 }
 
 impl Default for SarvamSttConfig {
@@ -204,6 +209,7 @@ impl Default for SarvamSttConfig {
             audio_gating:            true,
             pre_roll_ms:             500,
             stop_release_timeout_ms: 1_200,
+            max_turn_ms:             None,
         }
     }
 }
@@ -223,6 +229,7 @@ impl SarvamSttConfig {
             stop_release_timeout_ms: self.stop_release_timeout_ms,
             // Sarvam's streaming API emits finals only; nothing to drop.
             interim_policy:          InterimPolicy::Drop,
+            max_turn_ms:             self.max_turn_ms,
         };
         let audio = AudioSpec::new(self.sample_rate, self.encoding.clone());
         (core, SarvamProvider { config: self, audio })
