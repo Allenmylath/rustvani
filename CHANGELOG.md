@@ -2,8 +2,40 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.11"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.12"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Live transcription: VAD defaults, a turn limit, detected language (0.4.0-dev.12)
+
+Measured on real speech: All India Radio Malayalam news, and browser-microphone
+speech received over WebRTC/Opus.
+
+- **VAD defaults changed** to confidence 0.5, min_volume 0.2, start_secs 0.2,
+  stop_secs 0.8 (were 0.7, 0.3, 0.4, 0.4). A turn opens only after
+  `start_secs` of unbroken confident speech; after a browser's audio
+  processing and Opus, Silero's confidence stays above 0.7 for runs of only
+  ~0.36 s (median), so at 0.4 s turns often never opened: 38–69% of a
+  speaker's speech reached the STT, with deaf spells of up to 7 s. The new
+  defaults pass 99–100%, open no turns on white noise down to -30 dBFS, and
+  lowered Sarvam's character error rate on the news from 3.9/2.6% to
+  3.0/1.3%. Pass `VadParams` explicitly to keep the old behaviour.
+- **New `SttCoreConfig::max_turn_ms` / `SarvamSttConfig::max_turn_ms`**
+  (default `None`, unchanged behaviour): once a turn has sent that much audio,
+  the provider is asked to finalise what it has heard (its `finalize_msg`,
+  Sarvam's flush) at the next gap between words (80 ms of quiet), or 2 s
+  later if none comes; the text arrives as a mid-turn transcript and the turn
+  goes on. For live captions of speakers who rarely pause: a newsreader's
+  turns run 15–25 s, and a transcript otherwise waits for the turn to end.
+  At 8 s, captions came 3× sooner for about 1.7 points more character error.
+- **RAVI `user-transcription` carries the language** (`data.language`) when
+  the STT reports one. `ravi::models::msg_user_transcription` takes a
+  `language: Option<&str>` argument.
+- **SmartTurn inference runs on Tokio's blocking pool**
+  (`SmartTurnAnalyzer::analyze_end_of_turn_blocking`). It takes ~0.8 s of CPU
+  per turn end and ran inline on the input transport's audio task (and inside
+  `VadProcessor`'s state lock), holding a runtime worker that long and
+  stalling other tasks. If the inference panics the turn ends and the input
+  falls back to VAD-only.
 
 ### VAD — follows the sample rate of incoming audio (0.4.0-dev.11)
 
