@@ -147,11 +147,28 @@ pub trait SttProvider: Send + Sync + 'static {
     /// Wrap a chunk of PCM i16 LE (already at [`Self::audio`] rate) for the wire.
     fn encode_audio(&self, pcm_le: &[u8]) -> Outgoing;
 
+    /// Tell the server a turn begins. Sent when local VAD reports speech,
+    /// before the pre-roll. For providers whose endpointing is driven by the
+    /// client (Sarvam realtime's `manual` mode: `speech_start`). `None` by
+    /// default.
+    fn turn_start_msg(&self) -> Option<Outgoing> {
+        None
+    }
+
     /// Ask the server to finalise the current segment. Sent when local VAD
     /// reports end of turn. `None` for providers that only finalise on their
     /// own endpointing.
     fn finalize_msg(&self) -> Option<Outgoing> {
         None
+    }
+
+    /// Ask the server to finalise what it has heard so far *without* ending
+    /// the turn, for [`max_turn_ms`](super::driver::SttCoreConfig::max_turn_ms).
+    /// Defaults to [`finalize_msg`](Self::finalize_msg). The driver sends
+    /// [`turn_start_msg`](Self::turn_start_msg) right after it, so a provider
+    /// that is told where segments begin hears that the turn goes on.
+    fn mid_turn_finalize_msg(&self) -> Option<Outgoing> {
+        self.finalize_msg()
     }
 
     /// Graceful close message, sent before the socket is torn down.

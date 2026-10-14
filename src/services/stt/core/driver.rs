@@ -162,6 +162,8 @@ struct RxCtx<P: SttProvider> {
     frontend: Arc<Mutex<AudioFrontend>>,
     billing: Option<Arc<dyn BillingCollector>>,
     interim_policy: InterimPolicy,
+    /// The last partial pushed, to drop exact repeats.
+    last_partial: Mutex<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +260,7 @@ impl<P: SttProvider> SttService<P> {
             frontend: self.frontend.clone(),
             billing: self.billing.clone(),
             interim_policy: self.config.interim_policy,
+            last_partial: Mutex::new(String::new()),
         });
         let receive_task = tokio::spawn(run_receive_task(stream, ctx));
 
@@ -325,13 +328,18 @@ impl<P: SttProvider> SttService<P> {
             .unwrap()
             .add(self.gate.ms_of(samples.len()), samples, max_ms as f64);
         if let Some(sent_ms) = finalise {
-            if let Some(msg) = self.provider.finalize_msg() {
+            if let Some(msg) = self.provider.mid_turn_finalize_msg() {
                 log::info!(
                     "{}: {:.0} ms into the turn — finalising mid-turn",
                     self.provider.name(),
                     sent_ms
                 );
                 self.send(msg).await;
+                // The cut closed a segment; a provider that is told when one
+                // begins hears that the turn goes on.
+                if let Some(msg) = self.provider.turn_start_msg() {
+                    self.send(msg).await;
+                }
             }
         }
     }
@@ -425,6 +433,9 @@ impl<P: SttProvider> FrameHandler for SttService<P> {
 
             FrameInner::System(SystemFrame::VADUserStartedSpeaking { .. }) => {
                 self.reset_turn_count();
+                if let Some(msg) = self.provider.turn_start_msg() {
+                    self.send(msg).await;
+                }
                 // Forwards the frame downstream (under the emit lock) and
                 // returns the pre-roll captured during VAD detection latency.
                 let pre_roll = self.gate.on_vad_start(processor, frame, direction).await?;
@@ -544,7 +555,18 @@ async fn handle_message<P: SttProvider>(msg: WsMessage<'_>, ctx: &Arc<RxCtx<P>>)
         SttEvent::Partial { text, language } => {
             if ctx.interim_policy == InterimPolicy::Emit {
                 let text = text.trim();
-                if !text.is_empty() {
+                // Providers repeat a partial while nothing new has been heard;
+                // only a change is news downstream.
+                let changed = {
+                    let mut last = ctx.last_partial.lock().await;
+                    if *last == text {
+                        false
+                    } else {
+                        *last = text.to_string();
+                        true
+                    }
+                };
+                if !text.is_empty() && changed {
                     let mut td = TranscriptionData::new(text, "", timestamp());
                     td.language = language;
                     td.finalized = false;
@@ -785,6 +807,7 @@ mod tests {
             frontend,
             billing: Some(Arc::new(NoopBillingCollector)),
             interim_policy,
+            last_partial: Mutex::new(String::new()),
         });
         (c, gate, captured)
     }
@@ -867,6 +890,24 @@ mod tests {
             }
             other => panic!("expected a Transcription frame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_partials_are_pushed_once() {
+        let (c, _gate, captured) = ctx(InterimPolicy::Emit).await;
+        for msg in ["partial:hel", "partial:hel", "partial:hello", "partial:hello", "partial:hel"] {
+            recv(msg, &c).await;
+        }
+        let texts: Vec<String> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|f| match &f.inner {
+                FrameInner::Data(DataFrame::Transcription(td)) => Some(td.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["hel", "hello", "hel"], "a change is news, a repeat is not");
     }
 
     #[tokio::test]

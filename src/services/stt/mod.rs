@@ -33,6 +33,8 @@ pub mod deepgram;
 pub mod gnani;
 #[cfg(feature = "stt-sarvam")]
 pub mod sarvam;
+#[cfg(feature = "stt-sarvam")]
+pub mod sarvam_realtime;
 #[cfg(feature = "stt-60db")]
 pub mod sixtydb;
 
@@ -44,6 +46,8 @@ pub use gnani::{GnaniSttConfig, GnaniSttHandler};
 // not just Sarvam). `sarvam` re-exports it so existing paths keep resolving.
 #[cfg(feature = "stt-sarvam")]
 pub use sarvam::{SarvamSttConfig, SarvamSttHandler};
+#[cfg(feature = "stt-sarvam")]
+pub use sarvam_realtime::{SarvamRealtimeSttConfig, SarvamRealtimeSttHandler};
 #[cfg(feature = "stt-60db")]
 pub use sixtydb::{
     SixtyDbEncoding,

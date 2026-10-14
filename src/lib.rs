@@ -126,7 +126,7 @@ pub use services::{DeepgramSttConfig, DeepgramSttHandler};
 pub use services::{GnaniSttConfig, GnaniSttHandler};
 
 #[cfg(feature = "stt-sarvam")]
-pub use services::{SarvamSttConfig, SarvamSttHandler};
+pub use services::{SarvamRealtimeSttConfig, SarvamRealtimeSttHandler, SarvamSttConfig, SarvamSttHandler};
 
 #[cfg(feature = "stt-60db")]
 pub use services::{SixtyDbEncoding, SixtyDbSttConfig, SixtyDbSttHandler};

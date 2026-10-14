@@ -31,6 +31,8 @@ pub use stt::deepgram::{DeepgramSttConfig, DeepgramSttHandler};
 pub use stt::gnani::{GnaniSttConfig, GnaniSttHandler};
 #[cfg(feature = "stt-sarvam")]
 pub use stt::sarvam::{SarvamSttConfig, SarvamSttHandler};
+#[cfg(feature = "stt-sarvam")]
+pub use stt::sarvam_realtime::{SarvamRealtimeSttConfig, SarvamRealtimeSttHandler};
 #[cfg(feature = "stt-60db")]
 pub use stt::sixtydb::{
     SixtyDbEncoding,

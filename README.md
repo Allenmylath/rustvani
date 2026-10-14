@@ -25,16 +25,16 @@ User speaks → VAD → STT → LLM → TTS → User hears
 
 ```toml
 [dependencies]
-rustvani = "0.4.0-dev.12"
+rustvani = "0.4.0-dev.13"
 ```
 
 `0.4.0-dev.*` is a **prerelease**, so Cargo needs the version spelled out — `cargo add rustvani` alone will resolve to the last stable, `0.3.0`. Use:
 
 ```bash
-cargo add rustvani@0.4.0-dev.12
+cargo add rustvani@0.4.0-dev.13
 ```
 
-Everything in this README describes `0.4.0-dev.12`. The hush-vani noise backend, WebRTC transport, Twilio serializer, and agent swarm do **not** exist in `0.3.0`.
+Everything in this README describes `0.4.0-dev.13`. The hush-vani noise backend, WebRTC transport, Twilio serializer, and agent swarm do **not** exist in `0.3.0`.
 
 ---
 
@@ -66,7 +66,7 @@ A common "Sarvam end to end" setup:
 
 ```toml
 [dependencies]
-rustvani = { version = "0.4.0-dev.12", features = ["tts-sarvam"] }
+rustvani = { version = "0.4.0-dev.13", features = ["tts-sarvam"] }
 ```
 
 ---

@@ -2,8 +2,32 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.12"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.13"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Sarvam realtime STT: live partial transcripts (0.4.0-dev.13)
+
+- **New `SarvamRealtimeSttHandler` / `SarvamRealtimeSttConfig`** (feature
+  `stt-sarvam`) for Sarvam's realtime endpoint
+  (`/speech-to-text-realtime/ws`, `saaras:v3-realtime`): interim transcripts
+  while the user is still speaking, then a final. `stream_type` `fast`
+  (default), `balanced` or `simulated`. `endpointing` defaults to `manual`:
+  local VAD drives the turns (`speech_start` / `speech_end`), as with every
+  other provider; `vad` hands endpointing to Sarvam's server VAD
+  (`silence_duration_ms`, `threshold`, `min_speech_duration_ms`), which
+  ignores `flush`. Language `unknown` (the default) detects it.
+  On All India Radio Malayalam news: first text 0.6–1.1 s after speech
+  starts, words on screen ~1.3–1.8 s after they are spoken (the classic
+  streaming endpoint: 6.4 s, or 3.5 s with an 8 s turn limit), at 3.9–5.2%
+  character error.
+- **`SttProvider::turn_start_msg`** (default `None`): sent when local VAD opens
+  a turn, before the pre-roll.
+- **`SttProvider::mid_turn_finalize_msg`** (default: `finalize_msg`) for
+  `max_turn_ms` cuts; the driver sends `turn_start_msg` right after it. For
+  Sarvam realtime in manual mode a mid-turn `flush` lost audio; it now ends the
+  segment with `speech_end` and opens the next with `speech_start`.
+- **Repeated identical partials are pushed once.** Sarvam realtime repeats the
+  same hypothesis many times a second.
 
 ### Live transcription: VAD defaults, a turn limit, detected language (0.4.0-dev.12)
 

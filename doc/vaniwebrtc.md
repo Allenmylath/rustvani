@@ -13,7 +13,7 @@ This feature pulls a large dependency tree (`webrtc-rs`) and compiles libopus th
 
 ```toml
 [dependencies]
-rustvani = { version = "0.4.0-dev.12", features = ["vaniwebrtc"] }
+rustvani = { version = "0.4.0-dev.13", features = ["vaniwebrtc"] }
 ```
 
 ## Usage
