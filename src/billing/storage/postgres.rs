@@ -81,6 +81,21 @@ impl PostgresBillingStorage {
                     &[event_id, &sid, provider, audio_duration_ms, occurred_at, &raw],
                 ).await
             }
+            BillingEvent::TranslationUsage {
+                provider, model, source_language, target_language, char_count, occurred_at, ..
+            } => {
+                self.client.execute(
+                    "INSERT INTO billing_events
+                     (event_id, session_id, event_type, provider, model, source_language,
+                      target_language, char_count, occurred_at, raw_json)
+                     VALUES ($1,$2,'translation',$3,$4,$5,$6,$7,$8,$9)
+                     ON CONFLICT (event_id) DO NOTHING",
+                    &[
+                        event_id, &sid, provider, model, source_language, target_language,
+                        &(*char_count as i32), occurred_at, &raw,
+                    ],
+                ).await
+            }
             // Not stored as ledger rows.
             BillingEvent::SessionStart { .. }
             | BillingEvent::SessionEnd { .. }
@@ -120,9 +135,10 @@ impl BillingStorage for PostgresBillingStorage {
                  (session_id, started_at,
                   llm_input_tokens, llm_output_tokens, llm_calls,
                   tts_chars, tts_calls, stt_audio_ms, stt_calls,
+                  translation_chars, translation_calls,
                   metadata, transcript_json, status, last_checkpoint_at,
                   created_at, updated_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',now(),now(),now())
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'active',now(),now(),now())
                  ON CONFLICT (session_id) DO UPDATE SET
                    started_at        = COALESCE(billing_sessions.started_at, EXCLUDED.started_at),
                    llm_input_tokens  = EXCLUDED.llm_input_tokens,
@@ -132,6 +148,8 @@ impl BillingStorage for PostgresBillingStorage {
                    tts_calls         = EXCLUDED.tts_calls,
                    stt_audio_ms      = EXCLUDED.stt_audio_ms,
                    stt_calls         = EXCLUDED.stt_calls,
+                   translation_chars = EXCLUDED.translation_chars,
+                   translation_calls = EXCLUDED.translation_calls,
                    metadata          = EXCLUDED.metadata,
                    transcript_json   = EXCLUDED.transcript_json,
                    status            = 'active',
@@ -143,6 +161,7 @@ impl BillingStorage for PostgresBillingStorage {
                     &(s.llm_calls as i32),
                     &(s.tts_chars as i32), &(s.tts_calls as i32),
                     &s.stt_audio_ms, &(s.stt_calls as i32),
+                    &(s.translation_chars as i32), &(s.translation_calls as i32),
                     &meta, &transcript_json,
                 ],
             )
@@ -177,8 +196,9 @@ impl BillingStorage for PostgresBillingStorage {
                   llm_input_tokens, llm_output_tokens, llm_calls,
                   tts_chars, tts_calls,
                   stt_audio_ms, stt_calls,
+                  translation_chars, translation_calls,
                   metadata, transcript_json, status, created_at, updated_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'complete',$15,$15)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'complete',$17,$17)
                  ON CONFLICT (session_id) DO UPDATE SET
                    started_at        = COALESCE(EXCLUDED.started_at,        billing_sessions.started_at),
                    ended_at          = COALESCE(EXCLUDED.ended_at,          billing_sessions.ended_at),
@@ -191,6 +211,8 @@ impl BillingStorage for PostgresBillingStorage {
                    tts_calls         = EXCLUDED.tts_calls,
                    stt_audio_ms      = EXCLUDED.stt_audio_ms,
                    stt_calls         = EXCLUDED.stt_calls,
+                   translation_chars = EXCLUDED.translation_chars,
+                   translation_calls = EXCLUDED.translation_calls,
                    metadata          = EXCLUDED.metadata,
                    transcript_json   = EXCLUDED.transcript_json,
                    status            = 'complete',
@@ -202,6 +224,7 @@ impl BillingStorage for PostgresBillingStorage {
                     &(s.llm_calls as i32),
                     &(s.tts_chars as i32), &(s.tts_calls as i32),
                     &s.stt_audio_ms, &(s.stt_calls as i32),
+                    &(s.translation_chars as i32), &(s.translation_calls as i32),
                     &meta, &transcript_json, &now,
                 ],
             )
@@ -226,6 +249,8 @@ CREATE TABLE IF NOT EXISTS billing_sessions (
     tts_calls         INTEGER     NOT NULL DEFAULT 0,
     stt_audio_ms      FLOAT8      NOT NULL DEFAULT 0,
     stt_calls         INTEGER     NOT NULL DEFAULT 0,
+    translation_chars INTEGER     NOT NULL DEFAULT 0,
+    translation_calls INTEGER     NOT NULL DEFAULT 0,
     metadata          JSONB       NOT NULL DEFAULT '{}',
     transcript_json   JSONB       NOT NULL DEFAULT '[]',
     -- Billing lifecycle: 'active' (in flight, not yet billable),
@@ -245,6 +270,10 @@ ALTER TABLE billing_sessions
     ADD COLUMN IF NOT EXISTS status             TEXT  NOT NULL DEFAULT 'active';
 ALTER TABLE billing_sessions
     ADD COLUMN IF NOT EXISTS last_checkpoint_at TIMESTAMPTZ;
+ALTER TABLE billing_sessions
+    ADD COLUMN IF NOT EXISTS translation_chars  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE billing_sessions
+    ADD COLUMN IF NOT EXISTS translation_calls  INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS billing_events (
     id                BIGSERIAL   PRIMARY KEY,
@@ -261,13 +290,19 @@ CREATE TABLE IF NOT EXISTS billing_events (
     char_count        INTEGER,
     voice             TEXT,
     audio_duration_ms FLOAT8,
+    source_language   TEXT,
+    target_language   TEXT,
     occurred_at       TIMESTAMPTZ NOT NULL,
     raw_json          JSONB
 );
 
--- Add event_id to existing deployments that pre-date it.
+-- Add columns to existing deployments that pre-date them.
 ALTER TABLE billing_events
     ADD COLUMN IF NOT EXISTS event_id UUID;
+ALTER TABLE billing_events
+    ADD COLUMN IF NOT EXISTS source_language TEXT;
+ALTER TABLE billing_events
+    ADD COLUMN IF NOT EXISTS target_language TEXT;
 
 CREATE INDEX        IF NOT EXISTS billing_sessions_started_at  ON billing_sessions (started_at);
 CREATE INDEX        IF NOT EXISTS billing_sessions_status      ON billing_sessions (status, last_checkpoint_at);

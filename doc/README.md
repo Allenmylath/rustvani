@@ -20,6 +20,11 @@ Read that first if you are adding a provider.
 | [60db STT](stt-60db.md) | `src/services/stt/sixtydb.rs` | `stt-60db` ✅ | WebSocket | 39 languages, two-phase finals, diarization |
 | [Gnani STT](stt-gnani.md) | `src/services/stt/gnani.rs` | `stt-gnani` ❌ | WebSocket | Indic languages (Vachana API) |
 
+### Translation
+| Service | File | Feature | Protocol | Best For |
+|---|---|---|---|---|
+| [Sarvam Translate](translate-sarvam.md) | `src/services/translate/sarvam.rs` | `translate-sarvam` ✅ | HTTP | Final transcripts into English and 22 Indian languages; `TranslationService` and the provider trait are in `src/services/translate/mod.rs` |
+
 ### Text-to-Speech (TTS)
 | Service | File | Feature | Protocol | Best For |
 |---|---|---|---|---|

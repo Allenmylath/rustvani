@@ -146,7 +146,8 @@ async fn drain_task(
                         // Billable usage — buffered for the next ledger flush.
                         BillingEvent::LlmUsage { .. }
                         | BillingEvent::TtsUsage { .. }
-                        | BillingEvent::SttUsage { .. } => {
+                        | BillingEvent::SttUsage { .. }
+                        | BillingEvent::TranslationUsage { .. } => {
                             pending.push((Uuid::new_v4(), event.clone()));
                         }
                         // SessionStart / SessionEnd only move the running totals.
@@ -192,7 +193,7 @@ async fn drain_task(
 
     log::info!(
         "billing: session {} ended — {:.2}s | LLM in={} out={} calls={} \
-         | TTS chars={} calls={} | STT ms={:.0} calls={}",
+         | TTS chars={} calls={} | STT ms={:.0} calls={} | translation chars={} calls={}",
         final_summary.session_id,
         final_summary.duration_secs.unwrap_or(0.0),
         final_summary.llm_input_tokens,
@@ -202,6 +203,8 @@ async fn drain_task(
         final_summary.tts_calls,
         final_summary.stt_audio_ms,
         final_summary.stt_calls,
+        final_summary.translation_chars,
+        final_summary.translation_calls,
     );
 
     // Mark the session settled (complete). Totals are already durable from the
@@ -260,6 +263,10 @@ fn apply_event(s: &mut SessionSummary, event: &BillingEvent) {
         BillingEvent::SttUsage { audio_duration_ms, .. } => {
             s.stt_audio_ms += audio_duration_ms;
             s.stt_calls    += 1;
+        }
+        BillingEvent::TranslationUsage { char_count, .. } => {
+            s.translation_chars += char_count;
+            s.translation_calls += 1;
         }
         // Transcript entries are stored individually — nothing to aggregate.
         BillingEvent::Transcript(_) => {}
@@ -442,6 +449,32 @@ mod tests {
         let s = storage.1.lock().unwrap().clone().unwrap();
         assert!((s.stt_audio_ms - 3500.0).abs() < 0.001);
         assert_eq!(s.stt_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn translation_calls_sum_chars_and_increment_call_count() {
+        let session_id = Uuid::new_v4();
+        let storage = Arc::new(MemStorage(StdMutex::new(vec![]), StdMutex::new(None)));
+        let (billing, handle) = SessionBilling::new(session_id, storage.clone(), 64);
+
+        for chars in [10usize, 20] {
+            billing.record(BillingEvent::TranslationUsage {
+                session_id,
+                provider: "sarvam".into(),
+                model: "sarvam-translate:v1".into(),
+                source_language: Some("ml-IN".into()),
+                target_language: "en".into(),
+                char_count: chars,
+                occurred_at: Utc::now(),
+            });
+        }
+        drop(billing);
+        handle.await.unwrap();
+
+        let s = storage.1.lock().unwrap().clone().unwrap();
+        assert_eq!(s.translation_chars, 30);
+        assert_eq!(s.translation_calls, 2);
+        assert_eq!(storage.0.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -75,6 +75,19 @@ pub enum BillingEvent {
         audio_duration_ms: f64,
         occurred_at: DateTime<Utc>,
     },
+    /// One text translation call (a transcript into one target language).
+    TranslationUsage {
+        session_id: Uuid,
+        provider: String,
+        model: String,
+        /// The source language sent or detected, when known.
+        source_language: Option<String>,
+        /// The target language as the service was configured with it.
+        target_language: String,
+        /// Characters of source text translated — what translation APIs bill by.
+        char_count: usize,
+        occurred_at: DateTime<Utc>,
+    },
     Transcript(TranscriptEntry),
 }
 
@@ -86,6 +99,7 @@ impl BillingEvent {
             Self::LlmUsage     { session_id, .. } => *session_id,
             Self::TtsUsage     { session_id, .. } => *session_id,
             Self::SttUsage     { session_id, .. } => *session_id,
+            Self::TranslationUsage { session_id, .. } => *session_id,
             Self::Transcript(e)                   => e.session_id,
         }
     }
@@ -193,6 +207,30 @@ mod tests {
     }
 
     #[test]
+    fn translation_usage_round_trips() {
+        let ev = BillingEvent::TranslationUsage {
+            session_id: id(),
+            provider: "sarvam".into(),
+            model: "sarvam-translate:v1".into(),
+            source_language: None,
+            target_language: "hi".into(),
+            char_count: 42,
+            occurred_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"translation_usage\""), "tag missing: {json}");
+        let back: BillingEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            BillingEvent::TranslationUsage { char_count, target_language, source_language, .. } => {
+                assert_eq!(char_count, 42);
+                assert_eq!(target_language, "hi");
+                assert!(source_language.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn session_id_accessor_works_for_all_variants() {
         let sid = id();
         let now = Utc::now();
@@ -204,6 +242,9 @@ mod tests {
             BillingEvent::TtsUsage     { session_id: sid, provider: "x".into(), voice: "v".into(),
                                           char_count: 1, occurred_at: now },
             BillingEvent::SttUsage     { session_id: sid, provider: "x".into(), audio_duration_ms: 1.0, occurred_at: now },
+            BillingEvent::TranslationUsage { session_id: sid, provider: "x".into(), model: "m".into(),
+                                             source_language: Some("ml-IN".into()), target_language: "en".into(),
+                                             char_count: 1, occurred_at: now },
             BillingEvent::Transcript(TranscriptEntry {
                 turn_id: id(), session_id: sid, role: TranscriptRole::User,
                 text: "hello".into(), language: None, interrupted: false, occurred_at: now,
@@ -224,6 +265,8 @@ mod tests {
         assert_eq!(s.tts_calls, 0);
         assert_eq!(s.stt_audio_ms, 0.0);
         assert_eq!(s.stt_calls, 0);
+        assert_eq!(s.translation_chars, 0);
+        assert_eq!(s.translation_calls, 0);
         assert!(s.started_at.is_none());
         assert!(s.ended_at.is_none());
         assert!(s.duration_secs.is_none());
@@ -248,6 +291,9 @@ pub struct SessionSummary {
 
     pub stt_audio_ms: f64,
     pub stt_calls: u32,
+
+    pub translation_chars: usize,
+    pub translation_calls: u32,
 
     pub metadata: HashMap<String, String>,
 }

@@ -1,9 +1,9 @@
 [package]
 name = "rustvani"
-version = "0.4.0-dev.13"
+version = "0.4.0-dev.14"
 edition = "2021"
 license = "BSD-2-Clause"
-description = "Voice AI framework for Rust — real-time speech pipelines with STT, LLM, TTS, and Dhara conversation flows"
+description = "Voice AI framework for Rust — real-time speech pipelines with STT, translation, LLM, TTS, and Dhara conversation flows"
 repository = "https://github.com/Allenmylath/rustvani"
 homepage = "https://github.com/Allenmylath/rustvani"
 documentation = "https://docs.rs/rustvani"
@@ -20,7 +20,7 @@ exclude = [
 # Features
 # ---------------------------------------------------------------------------
 [features]
-default = ["vad-silero-ort", "transport-websocket", "serializer-twilio", "stt-sarvam", "stt-60db", "stt-deepgram", "llm-openai", "llm-sarvam", "tts-deepgram", "dhara", "db-postgres"]
+default = ["vad-silero-ort", "transport-websocket", "serializer-twilio", "stt-sarvam", "stt-60db", "stt-deepgram", "llm-openai", "llm-sarvam", "translate-sarvam", "tts-deepgram", "dhara", "db-postgres"]
 
 # Silero VAD — ONNX (ort) inference backend. Gates only the ort-based path
 # (`SileroVadOrt`) and its `ort`/C-C++ dependency; the pure-Rust `SileroVadNative`
@@ -51,6 +51,9 @@ llm-openai = ["dep:reqwest"]
 llm-sarvam = ["dep:reqwest"]
 tts-deepgram = ["dep:tokio-tungstenite"]
 tts-sarvam = ["dep:tokio-tungstenite"]
+# Sarvam text translation (HTTP). The `TranslationService` itself and the `TranslationProvider`
+# trait are always compiled; only this backend needs reqwest.
+translate-sarvam = ["dep:reqwest"]
 tts-piper = ["dep:ort"]
 
 # Dhara conversation flow system.

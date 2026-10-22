@@ -22,6 +22,8 @@ pub struct RaviObserverParams {
     pub bot_tts_enabled:            bool,
     pub user_speaking_enabled:      bool,
     pub user_transcription_enabled: bool,
+    /// Forward `TranslationFrame`s (from a `TranslationService`) as `user-translation`.
+    pub user_translation_enabled:   bool,
     pub user_mute_enabled:          bool,
     pub bot_transcription_enabled:  bool,
     /// Forward function call frames (start/end, in-progress, result, raw result)
@@ -37,6 +39,7 @@ impl Default for RaviObserverParams {
             bot_tts_enabled:            true,
             user_speaking_enabled:      true,
             user_transcription_enabled: true,
+            user_translation_enabled:   true,
             user_mute_enabled:          true,
             bot_transcription_enabled:  false,
             function_call_enabled:      true,
@@ -162,6 +165,22 @@ impl BaseObserver for RaviObserver {
                 self.send(json).await;
             }
 
+            // ---- User translation ----
+            FrameInner::Data(DataFrame::Translation(t))
+                if self.params.user_translation_enabled =>
+            {
+                let json = models::msg_user_translation(
+                    &t.text,
+                    &t.source_text,
+                    t.source_language.as_deref(),
+                    &t.target_language,
+                    &t.user_id,
+                    &t.timestamp,
+                    t.finalized,
+                );
+                self.send(json).await;
+            }
+
             // ---- LLM response boundaries ----
             FrameInner::Control(ControlFrame::LLMFullResponseStart)
                 if self.params.bot_llm_enabled =>
@@ -273,7 +292,7 @@ impl BaseObserver for RaviObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::{PassthroughHandler, StartFrameData, TranscriptionData};
+    use crate::frames::{PassthroughHandler, StartFrameData, TranscriptionData, TranslationData};
 
     fn pushed(frame: Frame) -> FramePushed {
         FramePushed {
@@ -335,5 +354,40 @@ mod tests {
             1,
             "transcript was sent more than once"
         );
+    }
+
+    #[tokio::test]
+    async fn translation_frames_go_out_as_user_translation() {
+        let proc = FrameProcessor::new("ravi-test", Box::new(PassthroughHandler), true);
+        proc.process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream)
+            .await
+            .unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cap = captured.clone();
+        proc.on_before_push_frame(move |frame| {
+            if let FrameInner::System(SystemFrame::RaviServerMessage { payload }) = &frame.inner {
+                cap.lock().unwrap().push(payload.clone());
+            }
+        });
+        let observer = RaviObserver::new(proc.clone(), RaviObserverParams::default());
+        let source = TranscriptionData::new("നാളെ", "user", "17.250").with_language("ml-IN").finalized();
+        observer
+            .on_push_frame(pushed(Frame::translation(TranslationData::new(&source, "en", "tomorrow"))))
+            .await;
+        let msgs = captured.lock().unwrap();
+        let msg: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(msg["type"], "user-translation");
+        assert_eq!(msg["data"]["text"], "tomorrow");
+        assert_eq!(msg["data"]["source_text"], "നാളെ");
+        assert_eq!(msg["data"]["target_language"], "en");
+        assert_eq!(msg["data"]["timestamp"], "17.250");
+
+        let off = RaviObserver::new(
+            proc.clone(),
+            RaviObserverParams { user_translation_enabled: false, ..RaviObserverParams::default() },
+        );
+        drop(msgs);
+        off.on_push_frame(pushed(Frame::translation(TranslationData::new(&source, "hi", "कल")))).await;
+        assert_eq!(captured.lock().unwrap().len(), 1, "disabled: nothing more sent");
     }
 }

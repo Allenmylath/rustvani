@@ -25,7 +25,7 @@ User speaks → VAD → STT → LLM → TTS → User hears
 
 ```toml
 [dependencies]
-rustvani = "0.4.0-dev.13"
+rustvani = "0.4.0-dev.14"
 ```
 
 `0.4.0-dev.*` is a **prerelease**, so Cargo needs the version spelled out — `cargo add rustvani` alone will resolve to the last stable, `0.3.0`. Use:
@@ -42,7 +42,7 @@ Everything in this README describes `0.4.0-dev.13`. The hush-vani noise backend,
 
 rustvani ships a lot of providers, so services are behind Cargo features. **Half of what people try first is opt-in** — check this table before filing a "cannot find `SarvamTtsHandler`" issue.
 
-**Enabled by default:** `vad-silero-ort`, `transport-websocket`, `serializer-twilio`, `stt-sarvam`, `stt-60db`, `stt-deepgram`, `llm-openai`, `llm-sarvam`, `tts-deepgram`, `dhara`, `db-postgres`.
+**Enabled by default:** `vad-silero-ort`, `transport-websocket`, `serializer-twilio`, `stt-sarvam`, `stt-60db`, `stt-deepgram`, `llm-openai`, `llm-sarvam`, `translate-sarvam`, `tts-deepgram`, `dhara`, `db-postgres`.
 
 | Feature | Default | Gates | Notes |
 |---|:---:|---|---|
@@ -54,6 +54,7 @@ rustvani ships a lot of providers, so services are behind Cargo features. **Half
 | `stt-deepgram` | ✅ | `DeepgramSttHandler` | |
 | `llm-openai` | ✅ | `OpenAILLMHandler`, `FunctionRegistry` | Any OpenAI-compatible endpoint |
 | `llm-sarvam` | ✅ | `SarvamLLMHandler` | Was gated on `stt-sarvam`; split out because Sarvam STT is WebSocket and no longer pulls `reqwest` |
+| `translate-sarvam` | ✅ | `SarvamTranslateProvider` | Text translation over HTTP. `TranslationService` and the `TranslationProvider` trait need no feature |
 | `tts-deepgram` | ✅ | `DeepgramTtsHandler` | Aura-2 |
 | `dhara` | ✅ | `DharaManager` | Implies `llm-openai` + `transport-websocket` |
 | `db-postgres` | ✅ | `NeonPostgresTool`, Postgres billing/audio storage | |
@@ -66,7 +67,7 @@ A common "Sarvam end to end" setup:
 
 ```toml
 [dependencies]
-rustvani = { version = "0.4.0-dev.13", features = ["tts-sarvam"] }
+rustvani = { version = "0.4.0-dev.14", features = ["tts-sarvam"] }
 ```
 
 ---
@@ -384,6 +385,7 @@ src/
 ├── services/
 │   ├── llm/           OpenAI + Sarvam LLM (SSE streaming, function calling)
 │   ├── stt/           Sarvam + 60db + Deepgram + Gnani STT (WebSocket streaming)
+│   ├── translate/     TranslationService + Sarvam Translate (HTTP)
 │   └── tts/           Sarvam + Deepgram TTS (WebSocket) + Piper TTS (local ONNX)
 ├── tools/             Built-in tools (Neon Postgres with pgvector)
 ├── transport/         WebSocket (axum), P2P WebRTC, base I/O, ChannelTransport
@@ -530,6 +532,14 @@ The coordination rule: `emitted_speaking` is an `AtomicBool` shared between clie
 
 → Per-service guides: [Sarvam](doc/stt-sarvam.md) · [Deepgram](doc/stt-deepgram.md) · [60db](doc/stt-60db.md) · [Gnani](doc/stt-gnani.md)
 
+### Translation
+- **`TranslationService`** — a stage after the STT that translates every *final* transcript into any number of target languages, as `TranslationFrame`s (sent to clients as RAVI `user-translation`). Interims are never translated.
+- One ordered queue per target language, off the pipeline's tasks: a slow call never delays the transcript or another language. Targets (`TranslationTargets`) can change while the pipeline runs.
+- **Sarvam Translate** (`sarvam-translate:v1`, `mayura:v1`) — English and 22 Indian languages; source auto-detection falls back to `mayura:v1` *(feature `translate-sarvam`)*
+- Billing: `BillingEvent::TranslationUsage` per call, by source characters
+
+→ [Sarvam Translate](doc/translate-sarvam.md)
+
 ### Large Language Models
 - **OpenAI-compatible** API with SSE streaming
 - **Sarvam LLM** (`sarvam-m`, `sarvam-30b`) with optional CoT thinking mode
@@ -662,7 +672,7 @@ use rustvani::agents::{AgentRunner, BaseAgent, LocalAgentBus, TaskContext};
 
 ### Billing & Usage Tracking
 
-Production-grade, non-blocking billing that captures exactly what you need to cost and invoice voice sessions — session duration, LLM tokens, TTS characters, STT audio duration, and full conversation transcripts, all linked by `session_id` and written to PostgreSQL or structured JSON logs.
+Production-grade, non-blocking billing that captures exactly what you need to cost and invoice voice sessions — session duration, LLM tokens, TTS characters, STT audio duration, translated characters, and full conversation transcripts, all linked by `session_id` and written to PostgreSQL or structured JSON logs.
 
 | Signal | Source | Accuracy |
 |---|---|---|
@@ -670,6 +680,7 @@ Production-grade, non-blocking billing that captures exactly what you need to co
 | LLM input + output tokens | OpenAI `stream_options.include_usage` | Exact |
 | TTS characters synthesised | Per-flush confirmation (Deepgram / Sarvam) | Exact |
 | STT audio duration | Server-reported or PCM byte counter | Exact / computed |
+| Translation characters | Per call (source text length) | Exact |
 
 `record()` is a single send onto an **unbounded** channel drained by a background task — it never blocks and never drops, so billing overhead is invisible to audio latency. (`SessionBilling::new`'s `channel_capacity` argument is retained for API compatibility and is ignored.) Wiring is one builder call per service:
 
@@ -725,6 +736,7 @@ Every service and component has a dedicated guide in [doc/](doc/README.md) — e
 | Audio front-end | [Speech Enhancement](doc/audio-enhancement.md) · [VAD](doc/vad.md) · [SmartTurn](doc/turn-acid.md) |
 | STT | [Sarvam](doc/stt-sarvam.md) · [Deepgram](doc/stt-deepgram.md) · [60db](doc/stt-60db.md) · [Gnani](doc/stt-gnani.md) |
 | LLM | [OpenAI](doc/llm-openai.md) · [Sarvam](doc/llm-sarvam.md) |
+| Translation | [Sarvam Translate](doc/translate-sarvam.md) |
 | TTS | [Sarvam](doc/tts-sarvam.md) · [Deepgram](doc/tts-deepgram.md) · [Piper (local)](doc/tts-piper.md) |
 | Transport | [WebSocket + Channel](doc/transport.md) · [WebRTC](doc/vaniwebrtc.md) · [Twilio serializer](doc/serializer-twilio.md) |
 | Tools | [Postgres tool](doc/tools-postgres.md) |

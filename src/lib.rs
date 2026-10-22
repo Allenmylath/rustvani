@@ -53,10 +53,10 @@ pub mod serializers;
 #[cfg(feature = "dhara")]
 pub mod dhara;
 
-/// Services — STT, LLM, TTS implementations.
+/// Services — STT, LLM, TTS and translation implementations.
 ///
 /// Individual services are gated by their respective features:
-/// `stt-sarvam`, `llm-openai`, `tts-deepgram`, `tts-sarvam`.
+/// `stt-sarvam`, `llm-openai`, `tts-deepgram`, `tts-sarvam`, `translate-sarvam`.
 pub mod services;
 pub mod tools;
 
@@ -76,7 +76,7 @@ pub use frames::{
     AudioRawData, ControlFrame, DataFrame, DataFrameData, ErrorFrameData, Frame, FrameDirection,
     FrameHandler, FrameInner, FrameKind, FrameProcessor, FrameProcessorSetup, KeypadEntry,
     PassthroughHandler, ProcessorBusHandle, StartFrameData, SystemFrame, TranscriptionData,
-    FunctionCallData, FunctionCallResultData,
+    TranslationData, FunctionCallData, FunctionCallResultData,
 };
 pub use context::{shared_context, LLMContext, ToolCall};
 pub use pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask};
@@ -145,3 +145,8 @@ pub use services::{SarvamTtsConfig, SarvamTtsHandler};
 
 #[cfg(feature = "tts-piper")]
 pub use services::{PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler};
+
+// Translation: the service and provider trait are always available; Sarvam's backend is gated.
+pub use services::{Translated, TranslationProvider, TranslationService, TranslationTargets};
+#[cfg(feature = "translate-sarvam")]
+pub use services::{SarvamTranslateConfig, SarvamTranslateProvider};

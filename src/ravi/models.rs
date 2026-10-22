@@ -120,6 +120,35 @@ pub fn msg_user_transcription(
     envelope("user-transcription", None, Some(data))
 }
 
+// ---- Translation ----
+
+/// A final transcript translated into `target_language`, from a `TranslationFrame`. `source_text`
+/// and `timestamp` are the transcript's, so a client can place the translation under the
+/// `user-transcription` it belongs to; `source_language` is sent when known.
+#[allow(clippy::too_many_arguments)]
+pub fn msg_user_translation(
+    text:            &str,
+    source_text:     &str,
+    source_language: Option<&str>,
+    target_language: &str,
+    user_id:         &str,
+    timestamp:       &str,
+    is_final:        bool,
+) -> String {
+    let mut data = json!({
+        "text":            text,
+        "source_text":     source_text,
+        "target_language": target_language,
+        "user_id":         user_id,
+        "timestamp":       timestamp,
+        "final":           is_final,
+    });
+    if let Some(language) = source_language {
+        data["source_language"] = json!(language);
+    }
+    envelope("user-translation", None, Some(data))
+}
+
 // ---- LLM ----
 
 pub fn msg_bot_llm_started() -> String { envelope("bot-llm-started", None, None) }
@@ -185,5 +214,23 @@ mod tests {
         assert_eq!(with["data"]["final"], true);
         let without: Value = serde_json::from_str(&msg_user_transcription("hi", "u", "0", false, None)).unwrap();
         assert!(without["data"].get("language").is_none());
+    }
+
+    #[test]
+    fn user_translation_names_both_languages_and_its_source() {
+        let msg: Value = serde_json::from_str(&msg_user_translation(
+            "tomorrow", "നാളെ", Some("ml-IN"), "en", "u", "17.250", true,
+        ))
+        .unwrap();
+        assert_eq!(msg["type"], "user-translation");
+        assert_eq!(msg["data"]["text"], "tomorrow");
+        assert_eq!(msg["data"]["source_text"], "നാളെ");
+        assert_eq!(msg["data"]["source_language"], "ml-IN");
+        assert_eq!(msg["data"]["target_language"], "en");
+        assert_eq!(msg["data"]["timestamp"], "17.250");
+        assert_eq!(msg["data"]["final"], true);
+        let unknown: Value =
+            serde_json::from_str(&msg_user_translation("x", "y", None, "hi", "u", "0", true)).unwrap();
+        assert!(unknown["data"].get("source_language").is_none());
     }
 }

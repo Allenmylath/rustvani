@@ -1,4 +1,4 @@
-//! Services — STT, LLM and TTS backends.
+//! Services — STT, LLM, TTS and translation backends.
 //!
 //! Every backend is behind the feature that supplies its dependency, so a
 //! `--no-default-features` build compiles only the providers it asked for. The
@@ -6,6 +6,7 @@
 
 pub mod llm;
 pub mod stt;
+pub mod translate;
 pub mod tts;
 
 // The reusable STT core: the `SttProvider` base trait plus the generic
@@ -45,3 +46,6 @@ pub use tts::{DeepgramTtsConfig, DeepgramTtsHandler};
 #[cfg(feature = "tts-piper")]
 pub use tts::piper::{PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler};
 pub use llm::FunctionRegistry;
+pub use translate::{Translated, TranslationProvider, TranslationService, TranslationTargets};
+#[cfg(feature = "translate-sarvam")]
+pub use translate::sarvam::{SarvamTranslateConfig, SarvamTranslateProvider};

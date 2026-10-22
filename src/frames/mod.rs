@@ -60,6 +60,7 @@ pub enum FrameKind {
     // Data
     Data,
     Transcription,
+    Translation,
     LLMText,
     LLMContextFrame,
     // Data — function calling
@@ -209,6 +210,48 @@ impl TranscriptionData {
     pub fn finalized(mut self) -> Self { self.finalized = true; self }
 }
 
+/// A transcript translated into another language, made by a
+/// [`TranslationService`](crate::services::translate::TranslationService) from a
+/// [`TranscriptionData`].
+///
+/// `source_text`, `user_id` and `timestamp` are the source transcript's, so a consumer can pair a
+/// translation with the transcript it came from; `source_language` is the transcript's language
+/// when known, else what the provider detected.
+#[derive(Debug, Clone)]
+pub struct TranslationData {
+    /// The translated text.
+    pub text:            String,
+    /// The transcript that was translated.
+    pub source_text:     String,
+    /// Language of `source_text` (BCP-47, e.g. `ml-IN`), when known.
+    pub source_language: Option<String>,
+    /// Language of `text`, as the target was named when the service was configured
+    /// (e.g. `hi`, `en-IN`).
+    pub target_language: String,
+    pub user_id:         String,
+    /// The source transcript's `timestamp`.
+    pub timestamp:       String,
+    /// Translations are made from final transcripts, so this is `true` unless a provider
+    /// streams revisions.
+    pub finalized:       bool,
+}
+
+impl TranslationData {
+    /// A translation of `source` into `target_language`.
+    pub fn new(source: &TranscriptionData, target_language: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            text:            text.into(),
+            source_text:     source.text.clone(),
+            source_language: source.language.clone(),
+            target_language: target_language.into(),
+            user_id:         source.user_id.clone(),
+            timestamp:       source.timestamp.clone(),
+            finalized:       true,
+        }
+    }
+    pub fn with_source_language(mut self, lang: impl Into<String>) -> Self { self.source_language = Some(lang.into()); self }
+}
+
 /// Payload for FunctionCallInProgressFrame — the model wants to invoke a tool.
 #[derive(Debug, Clone)]
 pub struct FunctionCallData {
@@ -339,6 +382,7 @@ pub enum DataFrame {
     Data(DataFrameData),
     OutputAudioRaw(AudioRawData),
     Transcription(TranscriptionData),
+    Translation(TranslationData),
     LLMText(String),
     LLMContextFrame(Arc<Mutex<crate::context::LLMContext>>),
     /// Model wants to invoke a tool — downstream observers can show "thinking…"
@@ -416,6 +460,7 @@ impl Frame {
                 DataFrame::Data(_)                     => "DataFrame",
                 DataFrame::OutputAudioRaw(_)           => "OutputAudioRawFrame",
                 DataFrame::Transcription(_)            => "TranscriptionFrame",
+                DataFrame::Translation(_)              => "TranslationFrame",
                 DataFrame::LLMText(_)                  => "LLMTextFrame",
                 DataFrame::LLMContextFrame(_)          => "LLMContextFrame",
                 DataFrame::FunctionCallInProgress(_)   => "FunctionCallInProgressFrame",
@@ -469,6 +514,7 @@ impl Frame {
                 DataFrame::Data(_)                     => FrameKind::Data,
                 DataFrame::OutputAudioRaw(_)           => FrameKind::OutputAudioRaw,
                 DataFrame::Transcription(_)            => FrameKind::Transcription,
+                DataFrame::Translation(_)              => FrameKind::Translation,
                 DataFrame::LLMText(_)                  => FrameKind::LLMText,
                 DataFrame::LLMContextFrame(_)          => FrameKind::LLMContextFrame,
                 DataFrame::FunctionCallInProgress(_)   => FrameKind::FunctionCallInProgress,
@@ -633,6 +679,9 @@ impl Frame {
     // ---- Generic data ----
     pub fn transcription(data: TranscriptionData) -> Self {
         Self::make(FrameInner::Data(DataFrame::Transcription(data)))
+    }
+    pub fn translation(data: TranslationData) -> Self {
+        Self::make(FrameInner::Data(DataFrame::Translation(data)))
     }
     pub fn data(content: Vec<u8>) -> Self {
         Self::make(FrameInner::Data(DataFrame::Data(DataFrameData { content, ..Default::default() })))

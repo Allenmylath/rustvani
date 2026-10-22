@@ -59,6 +59,9 @@ mod tests {
             BillingEvent::TtsUsage     { session_id: id, provider: "deepgram".into(), voice: "v".into(),
                                           char_count: 80, occurred_at: now },
             BillingEvent::SttUsage     { session_id: id, provider: "gnani".into(), audio_duration_ms: 1500.0, occurred_at: now },
+            BillingEvent::TranslationUsage { session_id: id, provider: "sarvam".into(), model: "sarvam-translate:v1".into(),
+                                             source_language: Some("ml-IN".into()), target_language: "en".into(),
+                                             char_count: 30, occurred_at: now },
             BillingEvent::Transcript(TranscriptEntry {
                 turn_id: Uuid::new_v4(), session_id: id,
                 role: TranscriptRole::User, text: "hello".into(),
@@ -82,6 +85,8 @@ mod tests {
             tts_calls: 3,
             stt_audio_ms: 7000.0,
             stt_calls: 4,
+            translation_chars: 120,
+            translation_calls: 2,
             ..Default::default()
         };
         assert!(storage.finalize_session(&summary, &[]).await.is_ok());

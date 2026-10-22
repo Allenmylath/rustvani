@@ -2,8 +2,40 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.13"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.14"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Translation as a pipeline stage (0.4.0-dev.14)
+
+- **New `TranslationService`** (`services::translate`, always compiled): sits after
+  the STT and translates every *final* transcript — `TranscriptionFrame`s with
+  `finalized`, and the turn-closing transcript bundled on `VADUserStoppedSpeaking`
+  — into each target language, as a new **`TranslationFrame`**
+  (`DataFrame::Translation`, `TranslationData`: `text`, `target_language`, and the
+  source transcript's `source_text`, `source_language`, `user_id`, `timestamp`).
+  Interims are not translated. One ordered queue per target language runs off the
+  pipeline's tasks, so a slow call never delays the transcript or another language.
+  Targets are a **`TranslationTargets`** handle that can change while the pipeline
+  runs; a transcript already in the target language is passed through as its own
+  translation. Long text is split at sentence ends to the provider's limit.
+- **`TranslationProvider` trait** (`name`, `model`, `supports`, `max_chars`,
+  `translate`) for any text-to-text backend.
+- **`SarvamTranslateProvider` / `SarvamTranslateConfig`** (feature
+  `translate-sarvam`, default on): `POST /translate`, `sarvam-translate:v1` by
+  default or `mayura:v1`; BCP-47 tags (`hi`, `en-IN`) mapped to Sarvam's `xx-IN`
+  codes. Sarvam detects the source language only on `mayura:v1`, so a transcript
+  of unknown language goes to `auto_detect_model` (default `mayura:v1`). One retry
+  on 429/5xx.
+- **RAVI `user-translation`** message (`models::msg_user_translation`), sent by
+  `RaviObserver` for every `TranslationFrame`;
+  `RaviObserverParams::user_translation_enabled` (default `true`). Struct-literal
+  constructions of `RaviObserverParams` need the new field.
+- **`BillingEvent::TranslationUsage`** (`provider`, `model`, `source_language`,
+  `target_language`, `char_count`), summed into `SessionSummary::translation_chars`
+  / `translation_calls`; the Postgres schema adds those columns and
+  `billing_events.source_language` / `target_language` (migrated with
+  `ADD COLUMN IF NOT EXISTS`). Exhaustive matches on `BillingEvent`, `DataFrame`
+  and `FrameKind` gain a variant.
 
 ### Sarvam realtime STT: live partial transcripts (0.4.0-dev.13)
 

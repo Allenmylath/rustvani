@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "SELECT session_id, started_at, ended_at, duration_secs, finish_reason,
                     llm_input_tokens, llm_output_tokens, llm_calls,
                     tts_chars, tts_calls, stt_audio_ms, stt_calls,
+                    translation_chars, translation_calls,
                     jsonb_array_length(transcript_json) AS transcript_len,
                     status, last_checkpoint_at
              FROM billing_sessions
@@ -50,6 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tts_calls: i32 = r.get("tts_calls");
         let stt_ms: f64 = r.get("stt_audio_ms");
         let stt_calls: i32 = r.get("stt_calls");
+        let tr_chars: i32 = r.get("translation_chars");
+        let tr_calls: i32 = r.get("translation_calls");
         let tlen: Option<i32> = r.get("transcript_len");
         let status: String = r.get("status");
         let last_ckpt: Option<chrono::DateTime<chrono::Utc>> = r.get("last_checkpoint_at");
@@ -74,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  duration={:?}s  finish={:?}  last_checkpoint={:?}", dur, reason, last_ckpt);
         println!("  LLM in={llm_in} out={llm_out} calls={llm_calls}");
         println!("  TTS chars={tts_chars} calls={tts_calls}  STT ms={stt_ms:.0} calls={stt_calls}");
+        println!("  translation chars={tr_chars} calls={tr_calls}");
         println!("  billing_events rows={ev} (with event_id={ev_with_id})  transcript entries={:?}", tlen);
         println!();
     }
