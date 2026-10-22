@@ -25,7 +25,7 @@ User speaks → VAD → STT → LLM → TTS → User hears
 
 ```toml
 [dependencies]
-rustvani = "0.4.0-dev.16"
+rustvani = "0.4.0-dev.17"
 ```
 
 `0.4.0-dev.*` is a **prerelease**, so Cargo needs the version spelled out — `cargo add rustvani` alone will resolve to the last stable, `0.3.0`. Use:
@@ -67,7 +67,7 @@ A common "Sarvam end to end" setup:
 
 ```toml
 [dependencies]
-rustvani = { version = "0.4.0-dev.16", features = ["tts-sarvam"] }
+rustvani = { version = "0.4.0-dev.17", features = ["tts-sarvam"] }
 ```
 
 ---
@@ -532,6 +532,9 @@ The coordination rule: `emitted_speaking` is an `AtomicBool` shared between clie
 - Transparent resampling if source rate ≠ target rate (via `rubato`)
 
 → Per-service guides: [Sarvam](doc/stt-sarvam.md) · [Deepgram](doc/stt-deepgram.md) · [60db](doc/stt-60db.md) · [Gnani](doc/stt-gnani.md)
+
+### Sentence segmentation
+- **`SentenceSegmenter`** — after a realtime STT with interims on, finalises each sentence as soon as the partial transcript shows its end followed by a few characters of the next, instead of waiting for the pause and the STT's final (about two seconds): translation, dubbing or an LLM start sooner. The partial carries on with the remainder; the segment's real final is stripped of what was already finalised.
 
 ### Translation
 - **`TranslationService`** — a stage after the STT that translates every *final* transcript into any number of target languages, as `TranslationFrame`s (sent to clients as RAVI `user-translation`). Interims are never translated.

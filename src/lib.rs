@@ -82,6 +82,7 @@ pub use context::{shared_context, LLMContext, ToolCall};
 pub use pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask};
 pub use processors::llm_user_aggregator::LLMUserAggregator;
 pub use processors::llm_assistant_aggregator::LLMAssistantAggregator;
+pub use processors::sentence_segmenter::{SegmenterConfig, SentenceSegmenter};
 
 // ---------------------------------------------------------------------------
 // Feature-gated re-exports

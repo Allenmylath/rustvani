@@ -2,7 +2,7 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.16"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.17"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
 
 ### Dubbing: translations spoken aloud (0.4.0-dev.15)
@@ -22,6 +22,16 @@ since Cargo will not resolve a prerelease from a plain version requirement.
   pace.
 - **`BillingEvent::TtsUsage` gains `language: Option<String>`** (struct literals
   need the new field; it serializes only when set).
+
+### Sentences out of partial transcripts (0.4.0-dev.17)
+
+- **`SentenceSegmenter`** (`processors::sentence_segmenter`): after a realtime
+  STT with interims on, a sentence whose end shows up in a partial transcript
+  with a few characters of the next sentence after it goes downstream at once
+  as a final `TranscriptionFrame`; the partial carries on with the remainder,
+  and the segment's own final (standalone, or bundled on `VADUserStoppedSpeaking`)
+  is stripped of what was already finalised, or dropped if nothing is left.
+  `SegmenterConfig { min_tail_chars: 3, min_sentence_chars: 6 }`.
 
 ### STT sockets reopen; Sarvam REST TTS retries (0.4.0-dev.16)
 
