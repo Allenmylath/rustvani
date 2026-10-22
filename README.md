@@ -25,7 +25,7 @@ User speaks → VAD → STT → LLM → TTS → User hears
 
 ```toml
 [dependencies]
-rustvani = "0.4.0-dev.15"
+rustvani = "0.4.0-dev.16"
 ```
 
 `0.4.0-dev.*` is a **prerelease**, so Cargo needs the version spelled out — `cargo add rustvani` alone will resolve to the last stable, `0.3.0`. Use:
@@ -67,7 +67,7 @@ A common "Sarvam end to end" setup:
 
 ```toml
 [dependencies]
-rustvani = { version = "0.4.0-dev.15", features = ["tts-sarvam"] }
+rustvani = { version = "0.4.0-dev.16", features = ["tts-sarvam"] }
 ```
 
 ---

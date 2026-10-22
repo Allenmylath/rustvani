@@ -130,6 +130,9 @@ impl SarvamRestTts {
         body
     }
 
+    /// Tries a call this many times on a rate limit or a server error, waiting [`RETRY_WAITS`].
+    const ATTEMPTS: u32 = 3;
+
     async fn call(&self, body: &Value) -> Result<Vec<u8>> {
         let url = format!("{}/text-to-speech", self.config.base_url.trim_end_matches('/'));
         let mut attempt = 0;
@@ -143,7 +146,7 @@ impl SarvamRestTts {
                 .send()
                 .await;
             let retry = |why: String| -> Result<()> {
-                if attempt < 2 {
+                if attempt < Self::ATTEMPTS {
                     log::debug!("SarvamRestTts: {why}; retrying");
                     Ok(())
                 } else {
@@ -175,10 +178,14 @@ impl SarvamRestTts {
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(RETRY_WAITS[(attempt as usize - 1).min(RETRY_WAITS.len() - 1)]).await;
         }
     }
 }
+
+/// Before the second and third attempts: a rate limit (429) with several languages dubbing at
+/// once clears in about a second.
+const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(600), Duration::from_millis(1500)];
 
 /// The PCM in a WAV file, with its format, from the `fmt ` and `data` chunks. Without a RIFF
 /// header the bytes are taken as raw PCM at `assume_rate`.

@@ -146,13 +146,31 @@ struct Session {
     send_task: Option<JoinHandle<()>>,
     receive_task: Option<JoinHandle<()>>,
     keepalive_task: Option<JoinHandle<()>>,
+    /// The processor the session was opened for: a lost socket is reopened for it.
+    processor: Option<FrameProcessor>,
+    /// Set by `End`/`Cancel`: a socket lost now is not reopened.
+    closing: bool,
+    /// When the socket was last reopened: not more often than [`RECONNECT_EVERY`].
+    last_reconnect: Option<std::time::Instant>,
 }
 
 impl Session {
     fn new() -> Self {
-        Self { ws_tx: None, send_task: None, receive_task: None, keepalive_task: None }
+        Self {
+            ws_tx: None,
+            send_task: None,
+            receive_task: None,
+            keepalive_task: None,
+            processor: None,
+            closing: false,
+            last_reconnect: None,
+        }
     }
 }
+
+/// A socket the server closed (or that failed) is reopened on the next send, but not more often
+/// than this, so a server that keeps refusing is not hammered.
+const RECONNECT_EVERY: Duration = Duration::from_secs(3);
 
 /// Everything the receive task needs.
 struct RxCtx<P: SttProvider> {
@@ -241,6 +259,7 @@ impl<P: SttProvider> SttService<P> {
         let name = self.provider.name();
         let handshake = self.provider.handshake();
         log::info!("{}: connecting to {}", name, handshake.url);
+        let processor_for_reconnect = processor.clone();
 
         let (sink, stream) = match ws::connect(&handshake).await {
             Ok(pair) => pair,
@@ -274,35 +293,87 @@ impl<P: SttProvider> SttService<P> {
             session.send_task = Some(send_task);
             session.receive_task = Some(receive_task);
             session.keepalive_task = keepalive_task;
+            session.processor = Some(processor_for_reconnect);
+            session.closing = false;
         }
 
         // In-band session configuration, for providers that need it.
         for msg in self.provider.on_connected() {
-            self.send(msg).await;
+            self.send_raw(msg).await;
         }
 
         log::info!("{}: connected", name);
     }
 
     async fn disconnect(&self) {
+        self.session.lock().await.closing = true;
         if let Some(msg) = self.provider.close_msg() {
-            self.send(msg).await;
+            self.send_raw(msg).await;
         }
+        self.teardown().await;
+        log::info!("{}: disconnected", self.provider.name());
+    }
 
+    /// Ends the socket's tasks and forgets its sender.
+    async fn teardown(&self) {
         let mut session = self.session.lock().await;
         if let Some(h) = session.keepalive_task.take() { h.abort(); }
         if let Some(h) = session.receive_task.take()   { h.abort(); }
         if let Some(h) = session.send_task.take()      { h.abort(); }
         session.ws_tx = None;
-
-        log::info!("{}: disconnected", self.provider.name());
     }
 
-    async fn send(&self, msg: Outgoing) {
+    /// Sends on the socket as it is; nothing is reopened.
+    async fn send_raw(&self, msg: Outgoing) {
         let tx = { self.session.lock().await.ws_tx.clone() };
         if let Some(tx) = tx {
             let _ = tx.send(msg).await;
         }
+    }
+
+    /// Sends on the socket. A socket the server closed (its receive task ended) or that fails
+    /// to take the message is reopened for the session's processor, and the message sent on
+    /// the new one, so one server error (Sarvam: "Transcription failed for utterance N", then a
+    /// close) does not silence the rest of the session.
+    async fn send(&self, msg: Outgoing) {
+        let (tx, lost) = {
+            let session = self.session.lock().await;
+            let lost = session.receive_task.as_ref().is_some_and(|task| task.is_finished());
+            (session.ws_tx.clone(), lost)
+        };
+        let Some(tx) = tx else { return };
+        let msg = if lost {
+            msg
+        } else {
+            match tx.send(msg).await {
+                Ok(()) => return,
+                Err(mpsc::error::SendError(msg)) => msg,
+            }
+        };
+        if self.reconnect().await {
+            self.send_raw(msg).await;
+        }
+    }
+
+    /// Reopens a lost socket for the session's processor, unless the session is closing or one
+    /// was reopened within [`RECONNECT_EVERY`]. Whether there is a socket afterwards.
+    async fn reconnect(&self) -> bool {
+        let processor = {
+            let mut session = self.session.lock().await;
+            if session.closing {
+                return false;
+            }
+            if session.last_reconnect.is_some_and(|at| at.elapsed() < RECONNECT_EVERY) {
+                return false;
+            }
+            session.last_reconnect = Some(std::time::Instant::now());
+            session.processor.clone()
+        };
+        let Some(processor) = processor else { return false };
+        log::warn!("{}: socket lost; reconnecting", self.provider.name());
+        self.teardown().await;
+        self.connect(processor).await;
+        self.session.lock().await.ws_tx.is_some()
     }
 
     /// Frame and send PCM samples through the provider's encoder.
@@ -717,6 +788,18 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         svc.session.lock().await.ws_tx = Some(tx);
         (svc, rx)
+    }
+
+    #[tokio::test]
+    async fn a_dead_socket_is_not_reopened_without_a_processor_or_while_closing() {
+        let (svc, rx) = capturing(None).await;
+        drop(rx); // the socket's tasks are gone
+        svc.send(Outgoing::Text("audio".into())).await; // nothing to reopen for: dropped quietly
+        assert!(svc.session.lock().await.last_reconnect.is_some(), "it did try");
+        svc.session.lock().await.closing = true;
+        svc.session.lock().await.last_reconnect = None;
+        svc.send(Outgoing::Text("audio".into())).await;
+        assert!(svc.session.lock().await.last_reconnect.is_none(), "not while closing");
     }
 
     /// `ms` of steady speech-level audio, or of a gap between words.

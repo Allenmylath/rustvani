@@ -2,7 +2,7 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.15"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.16"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
 
 ### Dubbing: translations spoken aloud (0.4.0-dev.15)
@@ -22,6 +22,16 @@ since Cargo will not resolve a prerelease from a plain version requirement.
   pace.
 - **`BillingEvent::TtsUsage` gains `language: Option<String>`** (struct literals
   need the new field; it serializes only when set).
+
+### STT sockets reopen; Sarvam REST TTS retries (0.4.0-dev.16)
+
+- **The STT core reopens a lost socket.** When the server closes the WebSocket
+  (Sarvam realtime after "Transcription failed for utterance N") or a send
+  fails, the next send reconnects for the session's processor (at most every
+  3 s, not while the session is ending) and goes out on the new socket. Before,
+  the rest of the session was silent.
+- **`SarvamRestTts` tries three times** on a 429 or a 5xx, waiting 0.6 s then
+  1.5 s: several languages dubbing at once hit Sarvam's rate limit.
 
 ### Translation as a pipeline stage (0.4.0-dev.14)
 
