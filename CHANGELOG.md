@@ -2,8 +2,26 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.14"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.15"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Dubbing: translations spoken aloud (0.4.0-dev.15)
+
+- **`TtsSynthesizer` trait** (`services::tts::synth`, always compiled): one utterance
+  in, its whole audio (`Pcm`) out, with a voice and a pace per call. The shape
+  dubbing needs, beside the streaming TTS handlers that speak an LLM's answer.
+- **`SarvamRestTts` / `SarvamRestTtsConfig`** (feature `tts-sarvam`, which now
+  also pulls `reqwest`): Bulbul over `POST /text-to-speech`, `bulbul:v3` by
+  default, 48 kHz WAV decoded to PCM; the eleven languages Bulbul speaks.
+- **`DubbingService`** (`services::dub`, always compiled): after the
+  `TranslationService`, speaks every final `TranslationFrame` whose target is in
+  its `TranslationTargets` and emits a new **`DubbedSpeechFrame`**
+  (`DataFrame::DubbedSpeech`, `DubbedSpeechData`: the PCM plus the source
+  transcript's `timestamp` and `source_text`, the voice and the pace). One
+  ordered queue per language; a `PaceHint` from the host sets each utterance's
+  pace.
+- **`BillingEvent::TtsUsage` gains `language: Option<String>`** (struct literals
+  need the new field; it serializes only when set).
 
 ### Translation as a pipeline stage (0.4.0-dev.14)
 

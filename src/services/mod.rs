@@ -4,6 +4,7 @@
 //! `--no-default-features` build compiles only the providers it asked for. The
 //! submodule declarations carry the same gates; these re-exports mirror them.
 
+pub mod dub;
 pub mod llm;
 pub mod stt;
 pub mod translate;
@@ -47,5 +48,9 @@ pub use tts::{DeepgramTtsConfig, DeepgramTtsHandler};
 pub use tts::piper::{PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler};
 pub use llm::FunctionRegistry;
 pub use translate::{Translated, TranslationProvider, TranslationService, TranslationTargets};
+pub use tts::synth::{Pcm, TtsSynthesizer};
+pub use dub::{DubConfig, DubbingService, PaceHint};
+#[cfg(feature = "tts-sarvam")]
+pub use tts::sarvam_rest::{SarvamRestTts, SarvamRestTtsConfig};
 #[cfg(feature = "translate-sarvam")]
 pub use translate::sarvam::{SarvamTranslateConfig, SarvamTranslateProvider};

@@ -66,6 +66,9 @@ pub enum BillingEvent {
         session_id: Uuid,
         provider: String,
         voice: String,
+        /// The language spoken, when the service knows it (dubbing).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
         char_count: usize,
         occurred_at: DateTime<Utc>,
     },
@@ -173,6 +176,7 @@ mod tests {
             session_id: id(),
             provider: "deepgram".into(),
             voice: "aura-2-helena-en".into(),
+            language: None,
             char_count: 120,
             occurred_at: Utc::now(),
         };
@@ -240,6 +244,7 @@ mod tests {
             BillingEvent::LlmUsage     { session_id: sid, provider: "x".into(), model: "m".into(),
                                           input_tokens: 1, output_tokens: 1, estimated: false, occurred_at: now },
             BillingEvent::TtsUsage     { session_id: sid, provider: "x".into(), voice: "v".into(),
+                                          language: None,
                                           char_count: 1, occurred_at: now },
             BillingEvent::SttUsage     { session_id: sid, provider: "x".into(), audio_duration_ms: 1.0, occurred_at: now },
             BillingEvent::TranslationUsage { session_id: sid, provider: "x".into(), model: "m".into(),

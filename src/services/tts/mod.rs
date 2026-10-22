@@ -10,6 +10,10 @@ pub mod deepgram;
 pub mod piper;
 #[cfg(feature = "tts-sarvam")]
 pub mod sarvam;
+#[cfg(feature = "tts-sarvam")]
+pub mod sarvam_rest;
+/// One-shot synthesis (`TtsSynthesizer`), the shape dubbing needs; always compiled.
+pub mod synth;
 
 #[cfg(feature = "tts-deepgram")]
 pub use deepgram::{DeepgramEncoding, DeepgramTtsConfig, DeepgramTtsHandler};
@@ -17,3 +21,6 @@ pub use deepgram::{DeepgramEncoding, DeepgramTtsConfig, DeepgramTtsHandler};
 pub use piper::{PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler};
 #[cfg(feature = "tts-sarvam")]
 pub use sarvam::{SarvamTtsConfig, SarvamTtsHandler, TtsModelConfig, get_model_config};
+#[cfg(feature = "tts-sarvam")]
+pub use sarvam_rest::{SarvamRestTts, SarvamRestTtsConfig};
+pub use synth::{Pcm, TtsSynthesizer};

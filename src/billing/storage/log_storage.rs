@@ -57,6 +57,7 @@ mod tests {
             BillingEvent::LlmUsage     { session_id: id, provider: "openai".into(), model: "gpt-4o".into(),
                                           input_tokens: 100, output_tokens: 50, estimated: false, occurred_at: now },
             BillingEvent::TtsUsage     { session_id: id, provider: "deepgram".into(), voice: "v".into(),
+                                          language: None,
                                           char_count: 80, occurred_at: now },
             BillingEvent::SttUsage     { session_id: id, provider: "gnani".into(), audio_duration_ms: 1500.0, occurred_at: now },
             BillingEvent::TranslationUsage { session_id: id, provider: "sarvam".into(), model: "sarvam-translate:v1".into(),

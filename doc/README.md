@@ -30,6 +30,7 @@ Read that first if you are adding a provider.
 |---|---|---|---|---|
 | [Deepgram TTS](tts-deepgram.md) | `src/services/tts/deepgram.rs` | `tts-deepgram` ✅ | WebSocket | Aura-2 voices, low latency |
 | [Sarvam TTS](tts-sarvam.md) | `src/services/tts/sarvam.rs` | `tts-sarvam` ❌ | WebSocket | Indian languages, 25+ voices |
+| [Sarvam Bulbul REST + Dubbing](dubbing.md) | `src/services/tts/sarvam_rest.rs`, `src/services/dub/mod.rs` | `tts-sarvam` ❌ (the service needs no feature) | HTTP | One utterance a call with a pace: live dubbing of translations |
 | [Piper TTS](tts-piper.md) | `src/services/tts/piper.rs` | `tts-piper` ❌ | Local ONNX | Zero network, fully local |
 
 ### Large Language Models (LLM)

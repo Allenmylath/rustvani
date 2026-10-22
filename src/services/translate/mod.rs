@@ -365,7 +365,7 @@ mod tests {
     use super::*;
     use crate::billing::NoopBillingCollector;
     use crate::error::PipecatError;
-    use crate::frames::{PassthroughHandler, StartFrameData};
+    use crate::frames::StartFrameData;
     use std::time::Duration;
 
     /// `[from>to] text`; "slow" takes a while; "fail" errors.

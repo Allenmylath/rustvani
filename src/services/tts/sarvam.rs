@@ -685,6 +685,7 @@ async fn handle_tts_message(
                         session_id:  bc.session_id(),
                         provider:    "sarvam".to_string(),
                         voice:       voice.to_string(),
+                        language: None,
                         char_count:  chars,
                         occurred_at: Utc::now(),
                     });

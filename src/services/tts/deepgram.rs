@@ -298,6 +298,7 @@ impl DeepgramTtsHandler {
                     session_id:  bc.session_id(),
                     provider:    "deepgram".to_string(),
                     voice:       self.config.voice.clone(),
+                    language: None,
                     char_count:  chars,
                     occurred_at: Utc::now(),
                 });
@@ -573,6 +574,7 @@ async fn handle_text_message(
                         session_id:  bc.session_id(),
                         provider:    "deepgram".to_string(),
                         voice:       voice.to_string(),
+                        language: None,
                         char_count:  chars,
                         occurred_at: Utc::now(),
                     });
@@ -597,6 +599,7 @@ async fn handle_text_message(
                         session_id:  bc.session_id(),
                         provider:    "deepgram".to_string(),
                         voice:       voice.to_string(),
+                        language: None,
                         char_count:  chars,
                         occurred_at: Utc::now(),
                     });

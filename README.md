@@ -25,7 +25,7 @@ User speaks → VAD → STT → LLM → TTS → User hears
 
 ```toml
 [dependencies]
-rustvani = "0.4.0-dev.14"
+rustvani = "0.4.0-dev.15"
 ```
 
 `0.4.0-dev.*` is a **prerelease**, so Cargo needs the version spelled out — `cargo add rustvani` alone will resolve to the last stable, `0.3.0`. Use:
@@ -58,7 +58,7 @@ rustvani ships a lot of providers, so services are behind Cargo features. **Half
 | `tts-deepgram` | ✅ | `DeepgramTtsHandler` | Aura-2 |
 | `dhara` | ✅ | `DharaManager` | Implies `llm-openai` + `transport-websocket` |
 | `db-postgres` | ✅ | `NeonPostgresTool`, Postgres billing/audio storage | |
-| **`tts-sarvam`** | ❌ | `SarvamTtsHandler` | Bulbul v2/v3 |
+| **`tts-sarvam`** | ❌ | `SarvamTtsHandler`, `SarvamRestTts` | Bulbul v2/v3, streaming and one utterance a call (dubbing); pulls `reqwest` |
 | **`tts-piper`** | ❌ | `PiperTtsHandler` | Local ONNX; runtime needs `espeak-ng` |
 | **`stt-gnani`** | ❌ | `GnaniSttHandler` | Vachana API |
 | **`vaniwebrtc`** | ❌ | `VaniWebRTCTransport` | P2P WebRTC. Large dep tree; needs cmake + a C compiler (MSVC on Windows) for `audiopus`/libopus. |
@@ -67,7 +67,7 @@ A common "Sarvam end to end" setup:
 
 ```toml
 [dependencies]
-rustvani = { version = "0.4.0-dev.14", features = ["tts-sarvam"] }
+rustvani = { version = "0.4.0-dev.15", features = ["tts-sarvam"] }
 ```
 
 ---
@@ -386,7 +386,8 @@ src/
 │   ├── llm/           OpenAI + Sarvam LLM (SSE streaming, function calling)
 │   ├── stt/           Sarvam + 60db + Deepgram + Gnani STT (WebSocket streaming)
 │   ├── translate/     TranslationService + Sarvam Translate (HTTP)
-│   └── tts/           Sarvam + Deepgram TTS (WebSocket) + Piper TTS (local ONNX)
+│   ├── dub/           DubbingService: translations spoken, for live dubbing
+│   └── tts/           Sarvam + Deepgram TTS (WebSocket) + Piper TTS (local ONNX); TtsSynthesizer + Sarvam REST (one-shot)
 ├── tools/             Built-in tools (Neon Postgres with pgvector)
 ├── transport/         WebSocket (axum), P2P WebRTC, base I/O, ChannelTransport
 │   ├── websocket/
@@ -539,6 +540,13 @@ The coordination rule: `emitted_speaking` is an `AtomicBool` shared between clie
 - Billing: `BillingEvent::TranslationUsage` per call, by source characters
 
 → [Sarvam Translate](doc/translate-sarvam.md)
+
+### Dubbing
+- **`DubbingService`** — after the translation stage, speaks every final translation in its language with a `TtsSynthesizer` (one utterance a call, with a voice and a pace) and emits a `DubbedSpeechFrame`: the whole utterance's PCM plus the source transcript's stamp, so a host can play it where the words were said. One ordered queue per language; a `PaceHint` from the host fits speech to the time the words took.
+- **Sarvam Bulbul over REST** (`SarvamRestTts`, bulbul:v3/v2) — the eleven Bulbul languages at up to 48 kHz *(feature `tts-sarvam`)*
+- Billing: `BillingEvent::TtsUsage` per utterance, with the language
+
+→ [Dubbing](doc/dubbing.md)
 
 ### Large Language Models
 - **OpenAI-compatible** API with SSE streaming
@@ -737,6 +745,7 @@ Every service and component has a dedicated guide in [doc/](doc/README.md) — e
 | STT | [Sarvam](doc/stt-sarvam.md) · [Deepgram](doc/stt-deepgram.md) · [60db](doc/stt-60db.md) · [Gnani](doc/stt-gnani.md) |
 | LLM | [OpenAI](doc/llm-openai.md) · [Sarvam](doc/llm-sarvam.md) |
 | Translation | [Sarvam Translate](doc/translate-sarvam.md) |
+| Dubbing | [DubbingService + Sarvam Bulbul REST](doc/dubbing.md) |
 | TTS | [Sarvam](doc/tts-sarvam.md) · [Deepgram](doc/tts-deepgram.md) · [Piper (local)](doc/tts-piper.md) |
 | Transport | [WebSocket + Channel](doc/transport.md) · [WebRTC](doc/vaniwebrtc.md) · [Twilio serializer](doc/serializer-twilio.md) |
 | Tools | [Postgres tool](doc/tools-postgres.md) |

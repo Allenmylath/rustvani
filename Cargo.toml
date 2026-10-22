@@ -1,6 +1,6 @@
 [package]
 name = "rustvani"
-version = "0.4.0-dev.14"
+version = "0.4.0-dev.15"
 edition = "2021"
 license = "BSD-2-Clause"
 description = "Voice AI framework for Rust — real-time speech pipelines with STT, translation, LLM, TTS, and Dhara conversation flows"
@@ -50,7 +50,8 @@ llm-openai = ["dep:reqwest"]
 # WebSocket service and no longer does.
 llm-sarvam = ["dep:reqwest"]
 tts-deepgram = ["dep:tokio-tungstenite"]
-tts-sarvam = ["dep:tokio-tungstenite"]
+# Bulbul streaming (WebSocket) and `SarvamRestTts` (HTTP, one utterance a call).
+tts-sarvam = ["dep:tokio-tungstenite", "dep:reqwest"]
 # Sarvam text translation (HTTP). The `TranslationService` itself and the `TranslationProvider`
 # trait are always compiled; only this backend needs reqwest.
 translate-sarvam = ["dep:reqwest"]

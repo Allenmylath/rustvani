@@ -76,7 +76,7 @@ pub use frames::{
     AudioRawData, ControlFrame, DataFrame, DataFrameData, ErrorFrameData, Frame, FrameDirection,
     FrameHandler, FrameInner, FrameKind, FrameProcessor, FrameProcessorSetup, KeypadEntry,
     PassthroughHandler, ProcessorBusHandle, StartFrameData, SystemFrame, TranscriptionData,
-    TranslationData, FunctionCallData, FunctionCallResultData,
+    TranslationData, DubbedSpeechData, FunctionCallData, FunctionCallResultData,
 };
 pub use context::{shared_context, LLMContext, ToolCall};
 pub use pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask};
@@ -150,3 +150,8 @@ pub use services::{PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler};
 pub use services::{Translated, TranslationProvider, TranslationService, TranslationTargets};
 #[cfg(feature = "translate-sarvam")]
 pub use services::{SarvamTranslateConfig, SarvamTranslateProvider};
+
+// Dubbing: one-shot synthesis trait and the service are always available; Sarvam REST is gated.
+pub use services::{DubConfig, DubbingService, PaceHint, Pcm, TtsSynthesizer};
+#[cfg(feature = "tts-sarvam")]
+pub use services::{SarvamRestTts, SarvamRestTtsConfig};

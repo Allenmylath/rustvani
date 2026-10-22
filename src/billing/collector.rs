@@ -338,6 +338,7 @@ mod tests {
             session_id,
             provider: "deepgram".into(),
             voice: "aura-2-helena-en".into(),
+            language: None,
             char_count: 80,
             occurred_at: Utc::now(),
         });
@@ -423,6 +424,7 @@ mod tests {
                 session_id,
                 provider: "deepgram".into(),
                 voice: "aura-2-helena-en".into(),
+                language: None,
                 char_count: chars,
                 occurred_at: Utc::now(),
             });
@@ -583,7 +585,7 @@ mod tests {
         let now = Utc::now();
         billing.record(BillingEvent::SessionStart  { session_id, started_at: now, metadata: Default::default() });
         billing.record(BillingEvent::LlmUsage      { session_id, provider: "openai".into(), model: "gpt-4o".into(), input_tokens: 10, output_tokens: 5, estimated: false, occurred_at: now });
-        billing.record(BillingEvent::TtsUsage      { session_id, provider: "deepgram".into(), voice: "v".into(), char_count: 50, occurred_at: now });
+        billing.record(BillingEvent::TtsUsage      { session_id, provider: "deepgram".into(), voice: "v".into(), language: None, char_count: 50, occurred_at: now });
         billing.record(BillingEvent::SttUsage      { session_id, provider: "gnani".into(), audio_duration_ms: 1000.0, occurred_at: now });
         billing.record(BillingEvent::SessionEnd    { session_id, ended_at: now, finish_reason: "end".into() });
         drop(billing);

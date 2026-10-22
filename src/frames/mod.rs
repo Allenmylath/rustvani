@@ -61,6 +61,7 @@ pub enum FrameKind {
     Data,
     Transcription,
     Translation,
+    DubbedSpeech,
     LLMText,
     LLMContextFrame,
     // Data — function calling
@@ -236,6 +237,52 @@ pub struct TranslationData {
     pub finalized:       bool,
 }
 
+/// A translation spoken aloud: the whole utterance's audio, from a
+/// [`DubbingService`](crate::services::dub::DubbingService). The source transcript's
+/// `source_text` and `timestamp` are carried so a consumer can place the speech where the words
+/// were said.
+#[derive(Debug, Clone)]
+pub struct DubbedSpeechData {
+    /// The text spoken (the translation).
+    pub text:            String,
+    pub source_text:     String,
+    pub source_language: Option<String>,
+    /// The language spoken, as the target was named.
+    pub target_language: String,
+    pub user_id:         String,
+    /// The source transcript's `timestamp`.
+    pub timestamp:       String,
+    pub voice:           String,
+    /// The pace it was spoken at (1.0 is natural).
+    pub pace:            f32,
+    /// Signed 16-bit little-endian PCM, interleaved when `channels > 1`.
+    pub audio:           bytes::Bytes,
+    pub sample_rate:     u32,
+    pub channels:        u16,
+}
+
+impl DubbedSpeechData {
+    pub fn new(translation: &TranslationData, voice: impl Into<String>, pace: f32, pcm: crate::services::tts::synth::Pcm) -> Self {
+        Self {
+            text:            translation.text.clone(),
+            source_text:     translation.source_text.clone(),
+            source_language: translation.source_language.clone(),
+            target_language: translation.target_language.clone(),
+            user_id:         translation.user_id.clone(),
+            timestamp:       translation.timestamp.clone(),
+            voice:           voice.into(),
+            pace,
+            audio:           pcm.samples,
+            sample_rate:     pcm.rate,
+            channels:        pcm.channels,
+        }
+    }
+
+    pub fn pcm(&self) -> crate::services::tts::synth::Pcm {
+        crate::services::tts::synth::Pcm { samples: self.audio.clone(), rate: self.sample_rate, channels: self.channels }
+    }
+}
+
 impl TranslationData {
     /// A translation of `source` into `target_language`.
     pub fn new(source: &TranscriptionData, target_language: impl Into<String>, text: impl Into<String>) -> Self {
@@ -383,6 +430,7 @@ pub enum DataFrame {
     OutputAudioRaw(AudioRawData),
     Transcription(TranscriptionData),
     Translation(TranslationData),
+    DubbedSpeech(DubbedSpeechData),
     LLMText(String),
     LLMContextFrame(Arc<Mutex<crate::context::LLMContext>>),
     /// Model wants to invoke a tool — downstream observers can show "thinking…"
@@ -461,6 +509,7 @@ impl Frame {
                 DataFrame::OutputAudioRaw(_)           => "OutputAudioRawFrame",
                 DataFrame::Transcription(_)            => "TranscriptionFrame",
                 DataFrame::Translation(_)              => "TranslationFrame",
+                DataFrame::DubbedSpeech(_)             => "DubbedSpeechFrame",
                 DataFrame::LLMText(_)                  => "LLMTextFrame",
                 DataFrame::LLMContextFrame(_)          => "LLMContextFrame",
                 DataFrame::FunctionCallInProgress(_)   => "FunctionCallInProgressFrame",
@@ -515,6 +564,7 @@ impl Frame {
                 DataFrame::OutputAudioRaw(_)           => FrameKind::OutputAudioRaw,
                 DataFrame::Transcription(_)            => FrameKind::Transcription,
                 DataFrame::Translation(_)              => FrameKind::Translation,
+                DataFrame::DubbedSpeech(_)             => FrameKind::DubbedSpeech,
                 DataFrame::LLMText(_)                  => FrameKind::LLMText,
                 DataFrame::LLMContextFrame(_)          => FrameKind::LLMContextFrame,
                 DataFrame::FunctionCallInProgress(_)   => FrameKind::FunctionCallInProgress,
@@ -682,6 +732,9 @@ impl Frame {
     }
     pub fn translation(data: TranslationData) -> Self {
         Self::make(FrameInner::Data(DataFrame::Translation(data)))
+    }
+    pub fn dubbed_speech(data: DubbedSpeechData) -> Self {
+        Self::make(FrameInner::Data(DataFrame::DubbedSpeech(data)))
     }
     pub fn data(content: Vec<u8>) -> Self {
         Self::make(FrameInner::Data(DataFrame::Data(DataFrameData { content, ..Default::default() })))
