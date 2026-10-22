@@ -48,9 +48,11 @@ pub use tts::{DeepgramTtsConfig, DeepgramTtsHandler};
 pub use tts::piper::{PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler};
 pub use llm::FunctionRegistry;
 pub use translate::{Translated, TranslationProvider, TranslationService, TranslationTargets};
-pub use tts::synth::{Pcm, TtsSynthesizer};
-pub use dub::{DubConfig, DubbingService, PaceHint};
+pub use tts::synth::{Pcm, PcmChunks, TtsSynthesizer};
+pub use dub::{DubConfig, DubbingService, PaceHint, SpeechStream};
 #[cfg(feature = "tts-sarvam")]
 pub use tts::sarvam_rest::{SarvamRestTts, SarvamRestTtsConfig};
+#[cfg(feature = "tts-sarvam")]
+pub use tts::sarvam_stream::{SarvamStreamTts, SarvamStreamTtsConfig};
 #[cfg(feature = "translate-sarvam")]
 pub use translate::sarvam::{SarvamTranslateConfig, SarvamTranslateProvider};

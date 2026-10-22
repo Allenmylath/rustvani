@@ -25,7 +25,7 @@ User speaks → VAD → STT → LLM → TTS → User hears
 
 ```toml
 [dependencies]
-rustvani = "0.4.0-dev.17"
+rustvani = "0.4.0-dev.18"
 ```
 
 `0.4.0-dev.*` is a **prerelease**, so Cargo needs the version spelled out — `cargo add rustvani` alone will resolve to the last stable, `0.3.0`. Use:
@@ -67,7 +67,7 @@ A common "Sarvam end to end" setup:
 
 ```toml
 [dependencies]
-rustvani = { version = "0.4.0-dev.17", features = ["tts-sarvam"] }
+rustvani = { version = "0.4.0-dev.18", features = ["tts-sarvam"] }
 ```
 
 ---
@@ -546,7 +546,7 @@ The coordination rule: `emitted_speaking` is an `AtomicBool` shared between clie
 
 ### Dubbing
 - **`DubbingService`** — after the translation stage, speaks every final translation in its language with a `TtsSynthesizer` (one utterance a call, with a voice and a pace) and emits a `DubbedSpeechFrame`: the whole utterance's PCM plus the source transcript's stamp, so a host can play it where the words were said. One ordered queue per language; a `PaceHint` from the host fits speech to the time the words took.
-- **Sarvam Bulbul over REST** (`SarvamRestTts`, bulbul:v3/v2) — the eleven Bulbul languages at up to 48 kHz *(feature `tts-sarvam`)*
+- **Sarvam Bulbul over REST** (`SarvamRestTts`, bulbul:v3) — the eleven Bulbul languages at up to 48 kHz; or **streaming** (`SarvamStreamTts`, one WebSocket per language kept open, 24 kHz): the frame goes out on the first chunk of audio and the rest follows on its `SpeechStream` *(feature `tts-sarvam`)*
 - Billing: `BillingEvent::TtsUsage` per utterance, with the language
 
 → [Dubbing](doc/dubbing.md)

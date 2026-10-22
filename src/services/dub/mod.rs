@@ -14,9 +14,18 @@
 //!
 //! The pace of each utterance comes from a [`PaceHint`] the host supplies (a dubbing host that
 //! fits speech into the time the original took), clamped to the provider's range.
+//!
+//! With a synthesizer that streams ([`TtsSynthesizer::streams`]), the frame goes out as soon as
+//! the first chunk of audio is there, carrying that chunk, and the rest follows on the frame's
+//! [`SpeechStream`]; a host can start playing a few hundred milliseconds after the text instead
+//! of after the whole utterance.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use tokio::sync::Notify;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -33,6 +42,69 @@ use crate::services::tts::synth::TtsSynthesizer;
 
 /// Decides the pace of an utterance (1.0 is natural); the service clamps it to the provider's range.
 pub type PaceHint = Arc<dyn Fn(&TranslationData) -> f32 + Send + Sync>;
+
+/// The rest of a streamed utterance's audio, after the first chunk on its frame: chunks of PCM
+/// in the frame's format, appended as they arrive, until [`finish`](Self::finish) (or
+/// [`fail`](Self::fail), after which nothing more comes).
+#[derive(Debug, Default)]
+pub struct SpeechStream {
+    chunks: Mutex<VecDeque<Bytes>>,
+    done: AtomicBool,
+    failed: AtomicBool,
+    notify: Notify,
+}
+
+impl SpeechStream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&self, chunk: Bytes) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.chunks.lock().unwrap().push_back(chunk);
+        self.notify.notify_waiters();
+    }
+
+    pub fn finish(&self) {
+        self.done.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Ended early: the synthesis failed part way.
+    pub fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.finish();
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// The next chunk, waiting for it; `None` once the utterance is over.
+    pub async fn next(&self) -> Option<Bytes> {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(chunk) = self.chunks.lock().unwrap().pop_front() {
+                return Some(chunk);
+            }
+            if self.is_done() {
+                return None;
+            }
+            notified.await;
+        }
+    }
+
+    /// Bytes waiting to be taken.
+    pub fn buffered(&self) -> usize {
+        self.chunks.lock().unwrap().iter().map(Bytes::len).sum()
+    }
+}
 
 #[derive(Clone)]
 pub struct DubConfig {
@@ -124,19 +196,63 @@ impl DubbingService {
             while let Some(translation) = translations.recv().await {
                 let pace = pace_hint(&translation).clamp(pace_min, pace_max);
                 let text = translation.text.trim();
+                let bill = |billing: &Option<Arc<dyn BillingCollector>>| {
+                    if let Some(bc) = billing {
+                        bc.record(BillingEvent::TtsUsage {
+                            session_id: bc.session_id(),
+                            provider: synth.name().to_string(),
+                            voice: voice.clone(),
+                            language: Some(lang.clone()),
+                            char_count: text.chars().count(),
+                            occurred_at: Utc::now(),
+                        });
+                    }
+                };
+                if synth.streams() {
+                    let mut chunks = match synth.synthesize_streaming(text, &lang, &voice, pace, sample_rate).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            log::warn!("Dubbing ({lang}): {e}");
+                            continue;
+                        }
+                    };
+                    // The frame goes out with the first chunk; the rest follows on its stream.
+                    let first = loop {
+                        match chunks.chunks.recv().await {
+                            Some(Ok(b)) if b.is_empty() => continue,
+                            Some(Ok(b)) => break Some(b),
+                            Some(Err(e)) => {
+                                log::warn!("Dubbing ({lang}): {e}");
+                                break None;
+                            }
+                            None => break None,
+                        }
+                    };
+                    let Some(first) = first else { continue };
+                    bill(&billing);
+                    let stream = Arc::new(SpeechStream::new());
+                    let pcm = crate::services::tts::synth::Pcm { samples: first, rate: chunks.rate, channels: chunks.channels };
+                    let data = DubbedSpeechData::new(&translation, &voice, pace, pcm).with_stream(Arc::clone(&stream));
+                    if let Err(e) = processor.push_frame(Frame::dubbed_speech(data), FrameDirection::Downstream).await {
+                        log::warn!("Dubbing: could not push dubbed speech ({lang}): {e}");
+                    }
+                    while let Some(chunk) = chunks.chunks.recv().await {
+                        match chunk {
+                            Ok(b) => stream.push(b),
+                            Err(e) => {
+                                log::warn!("Dubbing ({lang}): {e}");
+                                stream.fail();
+                                break;
+                            }
+                        }
+                    }
+                    stream.finish();
+                    continue;
+                }
                 match synth.synthesize(text, &lang, &voice, pace, sample_rate).await {
                     Ok(pcm) if pcm.samples.is_empty() => {}
                     Ok(pcm) => {
-                        if let Some(bc) = &billing {
-                            bc.record(BillingEvent::TtsUsage {
-                                session_id: bc.session_id(),
-                                provider: synth.name().to_string(),
-                                voice: voice.clone(),
-                                language: Some(lang.clone()),
-                                char_count: text.chars().count(),
-                                occurred_at: Utc::now(),
-                            });
-                        }
+                        bill(&billing);
                         let data = DubbedSpeechData::new(&translation, &voice, pace, pcm);
                         if let Err(e) = processor.push_frame(Frame::dubbed_speech(data), FrameDirection::Downstream).await {
                             log::warn!("Dubbing: could not push dubbed speech ({lang}): {e}");
@@ -176,6 +292,54 @@ mod tests {
     use crate::services::tts::synth::Pcm;
     use bytes::Bytes;
     use std::time::Duration;
+
+    /// Like `Tone`, in three chunks a while apart.
+    struct Trickle;
+
+    #[async_trait]
+    impl TtsSynthesizer for Trickle {
+        fn name(&self) -> &'static str { "trickle" }
+        fn model(&self) -> String { "trickle:v1".into() }
+        fn supports(&self, _lang: &str) -> bool { true }
+        fn streams(&self) -> bool { true }
+        async fn synthesize(&self, text: &str, _lang: &str, _voice: &str, _pace: f32, rate: u32) -> Result<Pcm> {
+            Ok(Pcm { samples: Bytes::from(vec![0u8; text.len() * 2]), rate, channels: 1 })
+        }
+        async fn synthesize_streaming(&self, text: &str, _lang: &str, _voice: &str, _pace: f32, rate: u32) -> Result<crate::services::tts::synth::PcmChunks> {
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            let n = text.len();
+            tokio::spawn(async move {
+                for i in 1..=3u8 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let _ = tx.send(Ok(Bytes::from(vec![i; n * 2]))).await;
+                }
+            });
+            Ok(crate::services::tts::synth::PcmChunks { rate, channels: 1, chunks: rx })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streaming_voice_sends_the_frame_on_the_first_chunk_and_the_rest_after() {
+        let service = DubbingService::new(Arc::new(Trickle), TranslationTargets::new(["hi"]), DubConfig::default());
+        let proc = FrameProcessor::new("dub-test", Box::new(service), true);
+        proc.process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream).await.unwrap();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let seen = out.clone();
+        proc.on_before_push_frame(move |frame| {
+            if let FrameInner::Data(DataFrame::DubbedSpeech(d)) = &frame.inner {
+                seen.lock().unwrap().push(d.clone());
+            }
+        });
+        proc.process_frame(Frame::translation(translation("abcd", "hi", "1")), FrameDirection::Downstream).await.unwrap();
+        let got = wait_for(&out, 1).await;
+        let d = &got[0];
+        assert_eq!(&d.audio[..], &[1u8; 8], "the first chunk rides the frame");
+        let stream = d.stream.clone().expect("the rest streams");
+        assert_eq!(stream.next().await.unwrap(), Bytes::from(vec![2u8; 8]));
+        assert_eq!(stream.next().await.unwrap(), Bytes::from(vec![3u8; 8]));
+        assert!(stream.next().await.is_none(), "and ends");
+        assert!(stream.is_done() && !stream.failed());
+    }
 
     /// 0.1 s of audio per character at pace 1; "slow" takes a while; "fail" errors; no Urdu.
     struct Tone;

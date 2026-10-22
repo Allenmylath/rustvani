@@ -12,6 +12,8 @@ pub mod piper;
 pub mod sarvam;
 #[cfg(feature = "tts-sarvam")]
 pub mod sarvam_rest;
+#[cfg(feature = "tts-sarvam")]
+pub mod sarvam_stream;
 /// One-shot synthesis (`TtsSynthesizer`), the shape dubbing needs; always compiled.
 pub mod synth;
 
@@ -23,4 +25,6 @@ pub use piper::{PiperModel, PiperQuality, PiperTtsConfig, PiperTtsHandler};
 pub use sarvam::{SarvamTtsConfig, SarvamTtsHandler, TtsModelConfig, get_model_config};
 #[cfg(feature = "tts-sarvam")]
 pub use sarvam_rest::{SarvamRestTts, SarvamRestTtsConfig};
-pub use synth::{Pcm, TtsSynthesizer};
+#[cfg(feature = "tts-sarvam")]
+pub use sarvam_stream::{SarvamStreamTts, SarvamStreamTtsConfig};
+pub use synth::{Pcm, PcmChunks, TtsSynthesizer};

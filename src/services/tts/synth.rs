@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::sync::mpsc;
 
 use crate::error::Result;
 
@@ -27,6 +28,15 @@ impl Pcm {
     pub fn duration_secs(&self) -> f64 {
         self.frames() as f64 / self.rate.max(1) as f64
     }
+}
+
+/// An utterance's audio as it is synthesized: chunks of PCM (s16le, `channels` interleaved) at
+/// `rate`, the first one sooner than the whole; the channel ends with the utterance, an `Err`
+/// ends it early.
+pub struct PcmChunks {
+    pub rate: u32,
+    pub channels: u16,
+    pub chunks: mpsc::Receiver<Result<Bytes>>,
 }
 
 /// A text-to-speech backend that synthesizes one utterance at a time.
@@ -52,4 +62,20 @@ pub trait TtsSynthesizer: Send + Sync + 'static {
     /// Speaks `text` in `lang` with `voice` (the provider's default when empty) at `pace`
     /// (clamped to [`pace_range`](Self::pace_range)), at `sample_rate` Hz if the provider can.
     async fn synthesize(&self, text: &str, lang: &str, voice: &str, pace: f32, sample_rate: u32) -> Result<Pcm>;
+
+    /// Whether [`synthesize_streaming`](Self::synthesize_streaming) yields audio before the whole
+    /// utterance is made (else it is [`synthesize`](Self::synthesize) in one chunk).
+    fn streams(&self) -> bool {
+        false
+    }
+
+    /// Like [`synthesize`](Self::synthesize), the audio arriving as it is made.
+    async fn synthesize_streaming(&self, text: &str, lang: &str, voice: &str, pace: f32, sample_rate: u32) -> Result<PcmChunks> {
+        let pcm = self.synthesize(text, lang, voice, pace, sample_rate).await?;
+        let (tx, rx) = mpsc::channel(1);
+        if !pcm.samples.is_empty() {
+            let _ = tx.try_send(Ok(pcm.samples));
+        }
+        Ok(PcmChunks { rate: pcm.rate, channels: pcm.channels, chunks: rx })
+    }
 }

@@ -255,10 +255,13 @@ pub struct DubbedSpeechData {
     pub voice:           String,
     /// The pace it was spoken at (1.0 is natural).
     pub pace:            f32,
-    /// Signed 16-bit little-endian PCM, interleaved when `channels > 1`.
+    /// Signed 16-bit little-endian PCM, interleaved when `channels > 1`: the whole utterance, or
+    /// its first chunk when `stream` carries the rest.
     pub audio:           bytes::Bytes,
     pub sample_rate:     u32,
     pub channels:        u16,
+    /// The rest of the audio as it is synthesized, from a streaming voice.
+    pub stream:          Option<std::sync::Arc<crate::services::dub::SpeechStream>>,
 }
 
 impl DubbedSpeechData {
@@ -275,7 +278,14 @@ impl DubbedSpeechData {
             audio:           pcm.samples,
             sample_rate:     pcm.rate,
             channels:        pcm.channels,
+            stream:          None,
         }
+    }
+
+    /// The rest of the audio follows on `stream`.
+    pub fn with_stream(mut self, stream: std::sync::Arc<crate::services::dub::SpeechStream>) -> Self {
+        self.stream = Some(stream);
+        self
     }
 
     pub fn pcm(&self) -> crate::services::tts::synth::Pcm {

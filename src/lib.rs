@@ -153,6 +153,6 @@ pub use services::{Translated, TranslationProvider, TranslationService, Translat
 pub use services::{SarvamTranslateConfig, SarvamTranslateProvider};
 
 // Dubbing: one-shot synthesis trait and the service are always available; Sarvam REST is gated.
-pub use services::{DubConfig, DubbingService, PaceHint, Pcm, TtsSynthesizer};
+pub use services::{DubConfig, DubbingService, PaceHint, Pcm, PcmChunks, SpeechStream, TtsSynthesizer};
 #[cfg(feature = "tts-sarvam")]
-pub use services::{SarvamRestTts, SarvamRestTtsConfig};
+pub use services::{SarvamRestTts, SarvamRestTtsConfig, SarvamStreamTts, SarvamStreamTtsConfig};

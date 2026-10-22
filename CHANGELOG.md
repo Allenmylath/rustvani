@@ -2,7 +2,7 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.17"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.18"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
 
 ### Dubbing: translations spoken aloud (0.4.0-dev.15)
@@ -22,6 +22,20 @@ since Cargo will not resolve a prerelease from a plain version requirement.
   pace.
 - **`BillingEvent::TtsUsage` gains `language: Option<String>`** (struct literals
   need the new field; it serializes only when set).
+
+### Streaming dubbing (0.4.0-dev.18)
+
+- **`TtsSynthesizer::synthesize_streaming`** (default: the whole utterance as one
+  chunk) and **`streams()`**; `PcmChunks` is the audio as it is made.
+- **`SarvamStreamTts`** (feature `tts-sarvam`): Bulbul over its streaming
+  WebSocket, one connection per (language, voice) kept open and reused,
+  utterances one after another on it (`config` when the pace changes, `text`,
+  `flush`, audio until the final event), 24 kHz. A connection the server closed
+  is reopened on the next utterance.
+- **`DubbingService` streams**: with a streaming voice the `DubbedSpeechFrame`
+  goes out as soon as the first chunk is there, carrying it, and the rest
+  follows on **`DubbedSpeechData::stream`** (`SpeechStream`: `next().await`,
+  `finish`, `fail`).
 
 ### Sentences out of partial transcripts (0.4.0-dev.17)
 
