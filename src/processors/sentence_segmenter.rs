@@ -99,8 +99,8 @@ impl SentenceSegmenter {
         let mut last = None;
         while from < rest.len() {
             let Some(end) = find_sentence_end(&rest[from..]) else { break };
-            let punctuation = from + end;
-            let after = punctuation + rest[punctuation..].chars().next().map_or(1, char::len_utf8);
+            // `end` is the last byte of the closing character (all three of a danda's), not its start.
+            let after = from + end + 1;
             let sentence = rest[..after].trim();
             let tail = rest[after..].trim();
             if tail.chars().count() >= self.config.min_tail_chars
@@ -292,6 +292,18 @@ mod tests {
         assert_eq!(got[2], ("Boats".to_string(), false, false));
         assert_eq!(got[3], ("Boats return now".to_string(), false, false));
         assert_eq!(got[4], ("Both return now.".to_string(), false, false), "revised to 'Hi,': the finalised words are still skipped");
+    }
+
+    /// A danda (`।`, three bytes) ends a Hindi sentence: the cut goes after the whole of it
+    /// (0.4.0-dev.19 cut two bytes into it and panicked, poisoning the segmenter's lock).
+    #[tokio::test]
+    async fn a_danda_ends_a_sentence_without_cutting_into_it() {
+        let (proc, out) = harness().await;
+        for p in ["।", "बहुत अच्छा है।", "बहुत अच्छा है। अगला", "बहुत अच्छा है। अगला वाक्य"] {
+            proc.process_frame(partial(p), FrameDirection::Downstream).await.unwrap();
+        }
+        let got = out.lock().unwrap().clone();
+        assert!(got.iter().any(|(t, fin, _)| *fin && t == "बहुत अच्छा है।"), "{got:?}");
     }
 
     #[test]

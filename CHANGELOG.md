@@ -2,8 +2,17 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.19"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.20"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Fix: a danda ends a sentence whole (0.4.0-dev.20)
+
+- `SentenceSegmenter` cut a sentence two bytes into its closing danda (`।`, three bytes):
+  `find_sentence_end` returns the closing character's *last* byte and the segmenter took it
+  for the first. A period is one byte, so only Devanagari hit it, and it panicked and
+  poisoned the segmenter's lock, stopping the run's captions. Measured on FLEURS Hindi
+  read speech, captions with sentence segments went from 88% character errors to the 5% they
+  get without.
 
 ### Fixes: Indic sentences, hush-vani on live audio, pass-through billing (0.4.0-dev.19)
 

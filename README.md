@@ -50,26 +50,26 @@ Live captions, translation and dubbing
 
 ```toml
 [dependencies]
-rustvani = "0.4.0-dev.19"
+rustvani = "0.4.0-dev.20"
 ```
 
 `0.4.0-dev.*` is a **prerelease**, so Cargo needs the version spelled out: a plain `cargo add rustvani` resolves to the last stable release, `0.3.0`, which has none of the STT core, translation, dubbing, WebRTC, Twilio or agent-swarm work described here. Use:
 
 ```bash
-cargo add rustvani@0.4.0-dev.19
+cargo add rustvani@0.4.0-dev.20
 ```
 
-Everything in this README describes `0.4.0-dev.19`. The [CHANGELOG](CHANGELOG.md) lists what each `dev.N` added.
+Everything in this README describes `0.4.0-dev.20`. The [CHANGELOG](CHANGELOG.md) lists what each `dev.N` added.
 
 Two common manifests:
 
 ```toml
 # A Sarvam voice agent (Sarvam TTS is opt-in).
-rustvani = { version = "0.4.0-dev.19", features = ["tts-sarvam"] }
+rustvani = { version = "0.4.0-dev.20", features = ["tts-sarvam"] }
 
 # A captioning / dubbing service that wants a small dependency tree:
 # no ONNX Runtime, no Postgres, no OpenAI client.
-rustvani = { version = "0.4.0-dev.19", default-features = false,
+rustvani = { version = "0.4.0-dev.20", default-features = false,
              features = ["transport-websocket", "stt-sarvam", "translate-sarvam", "tts-sarvam"] }
 ```
 
