@@ -51,14 +51,27 @@ pub const ABBREVIATIONS: &[&str] = &[
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Whether `c` belongs to a word. Indic vowel signs and viramas (`ा`, `്`) are combining marks,
+/// not alphanumeric, but they are inside words: any non-ASCII character that is neither
+/// whitespace nor punctuation counts.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || (!c.is_ascii()
+            && !c.is_whitespace()
+            && !matches!(c, '।' | '॥' | '…' | '“' | '”' | '‘' | '’' | '—' | '–' | '«' | '»'))
+}
+
 /// Extract the word immediately before byte position `pos` in `text`.
 fn word_before(text: &str, pos: usize) -> &str {
     let before = &text[..pos];
-    let end = before.trim_end_matches(|c: char| !c.is_alphanumeric()).len();
+    let end = before.trim_end_matches(|c: char| !is_word_char(c)).len();
     let slice = &before[..end];
+    // Past the character that ends the previous word: its length, not 1 (it may be multi-byte).
     let start = slice
-        .rfind(|c: char| !c.is_alphanumeric() && c != '\'')
-        .map(|i| i + 1)
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| !is_word_char(c) && c != '\'')
+        .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0);
     &slice[start..]
 }
@@ -211,7 +224,12 @@ pub fn find_sentence_end(text: &str) -> Option<usize> {
 /// Passes full `text` to `is_abbreviation_dot` so words straddling the cutoff
 /// are identified correctly.
 pub fn find_sentence_boundary_before(text: &str, max_len: usize) -> Option<usize> {
-    let search = &text[..max_len.min(text.len())];
+    // Down to a character boundary: a byte limit can fall inside a multi-byte character.
+    let mut cut = max_len.min(text.len());
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let search = &text[..cut];
     let bytes  = search.as_bytes();
     let mut last: Option<usize> = None;
     let mut i = 0;
@@ -577,5 +595,20 @@ mod tests {
         let text = "नमस्ते। अगला।";
         let pos = find_sentence_boundary_before(text, 25).unwrap();
         assert!(text[..pos].ends_with('।'));
+    }
+
+    /// Indic words end in combining marks (vowel signs, virama), which are not alphanumeric:
+    /// finding the word before a period must not cut into them (it panicked in 0.4.0-dev.18).
+    #[test]
+    fn indic_words_before_a_period_do_not_panic() {
+        for text in ["ഇത് ഒരു പരീക്ഷണമാണ്. അടുത്തത്", "यह एक परीक्षा है. अगला", "नमस्ते दुनिया. Next", "ശരി. ok"] {
+            let _ = find_sentence_end(text);
+            for max in 0..=text.len() + 2 {
+                let _ = find_sentence_boundary_before(text, max);
+            }
+        }
+        assert_eq!(word_before("ഇത് ഒരു പരീക്ഷണമാണ്.", "ഇത് ഒരു പരീക്ഷണമാണ്".len()), "പരീക്ഷണമാണ്");
+        assert_eq!(word_before("यह है.", "यह है".len()), "है");
+        assert_eq!(word_before("Dr. Rao", 2), "Dr");
     }
 }

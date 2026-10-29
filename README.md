@@ -50,26 +50,26 @@ Live captions, translation and dubbing
 
 ```toml
 [dependencies]
-rustvani = "0.4.0-dev.18"
+rustvani = "0.4.0-dev.19"
 ```
 
 `0.4.0-dev.*` is a **prerelease**, so Cargo needs the version spelled out: a plain `cargo add rustvani` resolves to the last stable release, `0.3.0`, which has none of the STT core, translation, dubbing, WebRTC, Twilio or agent-swarm work described here. Use:
 
 ```bash
-cargo add rustvani@0.4.0-dev.18
+cargo add rustvani@0.4.0-dev.19
 ```
 
-Everything in this README describes `0.4.0-dev.18`. The [CHANGELOG](CHANGELOG.md) lists what each `dev.N` added.
+Everything in this README describes `0.4.0-dev.19`. The [CHANGELOG](CHANGELOG.md) lists what each `dev.N` added.
 
 Two common manifests:
 
 ```toml
 # A Sarvam voice agent (Sarvam TTS is opt-in).
-rustvani = { version = "0.4.0-dev.18", features = ["tts-sarvam"] }
+rustvani = { version = "0.4.0-dev.19", features = ["tts-sarvam"] }
 
 # A captioning / dubbing service that wants a small dependency tree:
 # no ONNX Runtime, no Postgres, no OpenAI client.
-rustvani = { version = "0.4.0-dev.18", default-features = false,
+rustvani = { version = "0.4.0-dev.19", default-features = false,
              features = ["transport-websocket", "stt-sarvam", "translate-sarvam", "tts-sarvam"] }
 ```
 
@@ -553,12 +553,12 @@ Both backends implement the `StreamingDenoiser` trait (`filter` / `flush` / `res
 | | `NoiseBackend::Rnnoise` *(default)* | `NoiseBackend::HushVani` |
 |---|---|---|
 | Model | RNNoise (`nnnoiseless`) | DeepFilterNet3-style (`hush-vani`) |
-| Nature | True streaming, 10 ms frames | Batch API, wrapped in a sliding window |
+| Nature | True streaming, 10 ms frames | True streaming, 10 ms frames (`HushStream`) |
 | Suppression | Good | Stronger, especially on non-stationary noise |
 | Added latency | ~10 ms (one frame) | ~10 ms (160 samples held back per call) |
 | Native rate | 48 kHz (resampled in/out) | 16 kHz (resampled in/out) |
 
-**How hush-vani is made streaming.** `hush-vani` only exposes a batch `enhance()` whose GRUs start from zero on every call: feed it 20 ms chunks and you get 20 ms of cold-start artefacts, every chunk. rustvani wraps it in a sliding window instead: each call re-runs `enhance` over **200 ms of prior audio plus the new samples**, which re-primes the GRUs to roughly the state a true streaming decode would hold. The context region of the output is discarded and only the new samples are emitted. Because `enhance` lags its input by 160 samples, the last frame of each call is held back and drained in `flush()` at end of utterance. Re-computing the context every call is affordable: `hush-vani` runs at roughly 100× real time. An init failure logs and falls back to RNNoise rather than failing the pipeline.
+**How hush-vani streams.** rustvani runs hush-vani's `HushStream`: one 10 ms frame at a time, with the model's GRUs and STFT normalisation carried from frame to frame, so the output matches a batch `enhance()` over the same audio. The 160-sample lag is dropped at the start of each utterance, so `filter` + `flush` give back exactly the input's length, lined up with it; `reset()` between utterances keeps the model's state, so each utterance does not pay the normalisation's 1 s settling again. An init failure logs and falls back to RNNoise rather than failing the pipeline.
 
 `hush-vani` is a regular dependency; there is no feature flag, just set `noise_backend`. The pieces (`RNNoiseFilter`, `HushVaniFilter`, `AudioEnhancer`, `StreamResampler`) are also usable standalone, and the AGC is tunable via `AgcConfig` (target level, max gain, attack and release, noise gate, limiter knee). The adapted gain is kept across utterances, so the same speaker is not re-learned from scratch every sentence.
 

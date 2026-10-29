@@ -2,8 +2,28 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.18"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.19"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Fixes: Indic sentences, hush-vani on live audio, pass-through billing (0.4.0-dev.19)
+
+- **The sentence splitter no longer panics on Indic text.** Finding the word before a
+  period stepped one byte past the last non-alphanumeric character, which inside Malayalam
+  or Hindi is a 3-byte vowel sign or virama (`്`, `ा`): a slice into the middle of it. A
+  `SentenceSegmenter` hitting it poisoned its lock and the run's captions stopped. Combining
+  marks now count as word characters, the step is the character's length, and
+  `find_sentence_boundary_before` rounds its byte limit down to a character boundary.
+- **`NoiseBackend::HushVani` streams for real**, on hush-vani 0.1.2's `HushStream`: the
+  model's GRUs and STFT normalisation carry from frame to frame. The old wrapper re-ran the
+  batch `enhance` over a 200 ms lookback per chunk, restarting a normalisation with a 1 s
+  time constant every time, so the model saw unsettled features and suppressed speech:
+  transcripts went missing after two or three utterances. `reset()` between utterances now
+  keeps the model's state (only the alignment restarts), so each utterance does not pay
+  that settling again. `filter`/`flush` stay length-preserving and aligned.
+- **A transcript already in a target language is not billed as a translation.** It is
+  passed through as its own translation with no provider call, and now records no
+  `TranslationUsage`.
+- Requires `hush-vani = "0.1.2"`.
 
 ### Dubbing: translations spoken aloud (0.4.0-dev.15)
 

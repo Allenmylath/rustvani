@@ -1,39 +1,27 @@
 //! DeepFilterNet3-style noise suppression via the `hush-vani` crate.
 //!
-//! `hush-vani` exposes a **batch** API: [`Hush::enhance`] processes a whole
-//! signal and its GRUs start from zero on every call (no streaming API is
-//! exposed by the crate). To use it on the live STT stream — where audio
-//! arrives in ~20 ms chunks and is forwarded to Sarvam incrementally — this
-//! wrapper runs a **sliding window with lookback context**:
+//! [`hush_vani::HushStream`] runs the model one 10 ms frame at a time with its GRUs and its
+//! STFT normalisation carried from frame to frame, matching a batch `Hush::enhance` over the same
+//! audio. (Until 0.4.0-dev.19 this wrapper re-ran the batch `enhance` over a 200 ms lookback
+//! window per chunk. Each call restarted the spectral normalisation, whose time constant is
+//! 1 s, so the model never saw settled features and suppressed speech as noise: transcripts
+//! went missing after the first few utterances.)
 //!
-//! * All input for the current utterance is buffered at 16 kHz (`hush-vani`'s
-//!   native rate). On each [`filter`](HushVaniFilter::filter) call we re-run
-//!   `enhance` over a window that includes up to [`CONTEXT_SAMPLES`] of *prior*
-//!   audio plus the newly-arrived audio.
-//! * The context region re-primes the GRUs to roughly the state they'd hold in
-//!   a true streaming decode, so the new region is enhanced with real context.
-//!   The context region of the output is discarded; only the new samples are
-//!   emitted. Re-computing the context each call is cheap (`hush-vani` runs at
-//!   ~100× real-time).
+//! The stream's output lags its input by `Hush::LATENCY_SAMPLES` (160 samples, 10 ms); this
+//! wrapper removes the lag, so over an utterance (`filter` calls, then `flush`) the output is the
+//! input's length and lines up with it. `flush` drains the lag with zero padding.
 //!
-//! `enhance` returns `len / 160 * 160` samples that **lag the input by
-//! `LATENCY_SAMPLES` (160)**. So for an absolute input index `m` inside a window
-//! starting at absolute index `win_start`:
-//!
-//! ```text
-//! clean(input[m]) == out[m - win_start + LATENCY]
-//! ```
-//!
-//! We therefore hold back the last frame of each call (its lagged output isn't
-//! available yet) and drain it in [`flush`](HushVaniFilter::flush) via zero
-//! padding. Across an utterance total output length ≈ total input length.
+//! [`reset`](HushVaniFilter::reset) between utterances restarts that bookkeeping but keeps the
+//! model's state: the same speaker in the same room continues, and a cold start would cost the
+//! next utterance its first second while the normalisation settles again.
 //!
 //! Sample rates other than 16 kHz are resampled transparently in/out using
-//! [`StreamResampler`](super::resamplers::StreamResampler). Samples are
-//! normalised to `f32` in `[-1, 1]` for `hush-vani` and denormalised back to
-//! i16 on the way out.
+//! [`StreamResampler`](super::resamplers::StreamResampler). Samples are normalised to `f32` in
+//! `[-1, 1]` for `hush-vani` and denormalised back to i16 on the way out.
 
-use hush_vani::Hush;
+use std::sync::Arc;
+
+use hush_vani::{Hush, HushStream};
 use log;
 
 use super::resamplers::{ResamplerQuality, StreamResampler};
@@ -42,35 +30,29 @@ use super::resamplers::{ResamplerQuality, StreamResampler};
 const HUSH_SAMPLE_RATE: u32 = 16_000;
 
 /// Samples per 10 ms frame at 16 kHz (`hush-vani`'s frame unit).
-const FRAME: usize = 160;
+const FRAME: usize = Hush::FRAME_SAMPLES;
 
-/// Algorithmic latency of `enhance` (documented as `LATENCY_SAMPLES` = 160).
-const LATENCY: usize = 160;
-
-/// Lookback context re-fed each call to re-prime the GRUs (200 ms). Must be a
-/// multiple of [`FRAME`].
-const CONTEXT_SAMPLES: usize = 20 * FRAME;
+/// The stream's output lag, in samples.
+const LATENCY: usize = Hush::LATENCY_SAMPLES;
 
 // ---------------------------------------------------------------------------
 // HushVaniFilter
 // ---------------------------------------------------------------------------
 
-/// Streaming adapter around the batch `hush-vani` denoiser.
+/// Streaming `hush-vani` denoiser.
 ///
 /// Accepts PCM i16 at any sample rate (resampled to 16 kHz internally) and
 /// exposes the same streaming shape as
 /// [`RNNoiseFilter`](super::noisefilter::RNNoiseFilter):
 /// `filter` / `flush` / `reset`.
 pub struct HushVaniFilter {
-    hush: Hush,
+    stream: HushStream,
     sample_rate: u32,
-    /// Utterance audio at 16 kHz, normalised to `[-1, 1]`. Element 0 is at
-    /// absolute index [`Self::base`]; the front is trimmed as it is consumed.
-    input16k: Vec<f32>,
-    /// Absolute index (in 16 kHz samples since the last reset) of `input16k[0]`.
-    base: usize,
-    /// Absolute index up to which output has already been emitted.
+    /// 16 kHz samples fed in this utterance, and given out (aligned, lag removed).
+    fed: usize,
     emitted: usize,
+    /// Output samples still to drop at the start of the utterance: the lag.
+    skip: usize,
     resampler_in: Option<StreamResampler>,
     resampler_out: Option<StreamResampler>,
 }
@@ -81,7 +63,7 @@ impl HushVaniFilter {
     /// Loads the embedded `hush-vani` weights (no files/network). Returns an
     /// error only if the model fails to initialise.
     pub fn new(sample_rate: u32) -> Result<Self, hush_vani::Error> {
-        let hush = Hush::new()?;
+        let stream = HushStream::new(Arc::new(Hush::new()?));
 
         let (resampler_in, resampler_out) = if sample_rate != HUSH_SAMPLE_RATE {
             log::info!(
@@ -106,24 +88,34 @@ impl HushVaniFilter {
         };
 
         Ok(Self {
-            hush,
+            stream,
             sample_rate,
-            input16k: Vec::with_capacity(CONTEXT_SAMPLES + FRAME * 8),
-            base: 0,
+            fed: 0,
             emitted: 0,
+            skip: LATENCY,
             resampler_in,
             resampler_out,
         })
     }
 
-    /// Convert incoming i16 → normalised f32 and resample to 16 kHz.
-    fn ingest(&mut self, audio: &[i16]) {
+    /// Convert incoming i16 → normalised f32 at 16 kHz.
+    fn ingest(&mut self, audio: &[i16]) -> Vec<f32> {
         let norm: Vec<f32> = audio.iter().map(|&s| s as f32 / 32_768.0).collect();
-        let at_16k = match self.resampler_in {
+        match self.resampler_in {
             Some(ref mut r) => r.process(&norm),
             None => norm,
-        };
-        self.input16k.extend_from_slice(&at_16k);
+        }
+    }
+
+    /// Run 16 kHz audio through the model; returns the aligned output it completes.
+    fn enhance(&mut self, at_16k: &[f32]) -> Vec<f32> {
+        self.fed += at_16k.len();
+        let mut out = self.stream.process(at_16k);
+        let drop = self.skip.min(out.len());
+        out.drain(..drop);
+        self.skip -= drop;
+        self.emitted += out.len();
+        out
     }
 
     /// Resample a 16 kHz normalised block back to the source rate and clamp to
@@ -144,126 +136,60 @@ impl HushVaniFilter {
 
     /// Denoise a chunk of PCM i16 audio.
     ///
-    /// Returns the newly-finalised denoised samples (empty while the wrapper is
-    /// still accumulating a frame of lookahead). Output at the source rate.
+    /// Returns the newly-finalised denoised samples (fewer than given while the
+    /// model's 10 ms framing and lag are being filled). Output at the source rate.
     pub fn filter(&mut self, audio: &[i16]) -> Vec<i16> {
         if audio.is_empty() {
             return Vec::new();
         }
-        self.ingest(audio);
-
-        let total_abs = self.base + self.input16k.len();
-        let total_frames = total_abs / FRAME;
-        // Hold back the final frame: its lagged output is not available yet.
-        let target = total_frames.saturating_sub(1) * FRAME;
-        if target <= self.emitted {
-            return Vec::new();
-        }
-
-        // Window: up to CONTEXT_SAMPLES before `emitted`, through the last whole
-        // frame. Frame-aligned so `enhance` returns the full window length.
-        let win_start = (self.emitted.saturating_sub(CONTEXT_SAMPLES)) / FRAME * FRAME;
-        let frame_end = total_frames * FRAME;
-        let window: Vec<f32> = self.input16k[(win_start - self.base)..(frame_end - self.base)].to_vec();
-
-        let out = match self.hush.enhance(&window) {
-            Ok(o) => o,
-            Err(e) => {
-                // Passthrough this block on failure rather than dropping audio.
-                log::warn!("HushVaniFilter: enhance failed ({e}); passing through");
-                let block: Vec<f32> =
-                    self.input16k[(self.emitted - self.base)..(target - self.base)].to_vec();
-                self.emitted = target;
-                self.trim(target);
-                return self.egress(&block, false);
-            }
-        };
-
-        // clean(input[m]) == out[m - win_start + LATENCY]
-        let lo = self.emitted - win_start + LATENCY;
-        let hi = (target - win_start + LATENCY).min(out.len());
-        let block = if lo < hi { out[lo..hi].to_vec() } else { Vec::new() };
-
-        self.emitted = target;
-        self.trim(target);
+        let at_16k = self.ingest(audio);
+        let block = self.enhance(&at_16k);
         self.egress(&block, false)
     }
 
-    /// Drain the buffered/lagging tail at end of utterance.
-    ///
-    /// Emits denoised output for every remaining input sample by zero-padding
-    /// the window past the [`LATENCY`] lag, then clears utterance state.
+    /// Drain the buffered/lagging tail at end of utterance: every remaining
+    /// input sample comes out (the model is fed zeros to push it through).
     pub fn flush(&mut self) -> Vec<i16> {
-        // Pull any tail out of the input resampler first.
-        if let Some(ref mut r) = self.resampler_in {
-            let tail = r.flush();
-            self.input16k.extend_from_slice(&tail);
-        }
-
-        let total_abs = self.base + self.input16k.len();
-        if total_abs <= self.emitted {
-            // Nothing new to enhance; still drain the output resampler.
-            self.reset_buffers();
-            let empty: Vec<f32> = Vec::new();
-            return self.egress(&empty, true);
-        }
-
-        let win_start = (self.emitted.saturating_sub(CONTEXT_SAMPLES)) / FRAME * FRAME;
-        // Window = remaining audio (context + unemitted), zero-padded to a frame
-        // boundary, plus one extra frame to flush the LATENCY lag.
-        let mut window: Vec<f32> = self.input16k[(win_start - self.base)..].to_vec();
-        while window.len() % FRAME != 0 {
-            window.push(0.0);
-        }
-        window.extend(std::iter::repeat(0.0).take(FRAME));
-
-        let block = match self.hush.enhance(&window) {
-            Ok(out) => {
-                let lo = self.emitted - win_start + LATENCY;
-                let hi = (total_abs - win_start + LATENCY).min(out.len());
-                if lo < hi {
-                    out[lo..hi].to_vec()
-                } else {
-                    Vec::new()
-                }
-            }
-            Err(e) => {
-                log::warn!("HushVaniFilter: flush enhance failed ({e}); passing through");
-                self.input16k[(self.emitted - self.base)..].to_vec()
-            }
+        let tail = match self.resampler_in {
+            Some(ref mut r) => r.flush(),
+            None => Vec::new(),
         };
-
-        self.reset_buffers();
-        self.egress(&block, true)
+        let mut block = self.enhance(&tail);
+        let owed = self.fed.saturating_sub(self.emitted);
+        if owed > 0 {
+            // Zeros through the partial frame and the lag, then keep only what is owed.
+            let mut out = self.stream.process(&vec![0.0; owed + FRAME + LATENCY]);
+            let drop = self.skip.min(out.len());
+            out.drain(..drop);
+            out.truncate(owed);
+            block.extend_from_slice(&out);
+        }
+        let out = self.egress(&block, true);
+        self.start_utterance();
+        out
     }
 
-    /// Discard buffered audio and reset state between utterances.
+    /// Discard what is buffered for this utterance and start the next one (the
+    /// model's state is kept: see the module docs).
     pub fn reset(&mut self) {
-        self.reset_buffers();
+        // Drop a partial frame by completing it with zeros, unread.
+        let partial = self.fed % FRAME;
+        if partial != 0 {
+            let _ = self.stream.process(&vec![0.0; FRAME - partial]);
+        }
         if let Some(ref mut r) = self.resampler_in {
             r.reset();
         }
         if let Some(ref mut r) = self.resampler_out {
             r.reset();
         }
-        // `Hush` holds no cross-call state (GRUs reset per `enhance`).
+        self.start_utterance();
     }
 
-    fn reset_buffers(&mut self) {
-        self.input16k.clear();
-        self.base = 0;
+    fn start_utterance(&mut self) {
+        self.fed = 0;
         self.emitted = 0;
-    }
-
-    /// Drop the front of `input16k` we will never need again (anything before
-    /// the next call's lookback window), advancing `base`.
-    fn trim(&mut self, emitted: usize) {
-        let keep_from = emitted.saturating_sub(CONTEXT_SAMPLES) / FRAME * FRAME;
-        if keep_from > self.base {
-            let drop = keep_from - self.base;
-            self.input16k.drain(..drop);
-            self.base = keep_from;
-        }
+        self.skip = LATENCY;
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -332,5 +258,58 @@ mod tests {
         nf.reset();
         let tail = nf.flush();
         assert!(tail.is_empty());
+    }
+
+    /// Voiced-ish speech (harmonics, gated like syllables) under broadband noise, at 16 kHz.
+    fn noisy_speech(n: usize, seed: u32) -> (Vec<i16>, Vec<f32>) {
+        let mut s = seed;
+        let mut clean = Vec::with_capacity(n);
+        let noisy = (0..n)
+            .map(|i| {
+                let t = i as f32 / 16_000.0;
+                let f0 = 140.0 + 30.0 * (2.0 * std::f32::consts::PI * 3.0 * t).sin();
+                let gate = if (t * 4.0) as u32 % 3 == 2 { 0.0 } else { 1.0 };
+                let voice: f32 = (1..8).map(|k| (2.0 * std::f32::consts::PI * f0 * k as f32 * t).sin() / k as f32).sum();
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+                clean.push(0.2 * gate * voice);
+                ((0.2 * gate * voice + 0.05 * noise) * 32_767.0) as i16
+            })
+            .collect();
+        (noisy, clean)
+    }
+
+    fn rms(x: impl Iterator<Item = f32>) -> f32 {
+        let (s, n) = x.fold((0.0f32, 0usize), |(s, n), v| (s + v * v, n + 1));
+        (s / n.max(1) as f32).sqrt()
+    }
+
+    /// Speech keeps the level the model gives it, utterance after utterance (the windowed
+    /// wrapper lost it after two or three), and the output is the input's length.
+    #[test]
+    fn speech_survives_many_utterances() {
+        let hush = Hush::new().unwrap();
+        let mut nf = HushVaniFilter::new(16_000).expect("init");
+        for utt in 0..8 {
+            let (noisy, clean) = noisy_speech(16_000 * 2, 7 + utt);
+            let mut out = Vec::new();
+            for c in noisy.chunks(320) {
+                out.extend(nf.filter(c));
+            }
+            out.extend(nf.flush());
+            nf.reset();
+            assert_eq!(out.len(), noisy.len());
+            // Over the voiced parts.
+            let voiced = |x: &[f32]| rms(x.iter().zip(&clean).filter(|(_, c)| c.abs() > 0.0).map(|(v, _)| *v));
+            let got: Vec<f32> = out.iter().map(|&s| s as f32 / 32_768.0).collect();
+            let ratio = voiced(&got) / voiced(&clean);
+            // The batch model over this utterance alone, as the bar: the stream keeps as much.
+            let batch = hush.enhance(&noisy.iter().map(|&v| v as f32 / 32_768.0).collect::<Vec<_>>()).unwrap();
+            let batch_ratio = voiced(&batch[LATENCY..]) / voiced(&clean[..batch.len() - LATENCY]);
+            assert!(
+                ratio > batch_ratio * 0.9,
+                "utterance {utt}: speech at {ratio:.2} of its level, the batch model keeps {batch_ratio:.2}"
+            );
+        }
     }
 }

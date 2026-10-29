@@ -66,23 +66,21 @@ The contract is length-preserving *over an utterance*, not per call: any single 
 |---|---|---|
 | Crate | `nnnoiseless` | `hush-vani` |
 | Model | RNNoise | DeepFilterNet3-style |
-| Nature | True streaming, 10 ms frames | Batch API, wrapped in a sliding window |
+| Nature | True streaming, 10 ms frames | True streaming, 10 ms frames (`HushStream`) |
 | Suppression | Good | Stronger, especially on non-stationary noise |
 | Native rate | 48 kHz (resampled in/out) | 16 kHz (resampled in/out) |
 | Added latency | ~10 ms (one frame) | ~10 ms (160 samples held back per call) |
-| Cost | Very cheap | ~100× real-time, plus context recompute |
+| Cost | Very cheap | ~100× real-time |
 
 Neither requires a feature flag — both crates are regular dependencies. Switching is one field.
 
-### How hush-vani is made streaming
+### How hush-vani streams
 
-`hush-vani` only exposes a **batch** `Hush::enhance`, and its GRUs start from zero on every call. Feeding it the live 20 ms chunks directly would produce cold-start artefacts on every chunk. `HushVaniFilter` (`src/audio_process/hushfilter/`) works around this with a sliding window:
+`HushVaniFilter` (`src/audio_process/hushfilter/`) runs hush-vani's `HushStream`: one 10 ms frame at a time, with the model's GRUs and STFT normalisation carried from frame to frame, so its output matches a batch `Hush::enhance` over the same audio.
 
-- All input for the current utterance is buffered at 16 kHz (hush-vani's native rate). Each `filter` call re-runs `enhance` over a window of up to **200 ms of prior audio** (`CONTEXT_SAMPLES = 20 × 160`) plus the newly-arrived samples.
-- The context region re-primes the GRUs to roughly the state a true streaming decode would hold. That region of the output is then discarded — only the new samples are emitted.
-- `enhance` returns output that **lags its input by 160 samples**. For an absolute input index `m` in a window starting at `win_start`, `clean(input[m]) == out[m - win_start + 160]`. The last frame of each call therefore has no lagged output yet, so it is held back and drained in `flush()` via zero padding.
-
-Across a full utterance, total output length ≈ total input length. Recomputing the context every call is affordable because hush-vani runs at roughly 100× real-time.
+- The stream's output lags its input by 160 samples; the filter drops that lag at the start of each utterance, so `filter` + `flush` give back exactly the input's length, lined up with it. `flush()` drains the lag with zero padding.
+- `reset()` between utterances restarts only that bookkeeping and the resamplers. The model's state is kept: the same speaker in the same room continues, and a cold start costs the next utterance its first second while the normalisation (1 s time constant) settles.
+- Up to 0.4.0-dev.18 the filter re-ran the batch `enhance` over a 200 ms lookback window per chunk. That restarted the normalisation on every call; the model never saw settled features and suppressed speech, and transcripts went missing after two or three utterances.
 
 Sample rates other than 16 kHz are resampled in and out transparently via `StreamResampler`; samples are normalised to `f32` in `[-1, 1]` for hush-vani and denormalised back to i16 on the way out.
 
@@ -107,9 +105,9 @@ nf.reset();                               // clean slate for next utterance
 use rustvani::audio_process::hushfilter::HushVaniFilter;
 
 let mut hf = HushVaniFilter::new(16_000)?;  // Result — model init can fail
-let clean  = hf.filter(&noisy_pcm_i16);     // holds back the last 160 samples
+let clean  = hf.filter(&noisy_pcm_i16);     // 10 ms framing and 160-sample lag held back
 let tail   = hf.flush();                    // drain at end of utterance
-hf.reset();                                 // discard buffered audio + window
+hf.reset();                                 // next utterance; the model state carries on
 ```
 
 Unlike `RNNoiseFilter::new`, this returns a `Result<_, hush_vani::Error>` because the model is constructed eagerly. Inside `AudioFrontend::new` (`src/services/stt/core/frontend.rs`, used by every STT service), a failure here logs an error and **falls back to RNNoise** rather than failing the pipeline — so `NoiseBackend::HushVani` is always safe to set.

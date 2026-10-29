@@ -217,9 +217,11 @@ impl TranslationService {
                 if transcript.language.is_none() {
                     transcript.language = default_source.clone();
                 }
+                // Already in the target language: passed through, no call made, nothing to bill.
+                let passed_through = transcript.language.as_deref().is_some_and(|from| same_language(from, &target));
                 let translation = translate_one(provider.as_ref(), &transcript, &target).await;
                 let Some(translation) = translation else { continue };
-                if let Some(bc) = &billing {
+                if let (Some(bc), false) = (&billing, passed_through) {
                     bc.record(BillingEvent::TranslationUsage {
                         session_id: bc.session_id(),
                         provider: provider.name().to_string(),
@@ -562,6 +564,34 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let _ = NoopBillingCollector;
+    }
+
+    #[tokio::test]
+    async fn a_transcript_already_in_the_target_language_is_passed_through_unbilled() {
+        struct Record(Mutex<Vec<BillingEvent>>);
+        impl BillingCollector for Record {
+            fn record(&self, event: BillingEvent) { self.0.lock().unwrap().push(event); }
+            fn session_id(&self) -> uuid::Uuid { uuid::Uuid::nil() }
+        }
+        let billing = Arc::new(Record(Mutex::new(Vec::new())));
+        let (proc, out) = harness(TranslationTargets::new(["ml", "en"]), Some(billing.clone())).await;
+        proc.process_frame(Frame::transcription(final_transcript("നാളെ", "1")), FrameDirection::Downstream)
+            .await
+            .unwrap();
+        let got = wait_for(&out, 2).await;
+        let ml = got.iter().find(|t| t.target_language == "ml").unwrap();
+        assert_eq!(ml.text, "നാളെ", "its own translation");
+        let billed: Vec<String> = billing
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                BillingEvent::TranslationUsage { target_language, .. } => Some(target_language.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(billed, ["en"], "only the real translation is billed");
     }
 
     #[test]
