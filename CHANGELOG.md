@@ -11,8 +11,8 @@ since Cargo will not resolve a prerelease from a plain version requirement.
   `find_sentence_end` returns the closing character's *last* byte and the segmenter took it
   for the first. A period is one byte, so only Devanagari hit it, and it panicked and
   poisoned the segmenter's lock, stopping the run's captions. Measured on FLEURS Hindi
-  read speech, captions with sentence segments went from 88% character errors to the 5% they
-  get without.
+  read speech, captions with sentence segments went from 88% character errors to 11% (5%
+  without segments: finalising from partials still costs accuracy).
 
 ### Fixes: Indic sentences, hush-vani on live audio, pass-through billing (0.4.0-dev.19)
 
