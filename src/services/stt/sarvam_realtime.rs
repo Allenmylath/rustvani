@@ -29,7 +29,7 @@ use crate::frames::FrameProcessor;
 use super::core::util::percent_encode;
 use super::core::{
     AudioSpec, Handshake, InterimPolicy, NoiseBackend, Outgoing, SttCoreConfig, SttEvent,
-    SttProvider, SttService, WsMessage,
+    SttProvider, SttService, TurnLimit, WsMessage,
 };
 use std::time::Duration;
 
@@ -77,6 +77,8 @@ pub struct SarvamRealtimeSttConfig {
     pub pre_roll_ms: u32,
     pub stop_release_timeout_ms: u64,
     pub max_turn_ms: Option<u64>,
+    /// A turn limit changeable while running; overrides `max_turn_ms`. See [`SttCoreConfig::turn_limit`].
+    pub turn_limit: Option<TurnLimit>,
     /// Push partial transcripts downstream (default `true`: the reason to use this endpoint).
     pub partials: bool,
 }
@@ -102,6 +104,7 @@ impl Default for SarvamRealtimeSttConfig {
             pre_roll_ms: 500,
             stop_release_timeout_ms: 1_200,
             max_turn_ms: None,
+            turn_limit: None,
             partials: true,
         }
     }
@@ -120,6 +123,7 @@ impl SarvamRealtimeSttConfig {
             stop_release_timeout_ms: self.stop_release_timeout_ms,
             interim_policy: if self.partials { InterimPolicy::Emit } else { InterimPolicy::Drop },
             max_turn_ms: self.max_turn_ms,
+            turn_limit: self.turn_limit.clone(),
         };
         let audio = AudioSpec::new(self.sample_rate, "linear16");
         (core, SarvamRealtimeProvider { config: self, audio })

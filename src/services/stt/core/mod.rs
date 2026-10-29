@@ -56,7 +56,7 @@ pub mod turn_gate;
 pub mod util;
 pub mod ws;
 
-pub use driver::{InterimPolicy, SttCoreConfig, SttService};
+pub use driver::{InterimPolicy, SttCoreConfig, SttService, TurnLimit};
 pub use frontend::{AudioFrontend, FrontendConfig, NoiseBackend};
 pub use provider::{AudioSpec, Handshake, Outgoing, SttEvent, SttProvider, WsMessage};
 pub use turn_gate::{TranscriptOutcome, TurnGate};

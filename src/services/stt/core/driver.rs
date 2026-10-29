@@ -18,6 +18,7 @@
 //!     gate releases it
 //!   - `ErrorFrame` (upstream) on connection / provider errors
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,6 +107,35 @@ pub struct SttCoreConfig {
     /// turn to end). `None` (the default) never interrupts a turn, which is
     /// what a voice agent wants: one transcript per turn.
     pub max_turn_ms: Option<u64>,
+
+    /// The same limit, changeable while the service runs: when set, it is read
+    /// on every chunk of audio and `max_turn_ms` is ignored. For a host whose
+    /// need changes mid-stream (captions alone want whole turns; dubbing wants
+    /// them short so the voice stays close to the words).
+    pub turn_limit: Option<TurnLimit>,
+}
+
+/// A turn limit ([`SttCoreConfig::max_turn_ms`]) the host can change while the
+/// STT runs. Clones share one value.
+#[derive(Debug, Clone, Default)]
+pub struct TurnLimit(Arc<AtomicU64>);
+
+impl TurnLimit {
+    /// A limit starting at `ms` (`None`: whole turns).
+    pub fn new(ms: Option<u64>) -> Self {
+        let limit = Self::default();
+        limit.set(ms);
+        limit
+    }
+
+    /// Finalise mid-turn after `ms` of audio from now on, or never (`None`).
+    pub fn set(&self, ms: Option<u64>) {
+        self.0.store(ms.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> Option<u64> {
+        Some(self.0.load(Ordering::Relaxed)).filter(|&ms| ms > 0)
+    }
 }
 
 impl Default for SttCoreConfig {
@@ -121,6 +151,7 @@ impl Default for SttCoreConfig {
             stop_release_timeout_ms: 1_200,
             interim_policy: InterimPolicy::default(),
             max_turn_ms: None,
+            turn_limit: None,
         }
     }
 }
@@ -390,14 +421,20 @@ impl<P: SttProvider> SttService<P> {
     /// (80 ms of quiet, so no word is cut in two) or, failing one, after
     /// [`DIP_GRACE_MS`] more; then counts again.
     async fn count_turn_audio(&self, samples: &[i16]) {
-        let Some(max_ms) = self.config.max_turn_ms else {
-            return;
+        // A live limit counts even while off, so switched on mid-turn it cuts at
+        // the turn's next gap rather than a whole limit later.
+        let max_ms = match &self.config.turn_limit {
+            Some(live) => live.get().map_or(f64::INFINITY, |ms| ms as f64),
+            None => match self.config.max_turn_ms {
+                Some(ms) => ms as f64,
+                None => return,
+            },
         };
         let finalise = self
             .turn_count
             .lock()
             .unwrap()
-            .add(self.gate.ms_of(samples.len()), samples, max_ms as f64);
+            .add(self.gate.ms_of(samples.len()), samples, max_ms);
         if let Some(sent_ms) = finalise {
             if let Some(msg) = self.provider.mid_turn_finalize_msg() {
                 log::info!(
@@ -808,6 +845,29 @@ mod tests {
     }
     fn gap(ms: usize) -> Vec<i16> {
         vec![100; ms * 16]
+    }
+
+    /// A live limit takes effect on the next chunk: off, nothing is cut however
+    /// long the turn; on, the turn is finalised at its next gap.
+    #[tokio::test]
+    async fn a_live_turn_limit_switches_on_and_off_mid_stream() {
+        let limit = TurnLimit::new(None);
+        let svc = SttService::new(
+            MockProvider::new(),
+            SttCoreConfig { max_turn_ms: Some(500), turn_limit: Some(limit.clone()), ..SttCoreConfig::default() },
+        );
+        let (tx, mut sent) = mpsc::channel(16);
+        svc.session.lock().await.ws_tx = Some(tx);
+        for _ in 0..30 {
+            svc.count_turn_audio(&speech(100)).await; // 3 s of speech, no limit
+        }
+        svc.count_turn_audio(&gap(80)).await;
+        assert!(sent.try_recv().is_err(), "off: the fixed max_turn_ms is ignored too");
+        limit.set(Some(1_000));
+        svc.count_turn_audio(&speech(100)).await;
+        svc.count_turn_audio(&gap(80)).await;
+        assert_eq!(sent.try_recv().ok(), Some(Outgoing::Text("finalize".into())));
+        assert_eq!((TurnLimit::new(Some(3_000)).get(), TurnLimit::default().get()), (Some(3_000), None));
     }
 
     #[tokio::test]

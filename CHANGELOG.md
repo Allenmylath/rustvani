@@ -2,8 +2,21 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.20"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.21"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### A turn limit that changes while the STT runs (0.4.0-dev.21)
+
+- **`TurnLimit`** (re-exported at the crate root): a shared, live
+  `max_turn_ms`. Set it as `SttCoreConfig::turn_limit` (and on
+  `SarvamSttConfig` / `SarvamRealtimeSttConfig`, the new `turn_limit` field) and
+  the STT reads it on every chunk of audio instead of `max_turn_ms`; `set()` it
+  from anywhere. For a host whose need changes mid-stream: live captions read
+  best from whole turns (each mid-turn cut costs Sarvam accuracy), while
+  dubbing needs short turns so the voice stays near the words. A live limit
+  keeps counting while it is off, so switched on mid-turn it cuts at the turn's
+  next gap between words. Struct literals of the three configs need the new
+  field (or `..Default::default()`).
 
 ### Fix: a danda ends a sentence whole (0.4.0-dev.20)
 

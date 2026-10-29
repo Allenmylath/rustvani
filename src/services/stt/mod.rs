@@ -24,7 +24,7 @@ pub mod core;
 ))]
 pub use core::{
     AudioFrontend, AudioSpec, Handshake, InterimPolicy, NoiseBackend, Outgoing, SttCoreConfig,
-    SttEvent, SttProvider, SttService, TurnGate, WsMessage,
+    SttEvent, SttProvider, SttService, TurnGate, TurnLimit, WsMessage,
 };
 
 #[cfg(feature = "stt-deepgram")]

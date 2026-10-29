@@ -20,7 +20,7 @@ pub mod tts;
 ))]
 pub use stt::core::{
     AudioFrontend, AudioSpec, Handshake, InterimPolicy, NoiseBackend, Outgoing, SttCoreConfig,
-    SttEvent, SttProvider, SttService, TurnGate, WsMessage,
+    SttEvent, SttProvider, SttService, TurnGate, TurnLimit, WsMessage,
 };
 
 #[cfg(feature = "llm-openai")]

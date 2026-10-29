@@ -28,7 +28,7 @@ use crate::frames::FrameProcessor;
 use super::core::util::percent_encode;
 use super::core::{
     AudioSpec, Handshake, InterimPolicy, Outgoing, SttCoreConfig, SttEvent, SttProvider,
-    SttService, WsMessage,
+    SttService, TurnLimit, WsMessage,
 };
 
 // `NoiseBackend` moved to `core::frontend` — it is not Sarvam-specific. Kept
@@ -188,6 +188,10 @@ pub struct SarvamSttConfig {
     /// live captions of speakers who rarely pause. `None` (default): one
     /// transcript per turn. See [`SttCoreConfig::max_turn_ms`].
     pub max_turn_ms: Option<u64>,
+
+    /// A turn limit changeable while running; overrides `max_turn_ms`. See
+    /// [`SttCoreConfig::turn_limit`].
+    pub turn_limit: Option<TurnLimit>,
 }
 
 impl Default for SarvamSttConfig {
@@ -210,6 +214,7 @@ impl Default for SarvamSttConfig {
             pre_roll_ms:             500,
             stop_release_timeout_ms: 1_200,
             max_turn_ms:             None,
+            turn_limit:              None,
         }
     }
 }
@@ -230,6 +235,7 @@ impl SarvamSttConfig {
             // Sarvam's streaming API emits finals only; nothing to drop.
             interim_policy:          InterimPolicy::Drop,
             max_turn_ms:             self.max_turn_ms,
+            turn_limit:              self.turn_limit.clone(),
         };
         let audio = AudioSpec::new(self.sample_rate, self.encoding.clone());
         (core, SarvamProvider { config: self, audio })
