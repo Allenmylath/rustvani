@@ -29,6 +29,8 @@ pub use llm::openai::{OpenAILLMConfig, OpenAILLMHandler};
 pub use llm::sarvam::{SarvamLLMConfig, SarvamLLMHandler};
 #[cfg(feature = "stt-deepgram")]
 pub use stt::deepgram::{DeepgramSttConfig, DeepgramSttHandler};
+#[cfg(feature = "stt-deepgram")]
+pub use stt::deepgram_realtime::{DeepgramRealtimeSttConfig, DeepgramRealtimeSttHandler};
 #[cfg(feature = "stt-gnani")]
 pub use stt::gnani::{GnaniSttConfig, GnaniSttHandler};
 #[cfg(feature = "stt-sarvam")]

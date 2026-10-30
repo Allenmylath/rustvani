@@ -121,7 +121,7 @@ pub use services::{
 };
 
 #[cfg(feature = "stt-deepgram")]
-pub use services::{DeepgramSttConfig, DeepgramSttHandler};
+pub use services::{DeepgramRealtimeSttConfig, DeepgramRealtimeSttHandler, DeepgramSttConfig, DeepgramSttHandler};
 
 #[cfg(feature = "stt-gnani")]
 pub use services::{GnaniSttConfig, GnaniSttHandler};

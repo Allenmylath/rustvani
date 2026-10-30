@@ -2,8 +2,22 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.21"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.22"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Deepgram streaming STT on the shared core (0.4.0-dev.22)
+
+- **`DeepgramRealtimeSttHandler` / `DeepgramRealtimeSttConfig`** (feature `stt-deepgram`):
+  Deepgram's live `nova-3` as an `SttProvider` on the STT core, like
+  `SarvamRealtimeSttHandler`: partial transcripts while the speaker talks
+  (`interim_results`), finals per segment with their detected language
+  (`language=multi` unless one is configured; `channel.alternatives[0].languages`),
+  turns from local VAD (`Finalize`; server endpointing off by default), audio
+  gating, the noise front end, `max_turn_ms` and `turn_limit`, keepalives and
+  reconnects. A configured language goes as Deepgram names it (`hi`, `en-IN`).
+  Deepgram's `multi` mode detects English and Hindi but not Malayalam or Tamil;
+  named, nova-3 transcribes those too.
+- The older `DeepgramSttHandler` (finals only, its own socket) is unchanged.
 
 ### A turn limit that changes while the STT runs (0.4.0-dev.21)
 

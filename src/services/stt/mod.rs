@@ -29,6 +29,8 @@ pub use core::{
 
 #[cfg(feature = "stt-deepgram")]
 pub mod deepgram;
+#[cfg(feature = "stt-deepgram")]
+pub mod deepgram_realtime;
 #[cfg(feature = "stt-gnani")]
 pub mod gnani;
 #[cfg(feature = "stt-sarvam")]
@@ -40,6 +42,8 @@ pub mod sixtydb;
 
 #[cfg(feature = "stt-deepgram")]
 pub use deepgram::{DeepgramSttConfig, DeepgramSttHandler};
+#[cfg(feature = "stt-deepgram")]
+pub use deepgram_realtime::{DeepgramRealtimeSttConfig, DeepgramRealtimeSttHandler};
 #[cfg(feature = "stt-gnani")]
 pub use gnani::{GnaniSttConfig, GnaniSttHandler};
 // `NoiseBackend` now lives in `core::frontend` (it applies to every provider,
