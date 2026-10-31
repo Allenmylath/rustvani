@@ -2,8 +2,27 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.23"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.24"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Translation outcomes, interim translations and dub events (0.4.0-dev.24)
+
+- **`TranslationData`** carries `provider` and `latency_ms`, and `finalized` follows its
+  transcript (`false` for an interim one).
+- **`TranslationErrorFrame`** (`TranslationErrorData`): a translation call that fails goes
+  downstream instead of only to the log, with the provider's message and an
+  **`ErrorKind`** (`credits`, `rate_limited`, `rejected`, `timeout`, `other`).
+- **Interim translation** (`TranslationService::with_interim(every, targets)`): the newest interim
+  transcript per language is translated at most once per `every`, into its own set of languages
+  (those read live), as a `TranslationFrame` with `finalized: false`; one overtaken by a final
+  transcript before its answer comes is dropped. Interim calls are billed like final ones.
+- **`DubEventFrame`** (`DubEventData`, `DubEventKind`): `DubbingService` reports `synthesized`
+  (with `ready_ms`, from the translation to the first audio) and `failed` (with the error and its
+  kind); whatever plays the speech reports `started` (`late_ms`, `rtp_timestamp`), `ended`
+  (`audio_ms`) and `skipped`.
+- **RAVI**: `user-translation` carries `provider` and `latency_ms` (and `final: false` for interim
+  ones); new `user-translation-error` and `user-dub` messages (`RaviObserverParams::user_dub_enabled`,
+  on by default). `msg_user_translation` now takes the `TranslationData`.
 
 ### Bulbul streaming recovers from a rejected utterance (0.4.0-dev.23)
 

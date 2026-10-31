@@ -122,31 +122,74 @@ pub fn msg_user_transcription(
 
 // ---- Translation ----
 
-/// A final transcript translated into `target_language`, from a `TranslationFrame`. `source_text`
-/// and `timestamp` are the transcript's, so a client can place the translation under the
-/// `user-transcription` it belongs to; `source_language` is sent when known.
-#[allow(clippy::too_many_arguments)]
-pub fn msg_user_translation(
-    text:            &str,
-    source_text:     &str,
-    source_language: Option<&str>,
-    target_language: &str,
-    user_id:         &str,
-    timestamp:       &str,
-    is_final:        bool,
-) -> String {
+/// A transcript translated into `target_language`, from a `TranslationFrame`: a final one, or an
+/// interim one (`final: false`) the next replaces. `source_text` and `timestamp` are the
+/// transcript's, so a client can place the translation under the `user-transcription` it belongs
+/// to; `source_language`, `provider` and `latency_ms` are sent when known.
+pub fn msg_user_translation(t: &crate::frames::TranslationData) -> String {
     let mut data = json!({
-        "text":            text,
-        "source_text":     source_text,
-        "target_language": target_language,
-        "user_id":         user_id,
-        "timestamp":       timestamp,
-        "final":           is_final,
+        "text":            t.text,
+        "source_text":     t.source_text,
+        "target_language": t.target_language,
+        "user_id":         t.user_id,
+        "timestamp":       t.timestamp,
+        "final":           t.finalized,
     });
-    if let Some(language) = source_language {
+    if let Some(language) = &t.source_language {
         data["source_language"] = json!(language);
     }
+    if let Some(provider) = &t.provider {
+        data["provider"] = json!(provider);
+    }
+    if let Some(ms) = t.latency_ms {
+        data["latency_ms"] = json!(ms);
+    }
     envelope("user-translation", None, Some(data))
+}
+
+/// A transcript that could not be translated (`TranslationErrorFrame`): `kind` is `credits`,
+/// `rate_limited`, `rejected`, `timeout` or `other`.
+pub fn msg_user_translation_error(e: &crate::frames::TranslationErrorData) -> String {
+    let data = json!({
+        "source_text":     e.source_text,
+        "source_language": e.source_language,
+        "target_language": e.target_language,
+        "user_id":         e.user_id,
+        "timestamp":       e.timestamp,
+        "final":           e.finalized,
+        "provider":        e.provider,
+        "error":           e.error,
+        "kind":            e.kind.as_str(),
+    });
+    envelope("user-translation-error", None, Some(data))
+}
+
+/// What happened to a dubbed utterance (`DubEventFrame`): `event` is `synthesized`, `started`,
+/// `ended`, `skipped` or `failed`; the timings and `rtp_timestamp` are sent when known.
+pub fn msg_user_dub(d: &crate::frames::DubEventData) -> String {
+    let mut data = json!({
+        "event":           d.event.as_str(),
+        "target_language": d.target_language,
+        "text":            d.text,
+        "source_text":     d.source_text,
+        "user_id":         d.user_id,
+        "timestamp":       d.timestamp,
+    });
+    for (key, value) in [("ready_ms", d.ready_ms), ("late_ms", d.late_ms), ("audio_ms", d.audio_ms)] {
+        if let Some(v) = value {
+            data[key] = json!(v);
+        }
+    }
+    if let Some(ts) = d.rtp_timestamp {
+        data["rtp_timestamp"] = json!(ts);
+    }
+    if let Some(error) = &d.error {
+        data["error"] = json!(error);
+    }
+    if let Some(kind) = d.kind {
+        data["kind"] = json!(kind.as_str());
+    }
+    envelope("user-dub", None, Some(data))
 }
 
 // ---- LLM ----
@@ -218,10 +261,12 @@ mod tests {
 
     #[test]
     fn user_translation_names_both_languages_and_its_source() {
-        let msg: Value = serde_json::from_str(&msg_user_translation(
-            "tomorrow", "നാളെ", Some("ml-IN"), "en", "u", "17.250", true,
-        ))
-        .unwrap();
+        use crate::frames::{TranscriptionData, TranslationData};
+        let source = TranscriptionData::new("നാളെ", "u", "17.250").with_language("ml-IN").finalized();
+        let mut t = TranslationData::new(&source, "en", "tomorrow");
+        t.provider = Some("sarvam".into());
+        t.latency_ms = Some(640);
+        let msg: Value = serde_json::from_str(&msg_user_translation(&t)).unwrap();
         assert_eq!(msg["type"], "user-translation");
         assert_eq!(msg["data"]["text"], "tomorrow");
         assert_eq!(msg["data"]["source_text"], "നാളെ");
@@ -229,8 +274,34 @@ mod tests {
         assert_eq!(msg["data"]["target_language"], "en");
         assert_eq!(msg["data"]["timestamp"], "17.250");
         assert_eq!(msg["data"]["final"], true);
-        let unknown: Value =
-            serde_json::from_str(&msg_user_translation("x", "y", None, "hi", "u", "0", true)).unwrap();
+        assert_eq!((msg["data"]["provider"].clone(), msg["data"]["latency_ms"].clone()), (json!("sarvam"), json!(640)));
+        let bare = TranslationData::new(&TranscriptionData::new("y", "u", "0"), "hi", "x");
+        let unknown: Value = serde_json::from_str(&msg_user_translation(&bare)).unwrap();
         assert!(unknown["data"].get("source_language").is_none());
+        assert!(unknown["data"].get("provider").is_none());
+        assert_eq!(unknown["data"]["final"], false, "an interim transcript's translation is interim");
+    }
+
+    #[test]
+    fn translation_errors_and_dub_events_say_what_happened() {
+        use crate::frames::{DubEventData, DubEventKind, TranscriptionData, TranslationData, TranslationErrorData};
+        let source = TranscriptionData::new("നാളെ", "u", "3").finalized();
+        let e = TranslationErrorData::new(&source, "en", "sarvam", "SarvamTranslate: HTTP 402 Payment Required");
+        let msg: Value = serde_json::from_str(&msg_user_translation_error(&e)).unwrap();
+        assert_eq!(msg["type"], "user-translation-error");
+        assert_eq!((msg["data"]["kind"].clone(), msg["data"]["timestamp"].clone()), (json!("credits"), json!("3")));
+
+        let t = TranslationData::new(&source, "en", "tomorrow");
+        let mut started = DubEventData::new(DubEventKind::Started, &t);
+        started.late_ms = Some(120);
+        started.rtp_timestamp = Some(48_000);
+        let msg: Value = serde_json::from_str(&msg_user_dub(&started)).unwrap();
+        assert_eq!(msg["type"], "user-dub");
+        assert_eq!(msg["data"]["event"], "started");
+        assert_eq!((msg["data"]["late_ms"].clone(), msg["data"]["rtp_timestamp"].clone()), (json!(120), json!(48_000)));
+        assert!(msg["data"].get("error").is_none());
+        let failed = DubEventData::new(DubEventKind::Failed, &t).failed("SarvamStreamTts: no final event");
+        let msg: Value = serde_json::from_str(&msg_user_dub(&failed)).unwrap();
+        assert_eq!((msg["data"]["event"].clone(), msg["data"]["kind"].clone()), (json!("failed"), json!("timeout")));
     }
 }

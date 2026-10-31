@@ -61,7 +61,9 @@ pub enum FrameKind {
     Data,
     Transcription,
     Translation,
+    TranslationError,
     DubbedSpeech,
+    DubEvent,
     LLMText,
     LLMContextFrame,
     // Data — function calling
@@ -232,9 +234,161 @@ pub struct TranslationData {
     pub user_id:         String,
     /// The source transcript's `timestamp`.
     pub timestamp:       String,
-    /// Translations are made from final transcripts, so this is `true` unless a provider
-    /// streams revisions.
+    /// `true` for a final transcript's translation; `false` for an interim one, made from a
+    /// transcript still being spoken (`TranslationService::with_interim`) and replaced by the
+    /// next.
     pub finalized:       bool,
+    /// The provider that made it (`sarvam`, `google`), unless it is the transcript passed
+    /// through (already in the target language).
+    pub provider:        Option<String>,
+    /// How long the provider took, in milliseconds.
+    pub latency_ms:      Option<u64>,
+}
+
+/// A transcript that could not be translated into `target_language`: what the provider said, so
+/// a consumer can show that the line will not come (and a monitor can tell an account out of
+/// credits from a passing error).
+#[derive(Debug, Clone)]
+pub struct TranslationErrorData {
+    pub source_text:     String,
+    pub source_language: Option<String>,
+    pub target_language: String,
+    pub user_id:         String,
+    /// The source transcript's `timestamp`.
+    pub timestamp:       String,
+    /// Whether the transcript was final (an interim one's failure is of little consequence).
+    pub finalized:       bool,
+    pub provider:        String,
+    /// The error as the provider reported it.
+    pub error:           String,
+    /// What it was about: see [`ErrorKind`].
+    pub kind:            ErrorKind,
+}
+
+/// What a provider's error was about, as far as can be told from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Out of credits or quota (HTTP 402, `insufficient_quota`).
+    Credits,
+    /// Rate limited (HTTP 429).
+    RateLimited,
+    /// The provider refused the input (HTTP 400/422).
+    Rejected,
+    /// No answer in time.
+    Timeout,
+    Other,
+}
+
+impl ErrorKind {
+    /// Classifies an error message.
+    pub fn of(message: &str) -> Self {
+        let m = message.to_ascii_lowercase();
+        if m.contains("402") || m.contains("no credits") || m.contains("insufficient_quota") || m.contains("payment required") {
+            ErrorKind::Credits
+        } else if m.contains("429") || m.contains("rate limit") || m.contains("too many requests") {
+            ErrorKind::RateLimited
+        } else if m.contains("timed out") || m.contains("timeout") || m.contains("no final event") {
+            ErrorKind::Timeout
+        } else if m.contains(" 400") || m.contains(" 422") || m.contains("must contain") || m.contains("invalid") {
+            ErrorKind::Rejected
+        } else {
+            ErrorKind::Other
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::Credits => "credits",
+            ErrorKind::RateLimited => "rate_limited",
+            ErrorKind::Rejected => "rejected",
+            ErrorKind::Timeout => "timeout",
+            ErrorKind::Other => "other",
+        }
+    }
+}
+
+/// What happened to one dubbed utterance, for clients and monitors. A
+/// [`DubbingService`](crate::services::dub::DubbingService) reports `synthesized` (with
+/// `ready_ms`) and `failed`; whatever plays the speech reports `started` (with `late_ms` and,
+/// when it plays as RTP, `rtp_timestamp`, so a client can match the event to the audio it is
+/// hearing), `ended` (with `audio_ms`) and `skipped`.
+#[derive(Debug, Clone)]
+pub struct DubEventData {
+    pub event:           DubEventKind,
+    /// The language spoken.
+    pub target_language: String,
+    /// The translation spoken, and the transcript it came from (with its `timestamp`).
+    pub text:            String,
+    pub source_text:     String,
+    pub user_id:         String,
+    pub timestamp:       String,
+    /// `synthesized`: from the translation to the first audio.
+    pub ready_ms:        Option<u64>,
+    /// `started`: how long after its due time (the words' start plus the delay) it started.
+    pub late_ms:         Option<u64>,
+    /// `ended`: how long it played.
+    pub audio_ms:        Option<u64>,
+    /// `started`: the RTP timestamp of its first packet.
+    pub rtp_timestamp:   Option<u32>,
+    /// `failed`: why.
+    pub error:           Option<String>,
+    pub kind:            Option<ErrorKind>,
+}
+
+/// The stages of a dubbed utterance ([`DubEventData`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DubEventKind {
+    Synthesized,
+    Started,
+    Ended,
+    /// Not played: it would have started too late.
+    Skipped,
+    /// Its speech could not be made, or stopped part way.
+    Failed,
+}
+
+impl DubEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DubEventKind::Synthesized => "synthesized",
+            DubEventKind::Started => "started",
+            DubEventKind::Ended => "ended",
+            DubEventKind::Skipped => "skipped",
+            DubEventKind::Failed => "failed",
+        }
+    }
+}
+
+impl DubEventData {
+    /// An event about `translation`'s speech.
+    pub fn new(event: DubEventKind, translation: &TranslationData) -> Self {
+        Self::about(event, &translation.target_language, &translation.text, &translation.source_text, &translation.user_id, &translation.timestamp)
+    }
+
+    /// An event about speech known only by its fields (a player holds `DubbedSpeechData`).
+    pub fn about(event: DubEventKind, target_language: &str, text: &str, source_text: &str, user_id: &str, timestamp: &str) -> Self {
+        Self {
+            event,
+            target_language: target_language.to_string(),
+            text: text.to_string(),
+            source_text: source_text.to_string(),
+            user_id: user_id.to_string(),
+            timestamp: timestamp.to_string(),
+            ready_ms: None,
+            late_ms: None,
+            audio_ms: None,
+            rtp_timestamp: None,
+            error: None,
+            kind: None,
+        }
+    }
+
+    pub fn failed(mut self, error: impl Into<String>) -> Self {
+        let error = error.into();
+        self.kind = Some(ErrorKind::of(&error));
+        self.error = Some(error);
+        self
+    }
 }
 
 /// A translation spoken aloud: the whole utterance's audio, from a
@@ -303,10 +457,30 @@ impl TranslationData {
             target_language: target_language.into(),
             user_id:         source.user_id.clone(),
             timestamp:       source.timestamp.clone(),
-            finalized:       true,
+            finalized:       source.finalized,
+            provider:        None,
+            latency_ms:      None,
         }
     }
     pub fn with_source_language(mut self, lang: impl Into<String>) -> Self { self.source_language = Some(lang.into()); self }
+}
+
+impl TranslationErrorData {
+    /// `source` could not be translated into `target_language` by `provider`.
+    pub fn new(source: &TranscriptionData, target_language: impl Into<String>, provider: impl Into<String>, error: impl Into<String>) -> Self {
+        let error = error.into();
+        Self {
+            source_text:     source.text.clone(),
+            source_language: source.language.clone(),
+            target_language: target_language.into(),
+            user_id:         source.user_id.clone(),
+            timestamp:       source.timestamp.clone(),
+            finalized:       source.finalized,
+            provider:        provider.into(),
+            kind:            ErrorKind::of(&error),
+            error,
+        }
+    }
 }
 
 /// Payload for FunctionCallInProgressFrame — the model wants to invoke a tool.
@@ -440,7 +614,9 @@ pub enum DataFrame {
     OutputAudioRaw(AudioRawData),
     Transcription(TranscriptionData),
     Translation(TranslationData),
+    TranslationError(TranslationErrorData),
     DubbedSpeech(DubbedSpeechData),
+    DubEvent(DubEventData),
     LLMText(String),
     LLMContextFrame(Arc<Mutex<crate::context::LLMContext>>),
     /// Model wants to invoke a tool — downstream observers can show "thinking…"
@@ -519,7 +695,9 @@ impl Frame {
                 DataFrame::OutputAudioRaw(_)           => "OutputAudioRawFrame",
                 DataFrame::Transcription(_)            => "TranscriptionFrame",
                 DataFrame::Translation(_)              => "TranslationFrame",
+                DataFrame::TranslationError(_)         => "TranslationErrorFrame",
                 DataFrame::DubbedSpeech(_)             => "DubbedSpeechFrame",
+                DataFrame::DubEvent(_)                 => "DubEventFrame",
                 DataFrame::LLMText(_)                  => "LLMTextFrame",
                 DataFrame::LLMContextFrame(_)          => "LLMContextFrame",
                 DataFrame::FunctionCallInProgress(_)   => "FunctionCallInProgressFrame",
@@ -574,7 +752,9 @@ impl Frame {
                 DataFrame::OutputAudioRaw(_)           => FrameKind::OutputAudioRaw,
                 DataFrame::Transcription(_)            => FrameKind::Transcription,
                 DataFrame::Translation(_)              => FrameKind::Translation,
+                DataFrame::TranslationError(_)         => FrameKind::TranslationError,
                 DataFrame::DubbedSpeech(_)             => FrameKind::DubbedSpeech,
+                DataFrame::DubEvent(_)                 => FrameKind::DubEvent,
                 DataFrame::LLMText(_)                  => FrameKind::LLMText,
                 DataFrame::LLMContextFrame(_)          => FrameKind::LLMContextFrame,
                 DataFrame::FunctionCallInProgress(_)   => FrameKind::FunctionCallInProgress,
@@ -742,6 +922,12 @@ impl Frame {
     }
     pub fn translation(data: TranslationData) -> Self {
         Self::make(FrameInner::Data(DataFrame::Translation(data)))
+    }
+    pub fn translation_error(data: TranslationErrorData) -> Self {
+        Self::make(FrameInner::Data(DataFrame::TranslationError(data)))
+    }
+    pub fn dub_event(data: DubEventData) -> Self {
+        Self::make(FrameInner::Data(DataFrame::DubEvent(data)))
     }
     pub fn dubbed_speech(data: DubbedSpeechData) -> Self {
         Self::make(FrameInner::Data(DataFrame::DubbedSpeech(data)))

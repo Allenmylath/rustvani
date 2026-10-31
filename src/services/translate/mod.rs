@@ -9,8 +9,15 @@
 //! **final** transcript (a `TranscriptionFrame` with `finalized`, or the turn-closing transcript
 //! the STT's turn gate bundles onto `VADUserStoppedSpeaking`) is also handed to a
 //! [`TranslationProvider`] once per target language, and the result goes downstream as a
-//! `TranslationFrame` ([`TranslationData`]). Interim transcripts are never translated: they change
-//! too often to be worth a call.
+//! `TranslationFrame` ([`TranslationData`], with the provider and how long it took). A call that fails
+//! goes downstream as a `TranslationErrorFrame` ([`TranslationErrorData`], with what the error was
+//! about: out of credits, rate limited, rejected, …), so captions, dubs and monitors know the
+//! line will not come.
+//!
+//! Interim transcripts are translated only with [`TranslationService::with_interim`], into its own
+//! set of languages (those someone reads live, not those only dubbed): the newest interim
+//! transcript per language, at most one call per interval, as a `TranslationFrame` with
+//! `finalized: false`; one overtaken by a final transcript before its answer came is dropped.
 //!
 //! Translation calls run off the pipeline's tasks, one ordered queue per target language, so a
 //! slow provider never holds up the transcript or another language, and a language's translations
@@ -32,17 +39,19 @@
 pub mod sarvam;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::billing::{BillingCollector, BillingEvent};
 use crate::error::Result;
 use crate::frames::{
     ControlFrame, DataFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,
-    SystemFrame, TranscriptionData, TranslationData,
+    SystemFrame, TranscriptionData, TranslationData, TranslationErrorData,
 };
 
 // ---------------------------------------------------------------------------
@@ -134,6 +143,29 @@ pub struct TranslationService {
     workers: Mutex<HashMap<String, mpsc::UnboundedSender<TranscriptionData>>>,
     /// The last transcript submitted: a transcript seen twice is translated once.
     last: Mutex<Option<(String, String)>>,
+    /// Interim translation, when on ([`with_interim`](Self::with_interim)).
+    interim: Option<Interim>,
+    /// Counts final transcripts: an interim translation asked for before the latest final is
+    /// stale, its utterance over.
+    finals: Arc<AtomicU64>,
+}
+
+/// Interim translation: its languages, how often, and the newest interim transcript per language.
+struct Interim {
+    every: Duration,
+    targets: TranslationTargets,
+    workers: Mutex<HashMap<String, watch::Sender<Option<(u64, TranscriptionData)>>>>,
+}
+
+/// Interim transcripts shorter than this are not worth a call.
+const MIN_INTERIM_CHARS: usize = 8;
+
+/// What became of one transcript in one language.
+enum Outcome {
+    Translated(TranslationData),
+    Failed(String),
+    /// The provider answered nothing.
+    Nothing,
 }
 
 impl TranslationService {
@@ -150,7 +182,21 @@ impl TranslationService {
             default_source: None,
             workers: Mutex::new(HashMap::new()),
             last: Mutex::new(None),
+            interim: None,
+            finals: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Also translate interim transcripts into `targets` (a set apart from the final targets: the
+    /// languages read live), the newest one per language and at most one call per `every`.
+    pub fn with_interim(mut self, every: Duration, targets: TranslationTargets) -> Self {
+        self.interim = Some(Interim { every, targets, workers: Mutex::new(HashMap::new()) });
+        self
+    }
+
+    /// The handle the interim targets can be changed through, when interim translation is on.
+    pub fn interim_targets(&self) -> Option<TranslationTargets> {
+        self.interim.as_ref().map(|i| i.targets.clone())
     }
 
     /// Report a [`BillingEvent::TranslationUsage`] per call.
@@ -181,6 +227,8 @@ impl TranslationService {
 
     /// Queues a final transcript for every current target.
     fn submit(&self, processor: &FrameProcessor, transcript: &TranscriptionData) {
+        // Whatever interim translation is in flight is for an utterance now over.
+        self.finals.fetch_add(1, Ordering::SeqCst);
         let text = transcript.text.trim();
         if text.is_empty() {
             return;
@@ -219,8 +267,17 @@ impl TranslationService {
                 }
                 // Already in the target language: passed through, no call made, nothing to bill.
                 let passed_through = transcript.language.as_deref().is_some_and(|from| same_language(from, &target));
-                let translation = translate_one(provider.as_ref(), &transcript, &target).await;
-                let Some(translation) = translation else { continue };
+                let translation = match translate_one(provider.as_ref(), &transcript, &target).await {
+                    Outcome::Translated(t) => t,
+                    Outcome::Nothing => continue,
+                    Outcome::Failed(error) => {
+                        let failed = TranslationErrorData::new(&transcript, &target, provider.name(), error);
+                        if let Err(e) = processor.push_frame(Frame::translation_error(failed), FrameDirection::Downstream).await {
+                            log::warn!("Translation: could not push a translation error ({target}): {e}");
+                        }
+                        continue;
+                    }
+                };
                 if let (Some(bc), false) = (&billing, passed_through) {
                     bc.record(BillingEvent::TranslationUsage {
                         session_id: bc.session_id(),
@@ -243,25 +300,115 @@ impl TranslationService {
         queue
     }
 
+    /// Hands an interim transcript to every interim target's worker, replacing the one waiting.
+    fn submit_interim(&self, processor: &FrameProcessor, transcript: &TranscriptionData) {
+        let Some(interim) = &self.interim else { return };
+        if transcript.text.trim().chars().count() < MIN_INTERIM_CHARS {
+            return;
+        }
+        let generation = self.finals.load(Ordering::SeqCst);
+        let mut workers = interim.workers.lock().unwrap();
+        for target in interim.targets.get() {
+            let from = transcript.language.as_deref().or(self.default_source.as_deref());
+            if from.is_some_and(|from| same_language(from, &target)) {
+                continue; // its own transcript says it
+            }
+            let slot = workers
+                .entry(target.clone())
+                .or_insert_with(|| self.interim_worker(processor.clone(), target, interim.every));
+            slot.send_replace(Some((generation, transcript.clone())));
+        }
+    }
+
+    /// Translates one language's newest interim transcript, at most once per `every`, until its
+    /// sender is dropped.
+    fn interim_worker(
+        &self,
+        processor: FrameProcessor,
+        target: String,
+        every: Duration,
+    ) -> watch::Sender<Option<(u64, TranscriptionData)>> {
+        let (slot, mut newest) = watch::channel::<Option<(u64, TranscriptionData)>>(None);
+        let provider = Arc::clone(&self.provider);
+        let billing = self.billing.clone();
+        let default_source = self.default_source.clone();
+        let finals = Arc::clone(&self.finals);
+        tokio::spawn(async move {
+            let mut last = String::new();
+            while newest.changed().await.is_ok() {
+                let Some((generation, mut transcript)) = newest.borrow_and_update().clone() else { continue };
+                let text: String = transcript.text.trim().chars().take(provider.max_chars()).collect();
+                if generation != finals.load(Ordering::SeqCst) || text == last {
+                    continue;
+                }
+                if transcript.language.is_none() {
+                    transcript.language = default_source.clone();
+                }
+                let started = Instant::now();
+                let answer = provider.translate(&text, transcript.language.as_deref(), &target).await;
+                let stale = generation != finals.load(Ordering::SeqCst);
+                match answer {
+                    Ok(Translated { text: translated, source_language }) if !translated.trim().is_empty() => {
+                        last = text.clone();
+                        if let Some(bc) = &billing {
+                            bc.record(BillingEvent::TranslationUsage {
+                                session_id: bc.session_id(),
+                                provider: provider.name().to_string(),
+                                model: provider.model(),
+                                source_language: transcript.language.clone().or(source_language.clone()),
+                                target_language: target.clone(),
+                                char_count: text.chars().count(),
+                                occurred_at: Utc::now(),
+                            });
+                        }
+                        if !stale {
+                            let mut translation = TranslationData::new(&transcript, &target, translated.trim());
+                            translation.finalized = false;
+                            translation.provider = Some(provider.name().to_string());
+                            translation.latency_ms = Some(started.elapsed().as_millis() as u64);
+                            if translation.source_language.is_none() {
+                                translation.source_language = source_language;
+                            }
+                            let _ = processor.push_frame(Frame::translation(translation), FrameDirection::Downstream).await;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::debug!("Translation ({target}, interim): {e}");
+                        let failed = TranslationErrorData::new(&transcript, &target, provider.name(), e.to_string());
+                        let _ = processor.push_frame(Frame::translation_error(failed), FrameDirection::Downstream).await;
+                    }
+                }
+                tokio::time::sleep(every).await;
+            }
+        });
+        slot
+    }
+
     fn stop_workers(&self) {
         self.workers.lock().unwrap().clear();
+        if let Some(interim) = &self.interim {
+            interim.workers.lock().unwrap().clear();
+        }
     }
 }
 
-/// One transcript into one language: the provider's answer as a `TranslationData`, or `None` when
-/// there is nothing to say (the call failed, or it answered nothing).
+/// One transcript into one language: the provider's answer as a `TranslationData` (with the
+/// provider and how long it took), the error when the call failed, or nothing when it answered
+/// nothing.
 async fn translate_one(
     provider: &dyn TranslationProvider,
     transcript: &TranscriptionData,
     target: &str,
-) -> Option<TranslationData> {
+) -> Outcome {
     let text = transcript.text.trim();
     let from = transcript.language.as_deref();
     if from.is_some_and(|from| same_language(from, target)) {
         // Already in the target language: the transcript is its own translation.
-        return Some(TranslationData::new(transcript, target, text));
+        return Outcome::Translated(TranslationData::new(transcript, target, text));
     }
 
+    let started = Instant::now();
     let mut pieces = Vec::new();
     let mut detected = None;
     for chunk in split_at_sentences(text, provider.max_chars()) {
@@ -276,18 +423,20 @@ async fn translate_one(
             }
             Err(e) => {
                 log::warn!("Translation ({target}): {e}");
-                return None;
+                return Outcome::Failed(e.to_string());
             }
         }
     }
     if pieces.is_empty() {
-        return None;
+        return Outcome::Nothing;
     }
     let mut translation = TranslationData::new(transcript, target, pieces.join(" "));
     if translation.source_language.is_none() {
         translation.source_language = detected;
     }
-    Some(translation)
+    translation.provider = Some(provider.name().to_string());
+    translation.latency_ms = Some(started.elapsed().as_millis() as u64);
+    Outcome::Translated(translation)
 }
 
 /// Whether two BCP-47 tags name the same language, by primary subtag (`ml-IN` and `ml`).
@@ -340,6 +489,9 @@ impl FrameHandler for TranslationService {
         match &frame.inner {
             FrameInner::Data(DataFrame::Transcription(t)) if t.finalized => {
                 self.submit(processor, t);
+            }
+            FrameInner::Data(DataFrame::Transcription(t)) => {
+                self.submit_interim(processor, t);
             }
             // The turn-closing transcript rides the stop frame (STT TurnGate).
             FrameInner::System(SystemFrame::VADUserStoppedSpeaking { transcript: Some(t), .. })
@@ -592,6 +744,79 @@ mod tests {
             })
             .collect();
         assert_eq!(billed, ["en"], "only the real translation is billed");
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_goes_downstream_as_an_error() {
+        let service = TranslationService::new(Tagger, TranslationTargets::new(["en"]));
+        let proc = FrameProcessor::new("translate-test", Box::new(service), true);
+        proc.process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream).await.unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let seen = errors.clone();
+        proc.on_before_push_frame(move |frame| {
+            if let FrameInner::Data(DataFrame::TranslationError(e)) = &frame.inner {
+                seen.lock().unwrap().push(e.clone());
+            }
+        });
+        proc.process_frame(Frame::transcription(final_transcript("fail now", "4")), FrameDirection::Downstream)
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if !errors.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let errors = errors.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!((errors[0].timestamp.as_str(), errors[0].target_language.as_str()), ("4", "en"));
+        assert_eq!((errors[0].provider.as_str(), errors[0].finalized), ("tagger", true));
+        assert_eq!(errors[0].kind, crate::frames::ErrorKind::Other);
+        assert_eq!(crate::frames::ErrorKind::of("HTTP 402 Payment Required"), crate::frames::ErrorKind::Credits);
+    }
+
+    #[tokio::test]
+    async fn translations_say_who_made_them_and_how_long_it_took() {
+        let (proc, out) = harness(TranslationTargets::new(["en"]), None).await;
+        proc.process_frame(Frame::transcription(final_transcript("slow one", "1")), FrameDirection::Downstream)
+            .await
+            .unwrap();
+        let got = wait_for(&out, 1).await;
+        assert_eq!(got[0].provider.as_deref(), Some("tagger"));
+        assert!(got[0].latency_ms.unwrap() >= 70, "{:?}", got[0].latency_ms);
+    }
+
+    #[tokio::test]
+    async fn interim_transcripts_are_translated_into_the_interim_languages_only() {
+        let service = TranslationService::new(Tagger, TranslationTargets::new(["en", "hi"]))
+            .with_interim(Duration::from_millis(20), TranslationTargets::new(["en"]));
+        let proc = FrameProcessor::new("translate-test", Box::new(service), true);
+        proc.process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream).await.unwrap();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let seen = out.clone();
+        proc.on_before_push_frame(move |frame| {
+            if let FrameInner::Data(DataFrame::Translation(t)) = &frame.inner {
+                seen.lock().unwrap().push(t.clone());
+            }
+        });
+        let partial = |text: &str| Frame::transcription(TranscriptionData::new(text, "u", "1").with_language("ml-IN"));
+        proc.process_frame(partial("short"), FrameDirection::Downstream).await.unwrap();
+        proc.process_frame(partial("words being spoken"), FrameDirection::Downstream).await.unwrap();
+        let got = wait_for(&out, 1).await;
+        assert_eq!(got.len(), 1, "too short, and not into hi: {got:?}");
+        assert_eq!((got[0].text.as_str(), got[0].finalized), ("[ml-IN>en] words being spoken", false));
+        assert_eq!(got[0].provider.as_deref(), Some("tagger"));
+
+        // One asked for before a final, answered after it: its utterance is over, so it is dropped.
+        proc.process_frame(partial("slow words still coming"), FrameDirection::Downstream).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        proc.process_frame(Frame::transcription(final_transcript("the final words", "2")), FrameDirection::Downstream)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let got = out.lock().unwrap().clone();
+        assert!(!got.iter().any(|t| t.source_text.contains("slow words")), "{got:?}");
+        assert!(got.iter().any(|t| t.finalized && t.target_language == "hi"), "finals still go to every target");
     }
 
     #[test]

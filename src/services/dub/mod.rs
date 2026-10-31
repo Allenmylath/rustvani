@@ -34,8 +34,8 @@ use tokio::sync::mpsc;
 use crate::billing::{BillingCollector, BillingEvent};
 use crate::error::Result;
 use crate::frames::{
-    ControlFrame, DataFrame, DubbedSpeechData, Frame, FrameDirection, FrameHandler, FrameInner,
-    FrameProcessor, SystemFrame, TranslationData,
+    ControlFrame, DataFrame, DubEventData, DubEventKind, DubbedSpeechData, Frame, FrameDirection,
+    FrameHandler, FrameInner, FrameProcessor, SystemFrame, TranslationData,
 };
 use crate::services::translate::TranslationTargets;
 use crate::services::tts::synth::TtsSynthesizer;
@@ -193,7 +193,16 @@ impl DubbingService {
         let billing = self.billing.clone();
         let (pace_min, pace_max) = synth.pace_range();
         tokio::spawn(async move {
+            // What became of each utterance goes downstream as a `DubEventFrame` (RAVI `user-dub`).
+            let event = |translation: &TranslationData, kind: DubEventKind| DubEventData::new(kind, translation);
+            let tell = |processor: &FrameProcessor, data: DubEventData| {
+                let processor = processor.clone();
+                async move {
+                    let _ = processor.push_frame(Frame::dub_event(data), FrameDirection::Downstream).await;
+                }
+            };
             while let Some(translation) = translations.recv().await {
+                let received = std::time::Instant::now();
                 let pace = pace_hint(&translation).clamp(pace_min, pace_max);
                 let text = translation.text.trim();
                 let bill = |billing: &Option<Arc<dyn BillingCollector>>| {
@@ -213,6 +222,7 @@ impl DubbingService {
                         Ok(c) => c,
                         Err(e) => {
                             log::warn!("Dubbing ({lang}): {e}");
+                            tell(&processor, event(&translation, DubEventKind::Failed).failed(e.to_string())).await;
                             continue;
                         }
                     };
@@ -220,16 +230,25 @@ impl DubbingService {
                     let first = loop {
                         match chunks.chunks.recv().await {
                             Some(Ok(b)) if b.is_empty() => continue,
-                            Some(Ok(b)) => break Some(b),
+                            Some(Ok(b)) => break Ok(b),
                             Some(Err(e)) => {
                                 log::warn!("Dubbing ({lang}): {e}");
-                                break None;
+                                break Err(e.to_string());
                             }
-                            None => break None,
+                            None => break Err("no audio".to_string()),
                         }
                     };
-                    let Some(first) = first else { continue };
+                    let first = match first {
+                        Ok(first) => first,
+                        Err(error) => {
+                            tell(&processor, event(&translation, DubEventKind::Failed).failed(error)).await;
+                            continue;
+                        }
+                    };
                     bill(&billing);
+                    let mut synthesized = event(&translation, DubEventKind::Synthesized);
+                    synthesized.ready_ms = Some(received.elapsed().as_millis() as u64);
+                    tell(&processor, synthesized).await;
                     let stream = Arc::new(SpeechStream::new());
                     let pcm = crate::services::tts::synth::Pcm { samples: first, rate: chunks.rate, channels: chunks.channels };
                     let data = DubbedSpeechData::new(&translation, &voice, pace, pcm).with_stream(Arc::clone(&stream));
@@ -242,6 +261,7 @@ impl DubbingService {
                             Err(e) => {
                                 log::warn!("Dubbing ({lang}): {e}");
                                 stream.fail();
+                                tell(&processor, event(&translation, DubEventKind::Failed).failed(e.to_string())).await;
                                 break;
                             }
                         }
@@ -253,12 +273,18 @@ impl DubbingService {
                     Ok(pcm) if pcm.samples.is_empty() => {}
                     Ok(pcm) => {
                         bill(&billing);
+                        let mut synthesized = event(&translation, DubEventKind::Synthesized);
+                        synthesized.ready_ms = Some(received.elapsed().as_millis() as u64);
+                        tell(&processor, synthesized).await;
                         let data = DubbedSpeechData::new(&translation, &voice, pace, pcm);
                         if let Err(e) = processor.push_frame(Frame::dubbed_speech(data), FrameDirection::Downstream).await {
                             log::warn!("Dubbing: could not push dubbed speech ({lang}): {e}");
                         }
                     }
-                    Err(e) => log::warn!("Dubbing ({lang}): {e}"),
+                    Err(e) => {
+                        log::warn!("Dubbing ({lang}): {e}");
+                        tell(&processor, event(&translation, DubEventKind::Failed).failed(e.to_string())).await;
+                    }
                 }
             }
         });
@@ -393,6 +419,35 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         out.lock().unwrap().clone()
+    }
+
+    /// Each utterance reports what became of it: `synthesized` with how long the voice took, or
+    /// `failed` with why.
+    #[tokio::test]
+    async fn each_utterance_says_whether_its_speech_was_made() {
+        let (proc, _out) = harness(TranslationTargets::new(["hi"]), DubConfig::default(), None).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = events.clone();
+        proc.on_before_push_frame(move |frame| {
+            if let FrameInner::Data(DataFrame::DubEvent(e)) = &frame.inner {
+                seen.lock().unwrap().push(e.clone());
+            }
+        });
+        for (text, ts) in [("slow words", "1"), ("fail here", "2")] {
+            proc.process_frame(Frame::translation(translation(text, "hi", ts)), FrameDirection::Downstream).await.unwrap();
+        }
+        for _ in 0..100 {
+            if events.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!((events[0].event, events[0].timestamp.as_str()), (DubEventKind::Synthesized, "1"));
+        assert!(events[0].ready_ms.unwrap() >= 50, "{:?}", events[0].ready_ms);
+        assert_eq!((events[1].event, events[1].timestamp.as_str()), (DubEventKind::Failed, "2"));
+        assert!(events[1].error.is_some());
     }
 
     #[tokio::test]

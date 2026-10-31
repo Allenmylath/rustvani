@@ -22,8 +22,12 @@ pub struct RaviObserverParams {
     pub bot_tts_enabled:            bool,
     pub user_speaking_enabled:      bool,
     pub user_transcription_enabled: bool,
-    /// Forward `TranslationFrame`s (from a `TranslationService`) as `user-translation`.
+    /// Forward `TranslationFrame`s (from a `TranslationService`) as `user-translation`, and
+    /// `TranslationErrorFrame`s as `user-translation-error`.
     pub user_translation_enabled:   bool,
+    /// Forward `DubEventFrame`s (from a `DubbingService` and whatever plays its speech) as
+    /// `user-dub`.
+    pub user_dub_enabled:           bool,
     pub user_mute_enabled:          bool,
     pub bot_transcription_enabled:  bool,
     /// Forward function call frames (start/end, in-progress, result, raw result)
@@ -40,6 +44,7 @@ impl Default for RaviObserverParams {
             user_speaking_enabled:      true,
             user_transcription_enabled: true,
             user_translation_enabled:   true,
+            user_dub_enabled:           true,
             user_mute_enabled:          true,
             bot_transcription_enabled:  false,
             function_call_enabled:      true,
@@ -169,16 +174,19 @@ impl BaseObserver for RaviObserver {
             FrameInner::Data(DataFrame::Translation(t))
                 if self.params.user_translation_enabled =>
             {
-                let json = models::msg_user_translation(
-                    &t.text,
-                    &t.source_text,
-                    t.source_language.as_deref(),
-                    &t.target_language,
-                    &t.user_id,
-                    &t.timestamp,
-                    t.finalized,
-                );
-                self.send(json).await;
+                self.send(models::msg_user_translation(t)).await;
+            }
+            FrameInner::Data(DataFrame::TranslationError(e))
+                if self.params.user_translation_enabled =>
+            {
+                self.send(models::msg_user_translation_error(e)).await;
+            }
+
+            // ---- Dubbing ----
+            FrameInner::Data(DataFrame::DubEvent(d))
+                if self.params.user_dub_enabled =>
+            {
+                self.send(models::msg_user_dub(d)).await;
             }
 
             // ---- LLM response boundaries ----

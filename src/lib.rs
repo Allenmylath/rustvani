@@ -76,7 +76,8 @@ pub use frames::{
     AudioRawData, ControlFrame, DataFrame, DataFrameData, ErrorFrameData, Frame, FrameDirection,
     FrameHandler, FrameInner, FrameKind, FrameProcessor, FrameProcessorSetup, KeypadEntry,
     PassthroughHandler, ProcessorBusHandle, StartFrameData, SystemFrame, TranscriptionData,
-    TranslationData, DubbedSpeechData, FunctionCallData, FunctionCallResultData,
+    TranslationData, TranslationErrorData, ErrorKind, DubbedSpeechData, DubEventData, DubEventKind,
+    FunctionCallData, FunctionCallResultData,
 };
 pub use context::{shared_context, LLMContext, ToolCall};
 pub use pipeline::{FinishReason, Pipeline, PipelineLifecycle, PipelineParams, PipelineTask};
