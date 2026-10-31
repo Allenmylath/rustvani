@@ -150,7 +150,13 @@ impl SarvamStreamTts {
             async move {
                 while let Some(message) = stream.next().await {
                     match message {
-                        Ok(Message::Text(text)) => Self::on_message(&text, &current),
+                        Ok(Message::Text(text)) => {
+                            // After an error the server answers nothing more on this connection:
+                            // retire it, so the next utterance opens a new one.
+                            if Self::on_message(&text, &current) {
+                                alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                         Ok(Message::Close(_)) | Err(_) => break,
                         _ => {}
                     }
@@ -183,21 +189,24 @@ impl SarvamStreamTts {
         })
     }
 
-    /// One server message: audio to the utterance in flight; its final event ends it.
-    fn on_message(text: &str, current: &std::sync::Mutex<Option<Current>>) {
-        let Ok(message) = serde_json::from_str::<ServerMessage>(text) else { return };
+    /// One server message: audio to the utterance in flight; its final event ends it. Whether it
+    /// was an error, after which the connection is no use.
+    fn on_message(text: &str, current: &std::sync::Mutex<Option<Current>>) -> bool {
+        let Ok(message) = serde_json::from_str::<ServerMessage>(text) else { return false };
         match message.kind.as_str() {
             "audio" => {
-                let Some(b64) = message.data.as_ref().and_then(|d| d["audio"].as_str()).filter(|s| !s.is_empty()) else { return };
-                let Ok(mut audio) = BASE64.decode(b64) else { return };
+                let Some(b64) = message.data.as_ref().and_then(|d| d["audio"].as_str()).filter(|s| !s.is_empty()) else { return false };
+                let Ok(mut audio) = BASE64.decode(b64) else { return false };
                 if audio.len() > 44 && audio.starts_with(b"RIFF") {
                     audio.drain(..44);
                 }
                 if audio.is_empty() {
-                    return;
+                    return false;
                 }
                 if let Some(c) = current.lock().unwrap().as_ref() {
-                    let _ = c.chunks.try_send(Ok(Bytes::from(audio)));
+                    if let Err(mpsc::error::TrySendError::Full(_)) = c.chunks.try_send(Ok(Bytes::from(audio))) {
+                        log::warn!("SarvamStreamTts: audio arriving faster than it is taken; a chunk was dropped");
+                    }
                 }
             }
             "event" | "done" => {
@@ -212,9 +221,11 @@ impl SarvamStreamTts {
                 if let Some(c) = current.lock().unwrap().take() {
                     let _ = c.chunks.try_send(Err(PipecatError::pipeline(format!("SarvamStreamTts: {why}"))));
                 }
+                return true;
             }
             other => log::debug!("SarvamStreamTts: unhandled message {other:?}"),
         }
+        false
     }
 }
 
@@ -317,12 +328,15 @@ impl TtsSynthesizer for SarvamStreamTts {
         // sender, so this does not itself keep the chunks open.)
         tokio::spawn({
             let current = Arc::clone(&connection.current);
+            let alive = Arc::clone(&connection.alive);
             let weak = tx.downgrade();
             async move {
                 tokio::time::sleep(UTTERANCE_TIMEOUT).await;
                 let Some(tx) = weak.upgrade() else { return };
                 let stale = current.lock().unwrap().as_ref().is_some_and(|c| c.chunks.same_channel(&tx));
                 if stale {
+                    // A connection that dropped an utterance would drop the next too.
+                    alive.store(false, std::sync::atomic::Ordering::Relaxed);
                     current.lock().unwrap().take();
                     let _ = tx.try_send(Err(PipecatError::pipeline("SarvamStreamTts: no final event")));
                 }

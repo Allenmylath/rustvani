@@ -2,8 +2,18 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.22"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.23"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Bulbul streaming recovers from a rejected utterance (0.4.0-dev.23)
+
+- **`SarvamStreamTts`** retires a connection after the server's `error` message, or
+  after an utterance gets no final event within its timeout: the next utterance opens
+  a new connection. The server answers nothing more on such a connection, so before,
+  one rejected text (a lone fragment such as "V") made every later utterance in that
+  language wait 20 s and fail ("no final event") for as long as the process ran.
+- Audio arriving while an utterance's channel is full is logged (it was dropped
+  silently).
 
 ### Deepgram streaming STT on the shared core (0.4.0-dev.22)
 
