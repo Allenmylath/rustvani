@@ -153,10 +153,12 @@ pub struct TranslationService {
     finals_in_flight: Arc<AtomicU64>,
 }
 
-/// Interim translation: its languages, how often, and the newest interim transcript per language.
+/// Interim translation: its languages, how often, its provider when not the service's, and the
+/// newest interim transcript per language.
 struct Interim {
     every: Duration,
     targets: TranslationTargets,
+    provider: Option<Arc<dyn TranslationProvider>>,
     workers: Mutex<HashMap<String, watch::Sender<Option<(u64, TranscriptionData)>>>>,
 }
 
@@ -194,7 +196,18 @@ impl TranslationService {
     /// Also translate interim transcripts into `targets` (a set apart from the final targets: the
     /// languages read live), the newest one per language and at most one call per `every`.
     pub fn with_interim(mut self, every: Duration, targets: TranslationTargets) -> Self {
-        self.interim = Some(Interim { every, targets, workers: Mutex::new(HashMap::new()) });
+        self.interim = Some(Interim { every, targets, provider: None, workers: Mutex::new(HashMap::new()) });
+        self
+    }
+
+    /// Make interim translations with `provider` instead of the service's: a fast one with room for
+    /// many calls, so the final translations' provider is left to the finals. (Sarvam Translate
+    /// slows every call of a key that calls it this often: finals then queued for a minute.)
+    /// After [`with_interim`](Self::with_interim).
+    pub fn with_interim_provider(mut self, provider: Arc<dyn TranslationProvider>) -> Self {
+        if let Some(interim) = &mut self.interim {
+            interim.provider = Some(provider);
+        }
         self
     }
 
@@ -337,7 +350,11 @@ impl TranslationService {
         every: Duration,
     ) -> watch::Sender<Option<(u64, TranscriptionData)>> {
         let (slot, mut newest) = watch::channel::<Option<(u64, TranscriptionData)>>(None);
-        let provider = Arc::clone(&self.provider);
+        let provider = self
+            .interim
+            .as_ref()
+            .and_then(|i| i.provider.clone())
+            .unwrap_or_else(|| Arc::clone(&self.provider));
         let billing = self.billing.clone();
         let default_source = self.default_source.clone();
         let finals = Arc::clone(&self.finals);
@@ -833,6 +850,41 @@ mod tests {
         let got = out.lock().unwrap().clone();
         assert!(!got.iter().any(|t| t.source_text.contains("slow words")), "{got:?}");
         assert!(got.iter().any(|t| t.finalized && t.target_language == "hi"), "finals still go to every target");
+    }
+
+    #[tokio::test]
+    async fn interim_translations_can_have_a_provider_of_their_own() {
+        struct Quick;
+        #[async_trait]
+        impl TranslationProvider for Quick {
+            fn name(&self) -> &'static str { "quick" }
+            fn model(&self) -> String { "quick:v1".into() }
+            fn supports(&self, _lang: &str) -> bool { true }
+            async fn translate(&self, text: &str, _from: Option<&str>, to: &str) -> Result<Translated> {
+                Ok(Translated { text: format!("quick {to}: {text}"), source_language: None })
+            }
+        }
+        let service = TranslationService::new(Tagger, TranslationTargets::new(["en"]))
+            .with_interim(Duration::from_millis(10), TranslationTargets::new(["en"]))
+            .with_interim_provider(Arc::new(Quick));
+        let proc = FrameProcessor::new("translate-test", Box::new(service), true);
+        proc.process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream).await.unwrap();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let seen = out.clone();
+        proc.on_before_push_frame(move |frame| {
+            if let FrameInner::Data(DataFrame::Translation(t)) = &frame.inner {
+                seen.lock().unwrap().push(t.clone());
+            }
+        });
+        let partial = Frame::transcription(TranscriptionData::new("words being spoken", "u", "1").with_language("ml-IN"));
+        proc.process_frame(partial, FrameDirection::Downstream).await.unwrap();
+        let got = wait_for(&out, 1).await;
+        assert_eq!((got[0].text.as_str(), got[0].provider.as_deref()), ("quick en: words being spoken", Some("quick")));
+        proc.process_frame(Frame::transcription(final_transcript("the final words", "2")), FrameDirection::Downstream)
+            .await
+            .unwrap();
+        let got = wait_for(&out, 2).await;
+        assert_eq!(got[1].provider.as_deref(), Some("tagger"), "finals keep the service's provider");
     }
 
     #[test]

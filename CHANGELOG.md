@@ -2,8 +2,15 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.24"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.25"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Interim translations by a provider of their own (0.4.0-dev.25)
+
+- **`TranslationService::with_interim_provider`**: interim translations go to their own provider
+  (say Google Cloud Translation: fast, with room for many calls), leaving the final translations'
+  provider to the finals. Measured on a news bulletin: with interim calls on Sarvam Translate every
+  1.5 s, Sarvam slowed every call of the key to 5–6 s and the finals queued for up to a minute.
 
 ### Translation outcomes, interim translations and dub events (0.4.0-dev.24)
 
