@@ -148,6 +148,9 @@ pub struct TranslationService {
     /// Counts final transcripts: an interim translation asked for before the latest final is
     /// stale, its utterance over.
     finals: Arc<AtomicU64>,
+    /// Final translations being made: interim ones wait while any is, so the finals (what dubs
+    /// are made of) never queue behind them at a provider that limits concurrent calls.
+    finals_in_flight: Arc<AtomicU64>,
 }
 
 /// Interim translation: its languages, how often, and the newest interim transcript per language.
@@ -184,6 +187,7 @@ impl TranslationService {
             last: Mutex::new(None),
             interim: None,
             finals: Arc::new(AtomicU64::new(0)),
+            finals_in_flight: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -260,6 +264,7 @@ impl TranslationService {
         let provider = Arc::clone(&self.provider);
         let billing = self.billing.clone();
         let default_source = self.default_source.clone();
+        let in_flight = Arc::clone(&self.finals_in_flight);
         tokio::spawn(async move {
             while let Some(mut transcript) = transcripts.recv().await {
                 if transcript.language.is_none() {
@@ -267,7 +272,10 @@ impl TranslationService {
                 }
                 // Already in the target language: passed through, no call made, nothing to bill.
                 let passed_through = transcript.language.as_deref().is_some_and(|from| same_language(from, &target));
-                let translation = match translate_one(provider.as_ref(), &transcript, &target).await {
+                in_flight.fetch_add(1, Ordering::SeqCst);
+                let outcome = translate_one(provider.as_ref(), &transcript, &target).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let translation = match outcome {
                     Outcome::Translated(t) => t,
                     Outcome::Nothing => continue,
                     Outcome::Failed(error) => {
@@ -333,6 +341,7 @@ impl TranslationService {
         let billing = self.billing.clone();
         let default_source = self.default_source.clone();
         let finals = Arc::clone(&self.finals);
+        let finals_in_flight = Arc::clone(&self.finals_in_flight);
         tokio::spawn(async move {
             let mut last = String::new();
             while newest.changed().await.is_ok() {
@@ -343,6 +352,13 @@ impl TranslationService {
                 }
                 if transcript.language.is_none() {
                     transcript.language = default_source.clone();
+                }
+                // A final being translated goes first; this one waits (a newer may replace it).
+                while finals_in_flight.load(Ordering::SeqCst) > 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                if generation != finals.load(Ordering::SeqCst) {
+                    continue;
                 }
                 let started = Instant::now();
                 let answer = provider.translate(&text, transcript.language.as_deref(), &target).await;

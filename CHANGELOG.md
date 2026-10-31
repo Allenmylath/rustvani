@@ -15,7 +15,9 @@ since Cargo will not resolve a prerelease from a plain version requirement.
 - **Interim translation** (`TranslationService::with_interim(every, targets)`): the newest interim
   transcript per language is translated at most once per `every`, into its own set of languages
   (those read live), as a `TranslationFrame` with `finalized: false`; one overtaken by a final
-  transcript before its answer comes is dropped. Interim calls are billed like final ones.
+  transcript before its answer comes is dropped, and none is made while a final translation is
+  in flight (finals, what dubs are made of, never queue behind them). Interim calls are billed like
+  final ones.
 - **`DubEventFrame`** (`DubEventData`, `DubEventKind`): `DubbingService` reports `synthesized`
   (with `ready_ms`, from the translation to the first audio) and `failed` (with the error and its
   kind); whatever plays the speech reports `started` (`late_ms`, `rtp_timestamp`), `ended`
