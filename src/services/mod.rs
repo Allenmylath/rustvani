@@ -5,6 +5,7 @@
 //! submodule declarations carry the same gates; these re-exports mirror them.
 
 pub mod dub;
+pub mod ledger;
 pub mod llm;
 pub mod stt;
 pub mod translate;
@@ -52,6 +53,7 @@ pub use llm::FunctionRegistry;
 pub use translate::{Translated, TranslationProvider, TranslationService, TranslationTargets};
 pub use tts::synth::{Pcm, PcmChunks, TtsSynthesizer};
 pub use dub::{DubConfig, DubbingService, PaceHint, SpeechStream};
+pub use ledger::{Closed, Counts, SentenceKey, SentenceLedger, Stage, Stuck};
 #[cfg(feature = "tts-sarvam")]
 pub use tts::sarvam_rest::{SarvamRestTts, SarvamRestTtsConfig};
 #[cfg(feature = "tts-sarvam")]

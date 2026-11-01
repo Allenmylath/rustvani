@@ -76,6 +76,20 @@ Sarvam's `xx-IN` codes. Ask `provider.supports("ta")` before offering a language
 Longer transcripts are split at sentence ends (then spaces) and the pieces joined. `429` and `5xx`
 are retried once after 500 ms.
 
+## Retries and a fallback
+
+A final translation is not given up on after one call. A call that was rate limited, timed out or
+failed otherwise is tried again after 0.5 s and 1.5 s (`RETRY_WAITS`; `with_retry_waits`). Then a
+second provider, given with `with_fallback_provider`, gets it, and retries once. It gets it at once
+when the first provider is out of credits, refused the text, or answered nothing. The
+`TranslationErrorFrame` goes out only when every attempt failed, and the `TranslationData` says
+which provider answered. Once the fallback has translated a line the provider could not, it goes
+first for the next 60 s (`FALLBACK_HOLD`), so a provider that is down costs its retries once rather
+than on every line. The retries run in the language's queue, so translations keep their
+order. Interim translations are not retried. With a `SentenceLedger` (`with_ledger`), each final
+transcript with words in it is opened in every dubbed language here, and closed `Failed` when it
+could not be translated (see `doc/dubbing.md`).
+
 ## Frames
 
 | Consumed | Produced |

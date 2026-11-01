@@ -19,10 +19,18 @@
 //! the first chunk of audio is there, carrying that chunk, and the rest follows on the frame's
 //! [`SpeechStream`]; a host can start playing a few hundred milliseconds after the text instead
 //! of after the whole utterance.
+//!
+//! An utterance whose speech could not be made (the voice failed, or gave no audio) is tried once
+//! more after [`RETRY_WAIT`] before it is reported `failed`. With a
+//! [`SentenceLedger`](crate::services::ledger::SentenceLedger) that `failed` closes the sentence as
+//! lost; a translation into a language no longer dubbed closes it as abandoned; and speech handed
+//! on moves it to `Playing`, after which **whatever plays the `DubbedSpeechFrame` closes it**
+//! (played, failed, or abandoned when nobody listens any more).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::Notify;
@@ -37,8 +45,12 @@ use crate::frames::{
     ControlFrame, DataFrame, DubEventData, DubEventKind, DubbedSpeechData, Frame, FrameDirection,
     FrameHandler, FrameInner, FrameProcessor, SystemFrame, TranslationData,
 };
+use crate::services::ledger::{Closed, SentenceKey, SentenceLedger, Stage};
 use crate::services::translate::TranslationTargets;
-use crate::services::tts::synth::TtsSynthesizer;
+use crate::services::tts::synth::{Pcm, TtsSynthesizer};
+
+/// How long after a failed synthesis an utterance is tried again.
+pub const RETRY_WAIT: Duration = Duration::from_millis(500);
 
 /// Decides the pace of an utterance (1.0 is natural); the service clamps it to the provider's range.
 pub type PaceHint = Arc<dyn Fn(&TranslationData) -> f32 + Send + Sync>;
@@ -135,6 +147,8 @@ pub struct DubbingService {
     config: DubConfig,
     pace: PaceHint,
     billing: Option<Arc<dyn BillingCollector>>,
+    ledger: Option<Arc<SentenceLedger>>,
+    retry_wait: Duration,
     workers: Mutex<HashMap<String, mpsc::UnboundedSender<TranslationData>>>,
 }
 
@@ -146,6 +160,8 @@ impl DubbingService {
             config,
             pace: Arc::new(|_| 1.0),
             billing: None,
+            ledger: None,
+            retry_wait: RETRY_WAIT,
             workers: Mutex::new(HashMap::new()),
         }
     }
@@ -158,6 +174,19 @@ impl DubbingService {
     /// Report a [`BillingEvent::TtsUsage`] per utterance.
     pub fn with_billing(mut self, billing: Arc<dyn BillingCollector>) -> Self {
         self.billing = Some(billing);
+        self
+    }
+
+    /// Close the sentences that cannot be spoken in `ledger`, and move the spoken ones to
+    /// `Playing` (see the module docs).
+    pub fn with_ledger(mut self, ledger: Arc<SentenceLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// How long after a failed synthesis it is tried again ([`RETRY_WAIT`] by default).
+    pub fn with_retry_wait(mut self, wait: Duration) -> Self {
+        self.retry_wait = wait;
         self
     }
 
@@ -174,7 +203,16 @@ impl DubbingService {
     }
 
     fn submit(&self, processor: &FrameProcessor, translation: &TranslationData) {
-        if translation.text.trim().is_empty() || !self.targets.get().iter().any(|t| *t == translation.target_language) {
+        if !self.targets.get().iter().any(|t| *t == translation.target_language) {
+            if let Some(ledger) = &self.ledger {
+                ledger.close(&SentenceKey::of_translation(translation), Closed::Abandoned("not dubbed".into()));
+            }
+            return;
+        }
+        if translation.text.trim().is_empty() {
+            if let Some(ledger) = &self.ledger {
+                ledger.close(&SentenceKey::of_translation(translation), Closed::Failed("empty translation".into()));
+            }
             return;
         }
         let mut workers = self.workers.lock().unwrap();
@@ -186,105 +224,36 @@ impl DubbingService {
 
     fn worker(&self, processor: FrameProcessor, lang: String) -> mpsc::UnboundedSender<TranslationData> {
         let (queue, mut translations) = mpsc::unbounded_channel::<TranslationData>();
-        let synth = Arc::clone(&self.synth);
-        let voice = self.config.voice_for(&lang).to_string();
-        let sample_rate = self.config.sample_rate;
+        let speaker = Speaker {
+            synth: Arc::clone(&self.synth),
+            voice: self.config.voice_for(&lang).to_string(),
+            sample_rate: self.config.sample_rate,
+            billing: self.billing.clone(),
+            ledger: self.ledger.clone(),
+            processor,
+            lang,
+        };
         let pace_hint = Arc::clone(&self.pace);
-        let billing = self.billing.clone();
-        let (pace_min, pace_max) = synth.pace_range();
+        let retry_wait = self.retry_wait;
+        let (pace_min, pace_max) = speaker.synth.pace_range();
         tokio::spawn(async move {
-            // What became of each utterance goes downstream as a `DubEventFrame` (RAVI `user-dub`).
-            let event = |translation: &TranslationData, kind: DubEventKind| DubEventData::new(kind, translation);
-            let tell = |processor: &FrameProcessor, data: DubEventData| {
-                let processor = processor.clone();
-                async move {
-                    let _ = processor.push_frame(Frame::dub_event(data), FrameDirection::Downstream).await;
-                }
-            };
             while let Some(translation) = translations.recv().await {
-                let received = std::time::Instant::now();
+                let received = Instant::now();
                 let pace = pace_hint(&translation).clamp(pace_min, pace_max);
-                let text = translation.text.trim();
-                let bill = |billing: &Option<Arc<dyn BillingCollector>>| {
-                    if let Some(bc) = billing {
-                        bc.record(BillingEvent::TtsUsage {
-                            session_id: bc.session_id(),
-                            provider: synth.name().to_string(),
-                            voice: voice.clone(),
-                            language: Some(lang.clone()),
-                            char_count: text.chars().count(),
-                            occurred_at: Utc::now(),
-                        });
-                    }
+                let error = match speaker.speak(&translation, pace, received).await {
+                    Ok(()) => continue,
+                    Err(e) => e,
                 };
-                if synth.streams() {
-                    let mut chunks = match synth.synthesize_streaming(text, &lang, &voice, pace, sample_rate).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            log::warn!("Dubbing ({lang}): {e}");
-                            tell(&processor, event(&translation, DubEventKind::Failed).failed(e.to_string())).await;
-                            continue;
-                        }
-                    };
-                    // The frame goes out with the first chunk; the rest follows on its stream.
-                    let first = loop {
-                        match chunks.chunks.recv().await {
-                            Some(Ok(b)) if b.is_empty() => continue,
-                            Some(Ok(b)) => break Ok(b),
-                            Some(Err(e)) => {
-                                log::warn!("Dubbing ({lang}): {e}");
-                                break Err(e.to_string());
-                            }
-                            None => break Err("no audio".to_string()),
-                        }
-                    };
-                    let first = match first {
-                        Ok(first) => first,
-                        Err(error) => {
-                            tell(&processor, event(&translation, DubEventKind::Failed).failed(error)).await;
-                            continue;
-                        }
-                    };
-                    bill(&billing);
-                    let mut synthesized = event(&translation, DubEventKind::Synthesized);
-                    synthesized.ready_ms = Some(received.elapsed().as_millis() as u64);
-                    tell(&processor, synthesized).await;
-                    let stream = Arc::new(SpeechStream::new());
-                    let pcm = crate::services::tts::synth::Pcm { samples: first, rate: chunks.rate, channels: chunks.channels };
-                    let data = DubbedSpeechData::new(&translation, &voice, pace, pcm).with_stream(Arc::clone(&stream));
-                    if let Err(e) = processor.push_frame(Frame::dubbed_speech(data), FrameDirection::Downstream).await {
-                        log::warn!("Dubbing: could not push dubbed speech ({lang}): {e}");
-                    }
-                    while let Some(chunk) = chunks.chunks.recv().await {
-                        match chunk {
-                            Ok(b) => stream.push(b),
-                            Err(e) => {
-                                log::warn!("Dubbing ({lang}): {e}");
-                                stream.fail();
-                                tell(&processor, event(&translation, DubEventKind::Failed).failed(e.to_string())).await;
-                                break;
-                            }
-                        }
-                    }
-                    stream.finish();
-                    continue;
-                }
-                match synth.synthesize(text, &lang, &voice, pace, sample_rate).await {
-                    Ok(pcm) if pcm.samples.is_empty() => {}
-                    Ok(pcm) => {
-                        bill(&billing);
-                        let mut synthesized = event(&translation, DubEventKind::Synthesized);
-                        synthesized.ready_ms = Some(received.elapsed().as_millis() as u64);
-                        tell(&processor, synthesized).await;
-                        let data = DubbedSpeechData::new(&translation, &voice, pace, pcm);
-                        if let Err(e) = processor.push_frame(Frame::dubbed_speech(data), FrameDirection::Downstream).await {
-                            log::warn!("Dubbing: could not push dubbed speech ({lang}): {e}");
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("Dubbing ({lang}): {e}");
-                        tell(&processor, event(&translation, DubEventKind::Failed).failed(e.to_string())).await;
-                    }
+                log::warn!("Dubbing ({}): {error}; once more", speaker.lang);
+                tokio::time::sleep(retry_wait).await;
+                let error = match speaker.speak(&translation, pace, received).await {
+                    Ok(()) => continue,
+                    Err(e) => e,
+                };
+                log::warn!("Dubbing ({}): {error}", speaker.lang);
+                speaker.tell(DubEventData::new(DubEventKind::Failed, &translation).failed(error.clone())).await;
+                if let Some(ledger) = &speaker.ledger {
+                    ledger.close(&SentenceKey::of_translation(&translation), Closed::Failed(format!("speech: {error}")));
                 }
             }
         });
@@ -293,6 +262,99 @@ impl DubbingService {
 
     fn stop_workers(&self) {
         self.workers.lock().unwrap().clear();
+    }
+}
+
+/// One language's voice, speaking its utterances for the worker.
+struct Speaker {
+    synth: Arc<dyn TtsSynthesizer>,
+    voice: String,
+    sample_rate: u32,
+    billing: Option<Arc<dyn BillingCollector>>,
+    ledger: Option<Arc<SentenceLedger>>,
+    processor: FrameProcessor,
+    lang: String,
+}
+
+impl Speaker {
+    /// What became of an utterance goes downstream as a `DubEventFrame` (RAVI `user-dub`).
+    async fn tell(&self, data: DubEventData) {
+        let _ = self.processor.push_frame(Frame::dub_event(data), FrameDirection::Downstream).await;
+    }
+
+    /// Speaks `translation`: its frame pushed, with the rest of a streamed one following on its
+    /// stream. An error when nothing was pushed (the voice failed or gave no audio): the caller
+    /// may try again. Speech that stops part way is reported here, `failed`, and its stream fails.
+    async fn speak(&self, translation: &TranslationData, pace: f32, received: Instant) -> std::result::Result<(), String> {
+        let text = translation.text.trim();
+        let lang = self.lang.as_str();
+        if self.synth.streams() {
+            let mut chunks = self
+                .synth
+                .synthesize_streaming(text, lang, &self.voice, pace, self.sample_rate)
+                .await
+                .map_err(|e| e.to_string())?;
+            // The frame goes out with the first chunk; the rest follows on its stream.
+            let first = loop {
+                match chunks.chunks.recv().await {
+                    Some(Ok(b)) if b.is_empty() => continue,
+                    Some(Ok(b)) => break b,
+                    Some(Err(e)) => return Err(e.to_string()),
+                    None => return Err("no audio".to_string()),
+                }
+            };
+            let stream = Arc::new(SpeechStream::new());
+            let pcm = Pcm { samples: first, rate: chunks.rate, channels: chunks.channels };
+            let data = DubbedSpeechData::new(translation, &self.voice, pace, pcm).with_stream(Arc::clone(&stream));
+            self.hand_over(translation, data, received).await;
+            while let Some(chunk) = chunks.chunks.recv().await {
+                match chunk {
+                    Ok(b) => stream.push(b),
+                    Err(e) => {
+                        log::warn!("Dubbing ({lang}): {e}");
+                        stream.fail();
+                        self.tell(DubEventData::new(DubEventKind::Failed, translation).failed(e.to_string())).await;
+                        break;
+                    }
+                }
+            }
+            stream.finish();
+            return Ok(());
+        }
+        let pcm = self
+            .synth
+            .synthesize(text, lang, &self.voice, pace, self.sample_rate)
+            .await
+            .map_err(|e| e.to_string())?;
+        if pcm.samples.is_empty() {
+            return Err("no audio".to_string());
+        }
+        let data = DubbedSpeechData::new(translation, &self.voice, pace, pcm);
+        self.hand_over(translation, data, received).await;
+        Ok(())
+    }
+
+    /// Bills the utterance, reports it `synthesized`, and pushes its speech (it is `Playing` now).
+    async fn hand_over(&self, translation: &TranslationData, data: DubbedSpeechData, received: Instant) {
+        if let Some(bc) = &self.billing {
+            bc.record(BillingEvent::TtsUsage {
+                session_id: bc.session_id(),
+                provider: self.synth.name().to_string(),
+                voice: self.voice.clone(),
+                language: Some(self.lang.clone()),
+                char_count: translation.text.trim().chars().count(),
+                occurred_at: Utc::now(),
+            });
+        }
+        let mut synthesized = DubEventData::new(DubEventKind::Synthesized, translation);
+        synthesized.ready_ms = Some(received.elapsed().as_millis() as u64);
+        self.tell(synthesized).await;
+        if let Some(ledger) = &self.ledger {
+            ledger.advance(&SentenceKey::of_translation(translation), Stage::Playing);
+        }
+        if let Err(e) = self.processor.push_frame(Frame::dubbed_speech(data), FrameDirection::Downstream).await {
+            log::warn!("Dubbing: could not push dubbed speech ({}): {e}", self.lang);
+        }
     }
 }
 
@@ -394,7 +456,7 @@ mod tests {
     }
 
     async fn harness(targets: TranslationTargets, config: DubConfig, pace: Option<PaceHint>) -> (FrameProcessor, Arc<Mutex<Vec<DubbedSpeechData>>>) {
-        let mut service = DubbingService::new(Arc::new(Tone), targets, config);
+        let mut service = DubbingService::new(Arc::new(Tone), targets, config).with_retry_wait(Duration::from_millis(5));
         if let Some(p) = pace {
             service = service.with_pace_hint(p);
         }
@@ -498,6 +560,95 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].text, "final");
         assert_eq!(got[0].pace, 1.0, "the default hint");
+    }
+
+    /// Fails (or gives no audio, when `empty`) its first `misses` calls, then speaks.
+    struct Shaky {
+        misses: std::sync::atomic::AtomicUsize,
+        empty: bool,
+    }
+
+    #[async_trait]
+    impl TtsSynthesizer for Shaky {
+        fn name(&self) -> &'static str { "shaky" }
+        fn model(&self) -> String { "shaky:v1".into() }
+        fn supports(&self, _lang: &str) -> bool { true }
+        async fn synthesize(&self, _text: &str, _lang: &str, _voice: &str, _pace: f32, rate: u32) -> Result<Pcm> {
+            if self.misses.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                self.misses.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if self.empty {
+                    return Ok(Pcm { samples: Bytes::new(), rate, channels: 1 });
+                }
+                return Err(PipecatError::pipeline("connection reset"));
+            }
+            Ok(Pcm { samples: Bytes::from_static(&[1, 0, 1, 0]), rate, channels: 1 })
+        }
+    }
+
+    /// Speech and events out of a service on `synth` dubbing Hindi, with a ledger; `translations`
+    /// opened in it first.
+    async fn speak_all(
+        synth: Arc<dyn TtsSynthesizer>,
+        translations: &[TranslationData],
+    ) -> (Vec<DubbedSpeechData>, Vec<DubEventData>, Arc<SentenceLedger>) {
+        let targets = TranslationTargets::new(["hi"]);
+        let ledger = Arc::new(SentenceLedger::new(targets.clone()));
+        let service = DubbingService::new(synth, targets, DubConfig::default())
+            .with_retry_wait(Duration::from_millis(5))
+            .with_ledger(Arc::clone(&ledger));
+        let proc = FrameProcessor::new("dub-test", Box::new(service), true);
+        proc.process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream).await.unwrap();
+        let out = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+        let seen = out.clone();
+        proc.on_before_push_frame(move |frame| match &frame.inner {
+            FrameInner::Data(DataFrame::DubbedSpeech(d)) => seen.lock().unwrap().0.push(d.clone()),
+            FrameInner::Data(DataFrame::DubEvent(e)) => seen.lock().unwrap().1.push(e.clone()),
+            _ => {}
+        });
+        for t in translations {
+            let source = TranscriptionData::new(t.source_text.clone(), "u", t.timestamp.clone()).finalized();
+            ledger.open(&source, &[t.target_language.clone()]);
+            proc.process_frame(Frame::translation(t.clone()), FrameDirection::Downstream).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let out = out.lock().unwrap();
+        (out.0.clone(), out.1.clone(), ledger)
+    }
+
+    #[tokio::test]
+    async fn a_failed_voice_is_tried_once_more() {
+        let synth = Arc::new(Shaky { misses: 1.into(), empty: false });
+        let (speech, events, ledger) = speak_all(synth, &[translation("नमस्ते", "hi", "1")]).await;
+        assert_eq!(speech.len(), 1, "spoken on the second try");
+        assert!(!events.iter().any(|e| e.event == DubEventKind::Failed), "{events:?}");
+        let key = SentenceKey::of_speech(&speech[0]);
+        assert_eq!(ledger.stage(&key), Some(Stage::Playing), "handed to whatever plays it");
+    }
+
+    #[tokio::test]
+    async fn no_audio_twice_is_reported_and_closed_as_lost() {
+        let synth = Arc::new(Shaky { misses: 2.into(), empty: true });
+        let (speech, events, ledger) = speak_all(synth, &[translation("नमस्ते", "hi", "1")]).await;
+        assert!(speech.is_empty());
+        let failed: Vec<&DubEventData> = events.iter().filter(|e| e.event == DubEventKind::Failed).collect();
+        assert_eq!(failed.len(), 1, "no longer silent: {events:?}");
+        assert_eq!(failed[0].error.as_deref(), Some("no audio"));
+        assert_eq!(ledger.counts()["hi"].failed, 1);
+        assert!(ledger.open_counts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_language_no_longer_dubbed_is_closed_as_abandoned() {
+        let targets = TranslationTargets::new(["hi"]);
+        let ledger = Arc::new(SentenceLedger::new(targets.clone()));
+        let service = DubbingService::new(Arc::new(Tone), targets.clone(), DubConfig::default()).with_ledger(Arc::clone(&ledger));
+        let proc = FrameProcessor::new("dub-test", Box::new(service), true);
+        proc.process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream).await.unwrap();
+        let t = translation("नमस्ते", "hi", "1");
+        ledger.open(&TranscriptionData::new(t.source_text.clone(), "u", "1").finalized(), &["hi".into()]);
+        targets.set(Vec::<String>::new());
+        proc.process_frame(Frame::translation(t), FrameDirection::Downstream).await.unwrap();
+        assert_eq!(ledger.counts()["hi"].abandoned, 1);
     }
 
     #[tokio::test]

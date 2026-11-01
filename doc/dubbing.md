@@ -110,6 +110,29 @@ language, ask for `predicted / slot` clamped to a sensible range, measure what c
 (`Pcm::duration_secs()`), and call `synthesize` again faster if it still overruns. The StreamScope
 speech engine does exactly this (`sfu/processor-rustvani/src/dub.rs`).
 
+## Every sentence, accounted for
+
+An utterance whose voice failed, or gave no audio, is tried once more after `RETRY_WAIT`
+(0.5 s; `with_retry_wait`) before it is reported `failed` (a `DubEventFrame`). With a
+`SentenceLedger` (`with_ledger`, the same one the `TranslationService` opens sentences in), the
+service closes what it cannot speak (`Failed`), and what is translated into a language no longer
+dubbed (`Abandoned`), and moves what it hands on to `Playing`. From there the host that plays the
+`DubbedSpeechFrame` must close the sentence: `Played`, `Abandoned` when nobody listens any more,
+or `Failed` with why. The StreamScope engine never skips a late line (its lane catches up by
+speaking faster) and speaks a line again, whole, when its stream stopped part way.
+
+```rust
+let dubbed = TranslationTargets::new(["hi"]);
+let ledger = Arc::new(SentenceLedger::new(dubbed.clone()));
+let translation = TranslationService::new(provider, targets).with_ledger(ledger.clone());
+let dubbing = DubbingService::new(voice, dubbed, DubConfig::default()).with_ledger(ledger.clone());
+// … and the player: ledger.close(&SentenceKey::of_speech(&speech), Closed::Played)
+```
+
+`ledger.counts()`, `open_counts()` and `stuck()` say what became of the sentences; a sentence is
+only lost (`Failed`) after every retry and every provider, and both translators or both voices down
+is the one way that happens.
+
 ## Test
 
 ```sh

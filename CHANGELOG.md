@@ -2,8 +2,42 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.25"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.26"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### Every sentence translated and dubbed, or accounted for (0.4.0-dev.26)
+
+- **`SentenceLedger`** (`services::ledger`, re-exported at the crate root with `SentenceKey`,
+  `Stage`, `Closed`, `Counts`, `Stuck`): the turn gate's exactly-once discipline for a sentence
+  after the STT. `TranslationService::with_ledger` opens each final transcript with words in it
+  once per dubbed language; it moves `Translating → Speaking → Playing` and is closed exactly once
+  (`close` is a claim: a second close is a no-op) as `Played`, `Failed(why)` or `Abandoned(why)`
+  (nobody listening: not a loss). An entry open past a minute is `stuck` (a path that forgot to
+  close: a bug). A turn with no words (music, noise) opens nothing. `with_on_close` reports every
+  close, for a host counting outcomes.
+- **Final translations are retried, then sent to a fallback**: a call rate limited, timed out or
+  failed otherwise is tried again after 0.5 s and 1.5 s (`RETRY_WAITS`, `with_retry_waits`);
+  then `TranslationService::with_fallback_provider` gets it (at once when the provider is out of
+  credits, refused the text, or answered nothing; the fallback retries once). The
+  `TranslationErrorFrame` goes out only when all of them failed. A provider answering nothing was
+  silently dropped before; it now goes to the fallback, or is an error. Retries happen in the
+  language's queue, so translations keep their order. Once the fallback has translated a line the
+  provider could not, the next lines go to the fallback first for 60 s (`FALLBACK_HOLD`), the
+  provider asked only after it, then the provider is tried again: measured with Sarvam Translate
+  unreachable on an Akashvani bulletin, retrying it on every line (about 16 s a line) held the
+  queue back until 74% of the bulletin was still untranslated when it ended. After the hold the
+  provider gets one try per line until it answers. With a fallback, the provider has 3 s a line,
+  retries included (`PROVIDER_BUDGET`, `with_provider_budget`), so one that hangs costs seconds,
+  not its HTTP timeout.
+- **Fix: RAVI reported a transcript twice now and then.** `RaviObserver` dedups frames by id
+  across the pipeline's hops, and cleared its whole set at 4096 entries; audio frames fill it in
+  seconds, and a transcript whose hops straddled the clear went out twice. In StreamScope the
+  second caption had no span, its dub was placed on it, and one line in a 1 s slot put the lane
+  6 s behind. The oldest keys are now forgotten first.
+- **`DubbingService`** tries an utterance once more (`RETRY_WAIT`, 0.5 s, `with_retry_wait`) when
+  its voice failed or gave no audio, before reporting it `failed`; no audio was silently dropped
+  before. With `with_ledger`, a translation into a language no longer dubbed closes as abandoned,
+  and speech handed on moves to `Playing`: **whatever plays a `DubbedSpeechFrame` closes it**.
 
 ### Interim translations by a provider of their own (0.4.0-dev.25)
 

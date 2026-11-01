@@ -14,6 +14,19 @@
 //! about: out of credits, rate limited, rejected, …), so captions, dubs and monitors know the
 //! line will not come.
 //!
+//! A final transcript is not given up on after one call: a call that was rate limited, timed out
+//! or failed otherwise is tried again ([`RETRY_WAITS`]), and then, with
+//! [`with_fallback_provider`](TranslationService::with_fallback_provider), the other provider
+//! gets it (at once when the first is out of credits, refused the text, or answered nothing).
+//! With a fallback, the provider has [`PROVIDER_BUDGET`] for a line, retries included, so a
+//! provider that hangs costs seconds, not its HTTP timeout. Once a line has gone to the fallback,
+//! the next ones go to it first for [`FALLBACK_HOLD`] (the provider is asked only if the fallback
+//! fails); then the provider is tried again, once per line, until it answers: a provider that is
+//! down costs its retries once, not on every line, which would hold the queue back.
+//! The error frame goes out only when all of them failed. With a
+//! [`SentenceLedger`](crate::services::ledger::SentenceLedger) the sentence is opened here in
+//! every dubbed language, and closed as `Failed` when it could not be translated.
+//!
 //! Interim transcripts are translated only with [`TranslationService::with_interim`], into its own
 //! set of languages (those someone reads live, not those only dubbed): the newest interim
 //! transcript per language, at most one call per interval, as a `TranslationFrame` with
@@ -50,9 +63,10 @@ use tokio::sync::{mpsc, watch};
 use crate::billing::{BillingCollector, BillingEvent};
 use crate::error::Result;
 use crate::frames::{
-    ControlFrame, DataFrame, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,
+    ControlFrame, DataFrame, ErrorKind, Frame, FrameDirection, FrameHandler, FrameInner, FrameProcessor,
     SystemFrame, TranscriptionData, TranslationData, TranslationErrorData,
 };
+use crate::services::ledger::{Closed, SentenceKey, SentenceLedger, Stage};
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -135,6 +149,13 @@ impl TranslationTargets {
 /// The frame handler: forwards everything, translates final transcripts. See the module docs.
 pub struct TranslationService {
     provider: Arc<dyn TranslationProvider>,
+    /// Who translates a final transcript the provider could not.
+    fallback: Option<Arc<dyn TranslationProvider>>,
+    /// The waits before each retry of a failed call (the fallback gets the first only).
+    retry_waits: Vec<Duration>,
+    /// With a fallback: how long the provider has for a line, retries included.
+    provider_budget: Duration,
+    ledger: Option<Arc<SentenceLedger>>,
     targets: TranslationTargets,
     billing: Option<Arc<dyn BillingCollector>>,
     /// The source language when a transcript names none.
@@ -151,6 +172,8 @@ pub struct TranslationService {
     /// Final translations being made: interim ones wait while any is, so the finals (what dubs
     /// are made of) never queue behind them at a provider that limits concurrent calls.
     finals_in_flight: Arc<AtomicU64>,
+    /// Until when the fallback is asked first: the provider failed a line it then translated.
+    provider_down_until: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Interim translation: its languages, how often, its provider when not the service's, and the
@@ -164,6 +187,18 @@ struct Interim {
 
 /// Interim transcripts shorter than this are not worth a call.
 const MIN_INTERIM_CHARS: usize = 8;
+
+/// The waits before the retries of a failed final translation: rate limited, timed out, or failed
+/// otherwise (out of credits or a refused text are not retried).
+pub const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(500), Duration::from_millis(1500)];
+
+/// After the fallback translated a line the provider could not, how long the fallback is asked
+/// first.
+pub const FALLBACK_HOLD: Duration = Duration::from_secs(60);
+
+/// With a fallback, how long the provider has for a line, retries included (Sarvam Translate
+/// answers in 0.6-0.8 s on a normal day).
+pub const PROVIDER_BUDGET: Duration = Duration::from_secs(3);
 
 /// What became of one transcript in one language.
 enum Outcome {
@@ -182,6 +217,10 @@ impl TranslationService {
     pub fn with_provider(provider: Arc<dyn TranslationProvider>, targets: TranslationTargets) -> Self {
         Self {
             provider,
+            fallback: None,
+            retry_waits: RETRY_WAITS.to_vec(),
+            provider_budget: PROVIDER_BUDGET,
+            ledger: None,
             targets,
             billing: None,
             default_source: None,
@@ -190,6 +229,7 @@ impl TranslationService {
             interim: None,
             finals: Arc::new(AtomicU64::new(0)),
             finals_in_flight: Arc::new(AtomicU64::new(0)),
+            provider_down_until: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -214,6 +254,33 @@ impl TranslationService {
     /// The handle the interim targets can be changed through, when interim translation is on.
     pub fn interim_targets(&self) -> Option<TranslationTargets> {
         self.interim.as_ref().map(|i| i.targets.clone())
+    }
+
+    /// Translate the final transcripts `provider` (the service's) could not, after its retries:
+    /// out of credits, rate limited, down, or answering nothing.
+    pub fn with_fallback_provider(mut self, provider: Arc<dyn TranslationProvider>) -> Self {
+        self.fallback = Some(provider);
+        self
+    }
+
+    /// The waits before each retry of a failed final translation ([`RETRY_WAITS`] by default).
+    pub fn with_retry_waits(mut self, waits: Vec<Duration>) -> Self {
+        self.retry_waits = waits;
+        self
+    }
+
+    /// With a fallback, how long the provider has for a line, retries included
+    /// ([`PROVIDER_BUDGET`] by default).
+    pub fn with_provider_budget(mut self, budget: Duration) -> Self {
+        self.provider_budget = budget;
+        self
+    }
+
+    /// Open every final transcript in `ledger` in the languages it dubs, and close the ones that
+    /// could not be translated.
+    pub fn with_ledger(mut self, ledger: Arc<SentenceLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
     }
 
     /// Report a [`BillingEvent::TranslationUsage`] per call.
@@ -262,6 +329,9 @@ impl TranslationService {
         if targets.is_empty() {
             return;
         }
+        if let Some(ledger) = &self.ledger {
+            ledger.open(transcript, &targets);
+        }
         let mut workers = self.workers.lock().unwrap();
         for target in targets {
             let queue = workers
@@ -274,24 +344,36 @@ impl TranslationService {
     /// Translates one language's transcripts in order, until the queue is dropped.
     fn worker(&self, processor: FrameProcessor, target: String) -> mpsc::UnboundedSender<TranscriptionData> {
         let (queue, mut transcripts) = mpsc::unbounded_channel::<TranscriptionData>();
-        let provider = Arc::clone(&self.provider);
+        let mut providers = vec![Arc::clone(&self.provider)];
+        providers.extend(self.fallback.clone());
+        let retry_waits = self.retry_waits.clone();
+        let down_until = Arc::clone(&self.provider_down_until);
+        let budget = self.provider_budget;
+        let ledger = self.ledger.clone();
         let billing = self.billing.clone();
         let default_source = self.default_source.clone();
         let in_flight = Arc::clone(&self.finals_in_flight);
         tokio::spawn(async move {
             while let Some(mut transcript) = transcripts.recv().await {
+                let key = SentenceKey::of_transcript(&transcript, &target);
                 if transcript.language.is_none() {
                     transcript.language = default_source.clone();
                 }
                 // Already in the target language: passed through, no call made, nothing to bill.
                 let passed_through = transcript.language.as_deref().is_some_and(|from| same_language(from, &target));
                 in_flight.fetch_add(1, Ordering::SeqCst);
-                let outcome = translate_one(provider.as_ref(), &transcript, &target).await;
+                let (outcome, provider) = translate_final(&providers, &retry_waits, budget, &down_until, &transcript, &target).await;
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 let translation = match outcome {
                     Outcome::Translated(t) => t,
-                    Outcome::Nothing => continue,
-                    Outcome::Failed(error) => {
+                    Outcome::Nothing | Outcome::Failed(_) => {
+                        let error = match outcome {
+                            Outcome::Failed(e) => e,
+                            _ => format!("{} answered nothing", provider.name()),
+                        };
+                        if let Some(ledger) = &ledger {
+                            ledger.close(&key, Closed::Failed(format!("translation: {error}")));
+                        }
                         let failed = TranslationErrorData::new(&transcript, &target, provider.name(), error);
                         if let Err(e) = processor.push_frame(Frame::translation_error(failed), FrameDirection::Downstream).await {
                             log::warn!("Translation: could not push a translation error ({target}): {e}");
@@ -299,6 +381,10 @@ impl TranslationService {
                         continue;
                     }
                 };
+                if let Some(ledger) = &ledger {
+                    // Before it is pushed: the dubbing stage may take it at once.
+                    ledger.advance(&key, Stage::Speaking);
+                }
                 if let (Some(bc), false) = (&billing, passed_through) {
                     bc.record(BillingEvent::TranslationUsage {
                         session_id: bc.session_id(),
@@ -424,6 +510,100 @@ impl TranslationService {
             interim.workers.lock().unwrap().clear();
         }
     }
+}
+
+/// One final transcript into one language, not given up on lightly: the service's provider, its
+/// failed call tried again after each of `retry_waits` when it was rate limited, timed out or
+/// failed otherwise; then the fallback (`providers[1]`, when there is one), retried after the
+/// first wait only. With a fallback the provider has `budget` for the line, retries included.
+/// While `down_until` is ahead (the provider failed a line the fallback then translated), the
+/// fallback goes first and the provider is asked once, after it; once it has passed, the provider
+/// is asked first again but only once per line, until it answers. The outcome, and the provider it
+/// came from (the last one asked).
+async fn translate_final<'a>(
+    providers: &'a [Arc<dyn TranslationProvider>],
+    retry_waits: &[Duration],
+    budget: Duration,
+    down_until: &Mutex<Option<Instant>>,
+    transcript: &TranscriptionData,
+    target: &str,
+) -> (Outcome, &'a dyn TranslationProvider) {
+    let first_wait = &retry_waits[..retry_waits.len().min(1)];
+    let fallback = providers.get(1).filter(|f| f.supports(target));
+    let (provider_down, recovering) = match *down_until.lock().unwrap() {
+        Some(until) if fallback.is_some() => (Instant::now() < until, Instant::now() >= until),
+        _ => (false, false),
+    };
+    let mut order: Vec<(&'a dyn TranslationProvider, &[Duration], bool)> = Vec::new(); // (who, waits, is the fallback)
+    match fallback {
+        Some(f) if provider_down => {
+            order.push((f.as_ref(), first_wait, true));
+            order.push((providers[0].as_ref(), &[], false));
+        }
+        Some(f) => {
+            order.push((providers[0].as_ref(), if recovering { &[] } else { retry_waits }, false));
+            order.push((f.as_ref(), first_wait, true));
+        }
+        None => order.push((providers[0].as_ref(), retry_waits, false)),
+    }
+    // Only with somewhere else to go is the provider hurried.
+    let deadline = fallback.map(|_| Instant::now() + budget);
+    let mut last = (Outcome::Nothing, providers[0].as_ref());
+    let mut provider_failed = false;
+    for (i, &(provider, waits, is_fallback)) in order.iter().enumerate() {
+        let mut tries = 0;
+        loop {
+            let outcome = match deadline.filter(|_| !is_fallback) {
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout(left, translate_one(provider, transcript, target)).await {
+                        Ok(outcome) => outcome,
+                        Err(_) => Outcome::Failed(format!("no answer within {} ms", budget.as_millis())),
+                    }
+                }
+                None => translate_one(provider, transcript, target).await,
+            };
+            let retry = match &outcome {
+                Outcome::Translated(t) => {
+                    // A pass-through (no call made) says nothing about the providers.
+                    if t.provider.is_some() {
+                        let mut down = down_until.lock().unwrap();
+                        if !is_fallback {
+                            *down = None;
+                        } else if provider_failed && !provider_down {
+                            log::warn!(
+                                "Translation ({target}): {} first for {} s",
+                                provider.name(),
+                                FALLBACK_HOLD.as_secs()
+                            );
+                            *down = Some(Instant::now() + FALLBACK_HOLD);
+                        }
+                    }
+                    return (outcome, provider);
+                }
+                Outcome::Nothing => false,
+                Outcome::Failed(e) => matches!(ErrorKind::of(e), ErrorKind::RateLimited | ErrorKind::Timeout | ErrorKind::Other),
+            };
+            last = (outcome, provider);
+            // No retry the budget leaves no time for.
+            let in_budget = |wait: &Duration| is_fallback || deadline.is_none_or(|d| Instant::now() + *wait < d);
+            match waits.get(tries) {
+                Some(wait) if retry && in_budget(wait) => {
+                    log::info!("Translation ({target}): {} failed; again in {} ms", provider.name(), wait.as_millis());
+                    tokio::time::sleep(*wait).await;
+                    tries += 1;
+                }
+                _ => break,
+            }
+        }
+        if !is_fallback {
+            provider_failed = true;
+        }
+        if let Some((next, _, _)) = order.get(i + 1) {
+            log::warn!("Translation ({target}): {} could not; trying {}", provider.name(), next.name());
+        }
+    }
+    last
 }
 
 /// One transcript into one language: the provider's answer as a `TranslationData` (with the
@@ -578,12 +758,14 @@ mod tests {
         }
     }
 
+    const QUICK_RETRIES: [Duration; 2] = [Duration::from_millis(5), Duration::from_millis(5)];
+
     /// A processor in direct mode that records what the service pushes.
     async fn harness(
         targets: TranslationTargets,
         billing: Option<Arc<dyn BillingCollector>>,
     ) -> (FrameProcessor, Arc<Mutex<Vec<TranslationData>>>) {
-        let mut service = TranslationService::new(Tagger, targets);
+        let mut service = TranslationService::new(Tagger, targets).with_retry_waits(QUICK_RETRIES.to_vec());
         if let Some(b) = billing {
             service = service.with_billing(b);
         }
@@ -781,7 +963,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_call_goes_downstream_as_an_error() {
-        let service = TranslationService::new(Tagger, TranslationTargets::new(["en"]));
+        let service = TranslationService::new(Tagger, TranslationTargets::new(["en"])).with_retry_waits(QUICK_RETRIES.to_vec());
         let proc = FrameProcessor::new("translate-test", Box::new(service), true);
         proc.process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream).await.unwrap();
         let errors = Arc::new(Mutex::new(Vec::new()));
@@ -885,6 +1067,178 @@ mod tests {
             .unwrap();
         let got = wait_for(&out, 2).await;
         assert_eq!(got[1].provider.as_deref(), Some("tagger"), "finals keep the service's provider");
+    }
+
+    /// Fails its first `fails` calls with `error`, then translates; answers nothing when `empty`.
+    struct Flaky {
+        name: &'static str,
+        fails: std::sync::atomic::AtomicUsize,
+        error: &'static str,
+        empty: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Flaky {
+        fn new(name: &'static str, fails: usize, error: &'static str) -> Arc<Self> {
+            Arc::new(Self { name, fails: fails.into(), error, empty: false, calls: 0.into() })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl TranslationProvider for Flaky {
+        fn name(&self) -> &'static str { self.name }
+        fn model(&self) -> String { format!("{}:v1", self.name) }
+        fn supports(&self, _lang: &str) -> bool { true }
+        async fn translate(&self, text: &str, _from: Option<&str>, to: &str) -> Result<Translated> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fails.load(Ordering::SeqCst) > 0 {
+                self.fails.fetch_sub(1, Ordering::SeqCst);
+                return Err(PipecatError::pipeline(self.error));
+            }
+            let text = if self.empty { String::new() } else { format!("{} {to}: {text}", self.name) };
+            Ok(Translated { text, source_language: None })
+        }
+    }
+
+    /// Translations and errors out of a service in direct mode.
+    async fn run(
+        service: TranslationService,
+        transcripts: &[TranscriptionData],
+        wait: Duration,
+    ) -> (Vec<TranslationData>, Vec<TranslationErrorData>) {
+        let proc = FrameProcessor::new("translate-test", Box::new(service.with_retry_waits(QUICK_RETRIES.to_vec())), true);
+        proc.process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream).await.unwrap();
+        let out = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+        let seen = out.clone();
+        proc.on_before_push_frame(move |frame| match &frame.inner {
+            FrameInner::Data(DataFrame::Translation(t)) => seen.lock().unwrap().0.push(t.clone()),
+            FrameInner::Data(DataFrame::TranslationError(e)) => seen.lock().unwrap().1.push(e.clone()),
+            _ => {}
+        });
+        for t in transcripts {
+            proc.process_frame(Frame::transcription(t.clone()), FrameDirection::Downstream).await.unwrap();
+        }
+        tokio::time::sleep(wait).await;
+        let out = out.lock().unwrap();
+        (out.0.clone(), out.1.clone())
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_call_is_tried_again() {
+        let primary = Flaky::new("primary", 2, "HTTP 429 Too Many Requests");
+        let service = TranslationService::with_provider(primary.clone(), TranslationTargets::new(["en"]));
+        let (got, errors) = run(service, &[final_transcript("one", "1")], Duration::from_millis(100)).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(primary.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn what_the_provider_cannot_translate_goes_to_the_fallback_in_order() {
+        // Out of credits: no retry, straight to the fallback, which takes the next line too, in order.
+        let primary = Flaky::new("primary", 1, "HTTP 402 Payment Required");
+        let fallback = Flaky::new("fallback", 0, "");
+        let service = TranslationService::with_provider(primary.clone(), TranslationTargets::new(["en"]))
+            .with_fallback_provider(fallback.clone());
+        let (got, errors) =
+            run(service, &[final_transcript("one", "1"), final_transcript("two", "2")], Duration::from_millis(100)).await;
+        assert!(errors.is_empty(), "{errors:?}");
+        let got: Vec<(&str, Option<&str>)> = got.iter().map(|t| (t.text.as_str(), t.provider.as_deref())).collect();
+        assert_eq!(got, [("fallback en: one", Some("fallback")), ("fallback en: two", Some("fallback"))], "the fallback first, for a while");
+        assert_eq!((primary.calls(), fallback.calls()), (1, 2));
+    }
+
+    /// A provider that hangs costs the budget, not its HTTP timeout.
+    #[tokio::test]
+    async fn a_provider_that_hangs_has_a_budget_when_there_is_a_fallback() {
+        struct Hangs;
+        #[async_trait]
+        impl TranslationProvider for Hangs {
+            fn name(&self) -> &'static str { "hangs" }
+            fn model(&self) -> String { "hangs:v1".into() }
+            fn supports(&self, _lang: &str) -> bool { true }
+            async fn translate(&self, _text: &str, _from: Option<&str>, _to: &str) -> Result<Translated> {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Err(PipecatError::pipeline("too late"))
+            }
+        }
+        let service = TranslationService::with_provider(Arc::new(Hangs), TranslationTargets::new(["en"]))
+            .with_fallback_provider(Flaky::new("fallback", 0, ""))
+            .with_provider_budget(Duration::from_millis(50));
+        let (got, _) = run(service, &[final_transcript("one", "1")], Duration::from_millis(200)).await;
+        assert_eq!(got.len(), 1, "the fallback answered within the budget and a bit");
+        assert_eq!(got[0].provider.as_deref(), Some("fallback"));
+    }
+
+    /// After the hold, the provider is asked once per line until it answers.
+    #[tokio::test]
+    async fn after_the_hold_the_provider_gets_one_try_per_line() {
+        let primary = Flaky::new("primary", 99, "connection refused");
+        let fallback = Flaky::new("fallback", 0, "");
+        let service = TranslationService::with_provider(primary.clone(), TranslationTargets::new(["en"]))
+            .with_fallback_provider(fallback.clone());
+        // The hold already over: the provider was down a while ago.
+        *service.provider_down_until.lock().unwrap() = Some(Instant::now());
+        let (got, _) = run(service, &[final_transcript("one", "1")], Duration::from_millis(100)).await;
+        assert_eq!(got[0].provider.as_deref(), Some("fallback"));
+        assert_eq!(primary.calls(), 1, "one try, no retries");
+    }
+
+    /// A provider that is down costs its retries once, not on every line.
+    #[tokio::test]
+    async fn after_one_line_to_the_fallback_the_next_ones_go_to_it_first() {
+        let primary = Flaky::new("primary", 99, "connection refused");
+        let fallback = Flaky::new("fallback", 0, "");
+        let service = TranslationService::with_provider(primary.clone(), TranslationTargets::new(["en"]))
+            .with_fallback_provider(fallback.clone());
+        let lines: Vec<TranscriptionData> = (1..=4).map(|i| final_transcript(&format!("line {i}"), &i.to_string())).collect();
+        let (got, errors) = run(service, &lines, Duration::from_millis(150)).await;
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(got.len(), 4);
+        assert!(got.iter().all(|t| t.provider.as_deref() == Some("fallback")));
+        assert_eq!(primary.calls(), 3, "three tries on the first line only");
+        assert_eq!(fallback.calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_provider_answering_nothing_is_covered_by_the_fallback() {
+        let primary = Arc::new(Flaky { empty: true, ..Arc::into_inner(Flaky::new("primary", 0, "")).unwrap() });
+        let fallback = Flaky::new("fallback", 0, "");
+        let service = TranslationService::with_provider(primary, TranslationTargets::new(["en"])).with_fallback_provider(fallback);
+        let (got, errors) = run(service, &[final_transcript("one", "1")], Duration::from_millis(100)).await;
+        assert!(errors.is_empty());
+        assert_eq!(got[0].text, "fallback en: one");
+    }
+
+    #[tokio::test]
+    async fn when_every_provider_fails_the_sentence_is_one_error_and_closed_as_lost() {
+        let ledger = Arc::new(SentenceLedger::new(TranslationTargets::new(["en"])));
+        let primary = Flaky::new("primary", 99, "connection reset");
+        let fallback = Flaky::new("fallback", 99, "connection reset");
+        let service = TranslationService::with_provider(primary.clone(), TranslationTargets::new(["en"]))
+            .with_fallback_provider(fallback.clone())
+            .with_ledger(Arc::clone(&ledger));
+        let (got, errors) = run(service, &[final_transcript("one", "1")], Duration::from_millis(150)).await;
+        assert!(got.is_empty());
+        assert_eq!(errors.len(), 1, "one error, after every attempt: {errors:?}");
+        assert_eq!(errors[0].provider, "fallback");
+        assert_eq!((primary.calls(), fallback.calls()), (3, 2), "the primary twice more, the fallback once more");
+        assert_eq!(ledger.counts()["en"].failed, 1);
+        assert!(ledger.open_counts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dubbed_sentence_is_opened_and_moves_on_once_translated() {
+        let ledger = Arc::new(SentenceLedger::new(TranslationTargets::new(["hi"])));
+        let service = TranslationService::new(Tagger, TranslationTargets::new(["en", "hi"])).with_ledger(Arc::clone(&ledger));
+        let (got, _) = run(service, &[final_transcript("one", "1"), final_transcript("", "2")], Duration::from_millis(50)).await;
+        assert_eq!(got.len(), 2);
+        let hi = SentenceKey::of_transcript(&final_transcript("one", "1"), "hi");
+        assert_eq!(ledger.stage(&hi), Some(Stage::Speaking), "now the dubbing's to close");
+        assert_eq!(ledger.open_counts().get("hi"), Some(&1), "en is not dubbed; the empty one opens nothing");
     }
 
     #[test]

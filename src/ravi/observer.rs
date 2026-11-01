@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -59,8 +59,36 @@ impl Default for RaviObserverParams {
 pub struct RaviObserver {
     ravi_proc: FrameProcessor,
     params:    RaviObserverParams,
-    seen:      Mutex<HashSet<u64>>,
+    seen:      Mutex<Seen>,
     llm_accum: Mutex<String>,
+}
+
+/// How many frames' keys are remembered for deduplication.
+const SEEN_KEPT: usize = 4096;
+
+/// The keys of the last [`SEEN_KEPT`] frames seen, the oldest forgotten first. (Clearing them all
+/// at once let a frame's next hop through as new: a transcript then went out twice, in every run of
+/// a few minutes, its second caption with no span.)
+#[derive(Default)]
+struct Seen {
+    keys: HashSet<u64>,
+    order: VecDeque<u64>,
+}
+
+impl Seen {
+    /// Whether `key` is new; remembers it.
+    fn insert(&mut self, key: u64) -> bool {
+        if !self.keys.insert(key) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > SEEN_KEPT {
+            if let Some(old) = self.order.pop_front() {
+                self.keys.remove(&old);
+            }
+        }
+        true
+    }
 }
 
 impl RaviObserver {
@@ -68,7 +96,7 @@ impl RaviObserver {
         Self {
             ravi_proc,
             params,
-            seen:      Mutex::new(HashSet::new()),
+            seen:      Mutex::new(Seen::default()),
             llm_accum: Mutex::new(String::new()),
         }
     }
@@ -111,9 +139,6 @@ impl BaseObserver for RaviObserver {
             let mut seen = self.seen.lock().await;
             if !seen.insert(dedup_key) {
                 return;
-            }
-            if seen.len() > 4096 {
-                seen.clear();
             }
         }
 
@@ -310,6 +335,34 @@ mod tests {
             direction: FrameDirection::Downstream,
             timestamp: 0.0,
         }
+    }
+
+    /// The dedup forgets the oldest frames first: it used to clear itself at 4096, and a frame
+    /// whose hops straddled the clear was reported twice (a duplicate final caption, no span).
+    #[tokio::test]
+    async fn a_frame_is_reported_once_across_the_dedup_filling_up() {
+        let proc = FrameProcessor::new("ravi-test", Box::new(PassthroughHandler), true);
+        proc.process_frame(Frame::start(StartFrameData::default()), FrameDirection::Downstream).await.unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cap = captured.clone();
+        proc.on_before_push_frame(move |frame| {
+            if let FrameInner::System(SystemFrame::RaviServerMessage { payload }) = &frame.inner {
+                cap.lock().unwrap().push(payload.clone());
+            }
+        });
+        let observer = RaviObserver::new(proc.clone(), RaviObserverParams::default());
+        let other = || pushed(Frame::vad_user_started_speaking(0.0, 0.0));
+        for _ in 0..SEEN_KEPT - 10 {
+            observer.on_push_frame(other()).await;
+        }
+        let transcript = Frame::transcription(TranscriptionData::new("hello", "u", "1").finalized());
+        observer.on_push_frame(pushed(transcript.clone())).await;
+        for _ in 0..100 {
+            observer.on_push_frame(other()).await;
+        }
+        observer.on_push_frame(pushed(transcript)).await; // its next hop
+        let transcriptions = captured.lock().unwrap().iter().filter(|m| m.contains("user-transcription")).count();
+        assert_eq!(transcriptions, 1);
     }
 
     /// Regression: the STT TurnGate re-pushes the stashed VadStop frame with
