@@ -2,8 +2,18 @@
 
 ## 0.4.0-dev (unreleased)
 
-Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.26"` —
+Prerelease line. Install with an explicit version — `rustvani = "0.4.0-dev.27"` —
 since Cargo will not resolve a prerelease from a plain version requirement.
+
+### A provider of their own for some languages (0.4.0-dev.27)
+
+- **`TranslationService::with_provider_for(targets, provider)`**: final translations into a set
+  of target languages (changeable while the pipeline runs) go to `provider` first, the service's
+  provider covering for it. For a dubbing host: its dubbed languages translated by the fastest
+  provider, since a dub plays only once its line is translated, the languages only read by the
+  room's choice. Measured on Akashvani bulletins (StreamScope, 3 s turns): with Google Cloud
+  Translation for the dubbed languages (0.25–0.3 s a line against Sarvam's 0.65–1.2 s), dubs play
+  93–95% in sync at a 4 s delay, against 62–80% with Sarvam.
 
 ### Every sentence translated and dubbed, or accounted for (0.4.0-dev.26)
 

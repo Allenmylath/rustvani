@@ -23,7 +23,12 @@
 //! the next ones go to it first for [`FALLBACK_HOLD`] (the provider is asked only if the fallback
 //! fails); then the provider is tried again, once per line, until it answers: a provider that is
 //! down costs its retries once, not on every line, which would hold the queue back.
-//! The error frame goes out only when all of them failed. With a
+//! The error frame goes out only when all of them failed.
+//!
+//! [`with_provider_for`](TranslationService::with_provider_for) gives a set of target languages a
+//! provider of their own, asked first for their final translations, the service's provider then
+//! covering for it: a dubbing host gives its dubbed languages the fastest provider, since a dub can
+//! play only once its line is translated, and leaves the languages only read to the room's choice. With a
 //! [`SentenceLedger`](crate::services::ledger::SentenceLedger) the sentence is opened here in
 //! every dubbed language, and closed as `Failed` when it could not be translated.
 //!
@@ -151,6 +156,8 @@ pub struct TranslationService {
     provider: Arc<dyn TranslationProvider>,
     /// Who translates a final transcript the provider could not.
     fallback: Option<Arc<dyn TranslationProvider>>,
+    /// Target languages with a provider of their own, asked first for their finals.
+    provider_for: Option<(TranslationTargets, Arc<dyn TranslationProvider>)>,
     /// The waits before each retry of a failed call (the fallback gets the first only).
     retry_waits: Vec<Duration>,
     /// With a fallback: how long the provider has for a line, retries included.
@@ -174,6 +181,8 @@ pub struct TranslationService {
     finals_in_flight: Arc<AtomicU64>,
     /// Until when the fallback is asked first: the provider failed a line it then translated.
     provider_down_until: Arc<Mutex<Option<Instant>>>,
+    /// The same, for the languages with a provider of their own.
+    provider_for_down_until: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Interim translation: its languages, how often, its provider when not the service's, and the
@@ -230,6 +239,8 @@ impl TranslationService {
             finals: Arc::new(AtomicU64::new(0)),
             finals_in_flight: Arc::new(AtomicU64::new(0)),
             provider_down_until: Arc::new(Mutex::new(None)),
+            provider_for_down_until: Arc::new(Mutex::new(None)),
+            provider_for: None,
         }
     }
 
@@ -260,6 +271,14 @@ impl TranslationService {
     /// out of credits, rate limited, down, or answering nothing.
     pub fn with_fallback_provider(mut self, provider: Arc<dyn TranslationProvider>) -> Self {
         self.fallback = Some(provider);
+        self
+    }
+
+    /// Translate the final transcripts into `targets` (a set the host may change at any time, say
+    /// the languages being dubbed) with `provider` first, the service's provider covering for it
+    /// (and only it: the fallback is for the other languages).
+    pub fn with_provider_for(mut self, targets: TranslationTargets, provider: Arc<dyn TranslationProvider>) -> Self {
+        self.provider_for = Some((targets, provider));
         self
     }
 
@@ -346,8 +365,13 @@ impl TranslationService {
         let (queue, mut transcripts) = mpsc::unbounded_channel::<TranscriptionData>();
         let mut providers = vec![Arc::clone(&self.provider)];
         providers.extend(self.fallback.clone());
+        // For a language with a provider of its own: that one, then the service's.
+        let own = self.provider_for.as_ref().map(|(targets, own)| {
+            (targets.clone(), vec![Arc::clone(own), Arc::clone(&self.provider)])
+        });
         let retry_waits = self.retry_waits.clone();
         let down_until = Arc::clone(&self.provider_down_until);
+        let own_down_until = Arc::clone(&self.provider_for_down_until);
         let budget = self.provider_budget;
         let ledger = self.ledger.clone();
         let billing = self.billing.clone();
@@ -362,7 +386,11 @@ impl TranslationService {
                 // Already in the target language: passed through, no call made, nothing to bill.
                 let passed_through = transcript.language.as_deref().is_some_and(|from| same_language(from, &target));
                 in_flight.fetch_add(1, Ordering::SeqCst);
-                let (outcome, provider) = translate_final(&providers, &retry_waits, budget, &down_until, &transcript, &target).await;
+                let (chain, down) = match &own {
+                    Some((targets, chain)) if targets.get().contains(&target) => (chain, &own_down_until),
+                    _ => (&providers, &down_until),
+                };
+                let (outcome, provider) = translate_final(chain, &retry_waits, budget, down, &transcript, &target).await;
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 let translation = match outcome {
                     Outcome::Translated(t) => t,
@@ -1149,6 +1177,26 @@ mod tests {
         let got: Vec<(&str, Option<&str>)> = got.iter().map(|t| (t.text.as_str(), t.provider.as_deref())).collect();
         assert_eq!(got, [("fallback en: one", Some("fallback")), ("fallback en: two", Some("fallback"))], "the fallback first, for a while");
         assert_eq!((primary.calls(), fallback.calls()), (1, 2));
+    }
+
+    /// The languages with a provider of their own are translated by it, the others by the
+    /// service's; when it fails, the service's covers.
+    #[tokio::test]
+    async fn some_languages_can_have_a_provider_of_their_own() {
+        let fast = Flaky::new("fast", 0, "");
+        let dubbed = TranslationTargets::new(["hi"]);
+        let service = TranslationService::new(Tagger, TranslationTargets::new(["en", "hi"]))
+            .with_provider_for(dubbed.clone(), fast.clone());
+        let (got, _) = run(service, &[final_transcript("one", "1")], Duration::from_millis(80)).await;
+        let by = |lang: &str| got.iter().find(|t| t.target_language == lang).and_then(|t| t.provider.clone());
+        assert_eq!(by("hi").as_deref(), Some("fast"));
+        assert_eq!(by("en").as_deref(), Some("tagger"), "a language only read keeps the service's");
+
+        let down = Flaky::new("fast", 99, "connection refused");
+        let service = TranslationService::new(Tagger, TranslationTargets::new(["hi"])).with_provider_for(dubbed, down);
+        let (got, errors) = run(service, &[final_transcript("two", "2")], Duration::from_millis(100)).await;
+        assert!(errors.is_empty());
+        assert_eq!(got[0].provider.as_deref(), Some("tagger"), "the service's covers for it");
     }
 
     /// A provider that hangs costs the budget, not its HTTP timeout.
