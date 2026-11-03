@@ -50,26 +50,26 @@ Live captions, translation and dubbing
 
 ```toml
 [dependencies]
-rustvani = "0.4.0-dev.22"
+rustvani = "0.4.0-dev.27"
 ```
 
 `0.4.0-dev.*` is a **prerelease**, so Cargo needs the version spelled out: a plain `cargo add rustvani` resolves to the last stable release, `0.3.0`, which has none of the STT core, translation, dubbing, WebRTC, Twilio or agent-swarm work described here. Use:
 
 ```bash
-cargo add rustvani@0.4.0-dev.22
+cargo add rustvani@0.4.0-dev.27
 ```
 
-Everything in this README describes `0.4.0-dev.22`. The [CHANGELOG](CHANGELOG.md) lists what each `dev.N` added.
+Everything in this README describes `0.4.0-dev.27`. The [CHANGELOG](CHANGELOG.md) lists what each `dev.N` added.
 
 Two common manifests:
 
 ```toml
 # A Sarvam voice agent (Sarvam TTS is opt-in).
-rustvani = { version = "0.4.0-dev.22", features = ["tts-sarvam"] }
+rustvani = { version = "0.4.0-dev.27", features = ["tts-sarvam"] }
 
 # A captioning / dubbing service that wants a small dependency tree:
 # no ONNX Runtime, no Postgres, no OpenAI client.
-rustvani = { version = "0.4.0-dev.22", default-features = false,
+rustvani = { version = "0.4.0-dev.27", default-features = false,
              features = ["transport-websocket", "stt-sarvam", "translate-sarvam", "tts-sarvam"] }
 ```
 
@@ -89,7 +89,7 @@ rustvani ships many providers, so each is behind a Cargo feature that pulls in o
 | `transport-websocket` | ✅ | `transport`, `ravi`, `serializers` modules; the `rustvani::axum` re-export | axum 0.7 + tungstenite. `ChannelTransport` lives here too. |
 | `serializer-twilio` | ✅ | Twilio REST auto-hangup | The `TwilioFrameSerializer` itself builds under `transport-websocket`; only the hang-up call needs `reqwest`. |
 | `stt-sarvam` | ✅ | `SarvamSttHandler`, `SarvamRealtimeSttHandler` | Streaming and realtime (partials) endpoints |
-| `stt-deepgram` | ✅ | `DeepgramSttHandler` | |
+| `stt-deepgram` | ✅ | `DeepgramRealtimeSttHandler`, `DeepgramSttHandler` | Live `nova-3` on the STT core (partials), and the older finals-only handler |
 | `stt-60db` | ✅ | `SixtyDbSttHandler` | |
 | `llm-openai` | ✅ | `OpenAILLMHandler`, `FunctionRegistry` | Any OpenAI-compatible endpoint |
 | `llm-sarvam` | ✅ | `SarvamLLMHandler` | |
@@ -125,7 +125,7 @@ This is not a wrapper or a binding. It is a ground-up Rust implementation that m
 
 **A shared STT core with a turn gate.** Every STT provider built on `SttService` gets the same program for free: audio forwarded only during VAD-attested turns (plus pre-roll), the closing transcript bundled onto the `VADUserStoppedSpeaking` frame so the LLM can never see the stop before the words, a per-turn duration ledger for billing, live partials, mid-turn finalisation for speakers who never pause, and a socket that reopens itself when the provider closes it. A provider contributes its wire format and nothing else. See [Speech-to-text](#speech-to-text).
 
-**Live captions, translation and dubbing as pipeline stages.** `SentenceSegmenter` finalises sentences out of partial transcripts, `TranslationService` turns every final into one `TranslationFrame` per target language, and `DubbingService` speaks each translation and emits a `DubbedSpeechFrame` carrying the audio and the source transcript's timestamp, streamed from the first chunk. Targets can change while the pipeline runs. See [Live captions, translation and dubbing](#live-captions-translation-and-dubbing).
+**Live captions, translation and dubbing as pipeline stages.** `SentenceSegmenter` finalises sentences out of partial transcripts, `TranslationService` turns every final into one `TranslationFrame` per target language, and `DubbingService` speaks each translation and emits a `DubbedSpeechFrame` carrying the audio and the source transcript's timestamp, streamed from the first chunk. Targets can change while the pipeline runs; interim transcripts can be translated live; a final that fails is retried and handed to a fallback provider; and a `SentenceLedger` accounts for every sentence exactly once, as played, failed with why, or abandoned. See [Live captions, translation and dubbing](#live-captions-translation-and-dubbing).
 
 **A speech-enhancement front end, pure Rust.** High-pass filter, then RNNoise or a DeepFilterNet3-style denoiser, then automatic gain control and a soft limiter, in process, before audio reaches the STT. No Krisp SDK, no per-minute clean-up fees. See [Speech enhancement](#speech-enhancement-the-audio-front-end).
 
@@ -345,10 +345,41 @@ What comes out, and where to catch it:
 | `TranscriptionFrame` with `finalized: true`, or the transcript bundled on `VADUserStoppedSpeaking` | A sentence or a turn's final text | the segmenter and the STT turn gate |
 | `TranslationFrame` (`TranslationData`) | `text`, `target_language`, plus the source transcript's `source_text`, `source_language`, `timestamp` | `TranslationService` |
 | `DubbedSpeechFrame` (`DubbedSpeechData`) | PCM (s16le), `sample_rate`, `voice`, `pace`, the source `timestamp`; with a streaming voice, the first chunk plus a `SpeechStream` for the rest | `DubbingService` |
+| `TranslationErrorFrame` (`TranslationErrorData`) | A line no provider could translate: the source, the provider's message and an `ErrorKind` (`credits`, `rate_limited`, `rejected`, `timeout`, `other`) | `TranslationService`, after every retry and the fallback |
+| `DubEventFrame` (`DubEventData`) | What became of an utterance's speech: `synthesized` (`ready_ms`), `failed` (error, kind); `started` (`late_ms`), `ended` (`audio_ms`), `skipped` from whatever plays it | `DubbingService`, and your player |
 
-`your_sink` is any `FrameHandler` that matches on these frames (a WebSocket fan-out, an SFU track writer). Browser clients can instead be driven by the [RAVI protocol](#ravi-protocol): `RaviObserver` sends `user-transcription` and `user-translation` messages for every transcript and translation.
+`your_sink` is any `FrameHandler` that matches on these frames (a WebSocket fan-out, an SFU track writer). Browser clients can instead be driven by the [RAVI protocol](#ravi-protocol): `RaviObserver` sends `user-transcription`, `user-translation`, `user-translation-error` and `user-dub` messages for every transcript, translation and dub.
 
-Measured on All India Radio Malayalam news with the realtime endpoint: first text 0.6–1.1 s after speech starts and words on screen 1.3–1.8 s after they are spoken, at 3.9–5.2% character error. The classic streaming endpoint delivered the same text 6.4 s after, or 3.5 s with an 8 s `max_turn_ms`. A `PaceHint` lets the host fit each dubbed utterance into the time the original took.
+**In production**, a captioning host usually wants more than the plain stages: live translation of the words still being said, a second provider when the first fails or is slow, and an account of every sentence. All of it is opt-in on the same two services:
+
+```rust
+use std::time::Duration;
+use rustvani::{SentenceLedger, TranslationProvider};
+
+// Any text-to-text backend fits `TranslationProvider`; a host can bring its own
+// (StreamScope's is Google Cloud Translation) beside the built-in Sarvam one.
+let fast: Arc<dyn TranslationProvider> = Arc::new(my_google_provider);
+let read_live = TranslationTargets::new(["en"]);  // languages read as captions
+let dubbed = TranslationTargets::new(["hi"]);     // languages spoken
+
+// Every sentence opened once per dubbed language, closed exactly once as played,
+// failed (with why) or abandoned. `with_on_close` reports each close to the host.
+let ledger = Arc::new(SentenceLedger::new(dubbed.clone()));
+
+let translate = TranslationService::new(sarvam_provider, targets.clone())
+    .with_interim(Duration::from_millis(1500), read_live) // the newest partial, at most every 1.5 s
+    .with_interim_provider(fast.clone())                  // on a provider with room for many calls
+    .with_provider_for(dubbed.clone(), fast.clone())      // dubbed languages: the fastest provider first
+    .with_fallback_provider(fast)                          // finals Sarvam could not translate
+    .with_ledger(ledger.clone())
+    .into_processor();
+
+let dub = DubbingService::new(voice, dubbed, DubConfig::default())
+    .with_ledger(ledger)
+    .into_processor();
+```
+
+Measured on All India Radio Malayalam news with the realtime endpoint: first text 0.6–1.1 s after speech starts and words on screen 1.3–1.8 s after they are spoken, at 3.9–5.2% character error. The classic streaming endpoint delivered the same text 6.4 s after, or 3.5 s with an 8 s `max_turn_ms`. A `PaceHint` lets the host fit each dubbed utterance into the time the original took. Dubbing the same bulletins with the dubbed languages on a 0.3 s translator (`with_provider_for`), 93–95% of the lines play in sync at a 4 s delay behind the words, against 62–80% when every line waits for a 0.65–1.2 s one; with the primary translator unreachable, the fallback keeps 100% of the lines dubbed.
 
 → [Translation](doc/translate-sarvam.md) · [Dubbing](doc/dubbing.md) · [STT abstraction](doc/stt-abstraction.md)
 
@@ -482,9 +513,10 @@ src/
 ├── serializers/       Wire-protocol adapters: Twilio Media Streams, G.711
 ├── services/
 │   ├── stt/core/      SttService, SttProvider, TurnGate, AudioFrontend: shared by every provider on it
-│   ├── stt/           Sarvam (streaming + realtime), Deepgram, 60db, Gnani
-│   ├── translate/     TranslationService, TranslationProvider, Sarvam Translate
-│   ├── dub/           DubbingService, SpeechStream, PaceHint
+│   ├── stt/           Sarvam (streaming + realtime), Deepgram (realtime on the core, and finals-only), 60db, Gnani
+│   ├── translate/     TranslationService (interim, retries, fallback, a provider per language set), Sarvam Translate
+│   ├── dub/           DubbingService, SpeechStream, PaceHint, dub events
+│   ├── ledger.rs      SentenceLedger: every sentence closed exactly once (played, failed, abandoned)
 │   ├── tts/           Deepgram, Sarvam Bulbul (streaming handler, REST and streaming synthesizers), Piper
 │   │   └── synth.rs   TtsSynthesizer: one utterance in, its audio out
 │   └── llm/           OpenAI + Sarvam chat completions, FunctionRegistry
@@ -627,6 +659,7 @@ Every STT backend is the same program with a different wire format. The **STT co
 - `TurnGate` forwards audio only during local-VAD-attested turns plus a 500 ms pre-roll (so the provider's own server VAD has no inter-turn noise to hallucinate from), stashes `VADUserStoppedSpeaking` until the provider's final arrives and releases the two as one frame, times out after 1.2 s if no final comes, and keeps a per-turn duration ledger that attributes each transcript to its turn and feeds billing.
 - `SttCoreConfig` holds the provider-independent knobs: `sample_rate`, `noise_reduction`, `noise_backend`, `agc`, `audio_gating`, `pre_roll_ms`, `stop_release_timeout_ms`, `interim_policy` (`Drop` or `Emit` partials as non-final `TranscriptionFrame`s) and `max_turn_ms`.
 - **`max_turn_ms`**: once a turn has sent that much audio, the provider is asked to finalise what it has heard at the next gap between words (80 ms of quiet, so no word is cut in two), or 2 s later if none comes. The text arrives mid-turn and the turn goes on. For live captions of speakers who rarely pause: a newsreader's turns run 15–25 s. At 8 s, captions came three times sooner for about 1.7 points more character error.
+- **`TurnLimit`** (`SttCoreConfig::turn_limit`) is the same limit as a shared handle the host can `set()` while the STT runs: whole turns while a speaker is only captioned (each cut costs accuracy), short turns while someone hears their dub (so the voice stays near the words). Switched on mid-turn, it cuts at the next gap.
 - **Reconnect.** When the provider closes the socket or a send fails, the next send reopens it (at most every 3 s, not while the session is ending), so one server error does not silence the rest of the session.
 - Repeated identical partials are pushed once.
 
@@ -636,11 +669,12 @@ A provider implements `SttProvider`: `handshake()`, `encode_audio()`, `finalize_
 |---|---|---|---|
 | **Sarvam streaming** | `SarvamSttHandler` | ✅ | `saaras:v3`: transcribe, translate, verbatim, transliterate, codemix modes; `unknown` auto-detects among Indian languages; `prompt` for biasing; `vad_tuning` for Sarvam's server VAD. One final per turn. |
 | **Sarvam realtime** | `SarvamRealtimeSttHandler` | ✅ | `saaras:v3-realtime`: **partials** while the speaker talks, then a final. `stream_type` `fast` / `balanced` / `simulated`; `endpointing` `manual` (local VAD drives `speech_start` / `speech_end`, the default) or `vad` (Sarvam's). The handler for captions. |
-| **Deepgram** | `DeepgramSttHandler` | ❌ | `nova-3`, the low-latency choice for English and telephony. Finals only; `Finalize` sent on VAD stop. |
+| **Deepgram realtime** | `DeepgramRealtimeSttHandler` | ✅ | `nova-3` live: **partials** while the speaker talks, finals per segment with their detected language (`multi` detects English and Hindi; name the language for Malayalam or Tamil), turns from local VAD (`Finalize`), keepalives and reconnects. |
+| **Deepgram** | `DeepgramSttHandler` | ❌ | The older handler: finals only, its own socket; `Finalize` sent on VAD stop. |
 | **60db** | `SixtyDbSttHandler` | ❌ | 39 languages, two-phase finals (fast dictation then LLM-refined), diarization; linear or µ-law. |
 | **Gnani (Vachana)** | `GnaniSttHandler` | ❌ | Indic languages; feature `stt-gnani`. |
 
-Providers not yet on the core send raw audio at their configured rate, without the front end, the turn gate or the transcript-before-stop guarantee; their closing transcript may arrive after the stop frame, in which case `LLMUserAggregator` defers it to the next turn. Moving them onto the core is planned.
+Providers not on the core (the older Deepgram handler, 60db, Gnani) send raw audio at their configured rate, without the front end, the turn gate or the transcript-before-stop guarantee; their closing transcript may arrive after the stop frame, in which case `LLMUserAggregator` defers it to the next turn. Moving 60db and Gnani onto the core is planned.
 
 → Per-service guides: [STT abstraction](doc/stt-abstraction.md) · [Sarvam](doc/stt-sarvam.md) · [Deepgram](doc/stt-deepgram.md) · [60db](doc/stt-60db.md) · [Gnani](doc/stt-gnani.md)
 
@@ -661,6 +695,10 @@ Boundaries use the abbreviation-aware splitter (`Dr.`, initials, acronyms, Devan
 - **`TranslationService`** is a stage after the STT that translates every *final* transcript (`finalized` frames and the turn-closing transcript bundled on `VADUserStoppedSpeaking`) into each target language, as `TranslationFrame`s. Interims are never translated. Every other frame passes through unchanged.
 - One ordered queue per target language, off the pipeline's tasks: a slow call never delays the transcript or another language, and a language's translations come out in the order their transcripts did. Targets are a `TranslationTargets` handle that can change while the pipeline runs. A transcript already in the target language is passed through as its own translation, so a target is never silent. Long text is split at sentence ends to the provider's limit.
 - `with_default_source_language` sets the source for STTs that report none per phrase; otherwise the provider detects it.
+- **Interim translations** (`with_interim(every, targets)`): the newest interim transcript per language is translated at most once per `every`, into its own set of languages (those read live), as a `TranslationFrame` with `finalized: false`. One overtaken by a final before its answer comes is dropped, and none is made while a final translation is in flight, so finals never queue behind them. `with_interim_provider` gives them a provider of their own: measured on a news bulletin, interim calls every 1.5 s on Sarvam Translate slowed every call of the key to 5–6 s and the finals queued for a minute.
+- **Retries, then a fallback.** A final translation that is rate limited, times out or fails is tried again after 0.5 s and 1.5 s, in its language's queue so order holds. Then `with_fallback_provider` gets it, at once when the provider is out of credits, refused the text or answered nothing. Once the fallback has translated a line the provider could not, the next lines go to the fallback first for 60 s (`FALLBACK_HOLD`); with a fallback the provider has 3 s a line, retries included (`PROVIDER_BUDGET`). Only when all of them fail does a `TranslationErrorFrame` go downstream, with an `ErrorKind`.
+- **A provider per language set** (`with_provider_for(targets, provider)`): finals into those languages go to that provider first, the service's provider covering for it. A dubbing host gives its dubbed languages the fastest provider, since a dub plays only once its line is translated, and leaves the languages only read to the room's choice.
+- `TranslationData` carries `provider`, `latency_ms` and `finalized`. With a `SentenceLedger` (`with_ledger`), every final transcript with words in it is opened once per dubbed language, and the ones no provider could translate are closed as failed.
 - **`TranslationProvider`** (`name`, `model`, `supports`, `max_chars`, `translate`) fits any text-to-text backend.
 - **Sarvam Translate** (`sarvam-translate:v1` by default, or `mayura:v1`): English and 22 Indian languages, BCP-47 tags (`hi`, `en-IN`, `ml_IN`) mapped to Sarvam's codes. Sarvam detects the source language only on `mayura:v1`, so a transcript of unknown language goes to `auto_detect_model`. One retry on 429 or 5xx. *(feature `translate-sarvam`)*
 - Billing: `BillingEvent::TranslationUsage` per call, by source characters.
@@ -672,7 +710,9 @@ Boundaries use the abbreviation-aware splitter (`Dr.`, initials, acronyms, Devan
 - **`DubbingService`** sits after the translation stage. It speaks every final translation whose target is among its `TranslationTargets` with a `TtsSynthesizer` and emits a `DubbedSpeechFrame`: the utterance's PCM plus the source transcript's `timestamp` and `source_text`, so a host can play it where the words were said. One ordered queue per language. `DubConfig` maps a voice per language and sets the sample rate asked of the provider; a `PaceHint` closure decides each utterance's pace (clamped to the provider's range).
 - **Streaming.** With a synthesizer whose `streams()` is true, the frame goes out as soon as the first chunk of audio exists, carrying it, and the rest follows on `DubbedSpeechData::stream` (a `SpeechStream`: `next().await`, `finish`, `fail`). A host can start playing a few hundred milliseconds after the text instead of after the whole utterance.
 - **`TtsSynthesizer`** is the one-utterance shape, as opposed to the streaming TTS handlers that speak an LLM's answer token by token: `synthesize(text, lang, voice, pace, sample_rate) -> Pcm`, and `synthesize_streaming -> PcmChunks`.
-- **Sarvam Bulbul over REST** (`SarvamRestTts`, `bulbul:v3` by default): the eleven Bulbul languages, up to 48 kHz, three attempts on a rate limit. **Sarvam Bulbul streaming** (`SarvamStreamTts`): one WebSocket per (language, voice) kept open and reused, utterances one after another on it, 24 kHz. *(feature `tts-sarvam`)*
+- **Every utterance reported.** `DubEventFrame` (`DubEventData`, `DubEventKind`): the service reports `synthesized` (with `ready_ms`, from the translation to the first audio) and `failed` (with the error and its `ErrorKind`); whatever plays the speech reports `started` (`late_ms`, `rtp_timestamp`), `ended` (`audio_ms`) and `skipped`. An utterance whose voice failed or gave no audio is tried once more after 0.5 s (`RETRY_WAIT`) before it is `failed`.
+- **`SentenceLedger`** (`services::ledger`, `with_ledger` on both services): the turn gate's exactly-once discipline for a sentence after the STT. Each final transcript with words in it is opened once per dubbed language, moves `Translating → Speaking → Playing`, and is closed exactly once as `Played`, `Failed(why)` or `Abandoned(why)` (nobody listening: not a loss); a second close is a no-op. **Whatever plays a `DubbedSpeechFrame` closes it.** `stuck()` lists entries open past a minute, a path that forgot to close; `with_on_close` reports every close, for a host counting outcomes.
+- **Sarvam Bulbul over REST** (`SarvamRestTts`, `bulbul:v3` by default): the eleven Bulbul languages, up to 48 kHz, three attempts on a rate limit. **Sarvam Bulbul streaming** (`SarvamStreamTts`): one WebSocket per (language, voice) kept open and reused, utterances one after another on it, 24 kHz. A connection the server answered with an error, or gave no final event on, is retired and the next utterance opens a new one, so one rejected fragment cannot stall its language. *(feature `tts-sarvam`)*
 - Billing: `BillingEvent::TtsUsage` per utterance, with the language.
 
 → [doc/dubbing.md](doc/dubbing.md)
@@ -713,7 +753,7 @@ let observer = RaviProcessor::create_observer(&ravi, RaviObserverParams::default
 // task.run(system_clock(), Some(Arc::new(observer)))
 ```
 
-`RaviProcessor` handles inbound messages: `client-ready` (answered with `bot-ready`), `disconnect-bot`, `send-text` (injects a typed user turn into the context and triggers the LLM) and custom `client-message`s, which become `RaviClientMessage` frames for your own processors. `RaviObserver` watches the pipeline and sends `user-started-speaking`, `user-transcription` (with `final` and the detected `language`), `user-translation`, `bot-llm-started`, `bot-llm-text`, `bot-tts-*`, `bot-started-speaking` and `function-call-*` events, each switchable in `RaviObserverParams`. Dhara handlers can push arbitrary `server-message`s with `DharaContext::push_ravi_message`.
+`RaviProcessor` handles inbound messages: `client-ready` (answered with `bot-ready`), `disconnect-bot`, `send-text` (injects a typed user turn into the context and triggers the LLM) and custom `client-message`s, which become `RaviClientMessage` frames for your own processors. `RaviObserver` watches the pipeline and sends `user-started-speaking`, `user-transcription` (with `final` and the detected `language`), `user-translation` (with `provider`, `latency_ms`, and `final: false` for an interim one), `user-translation-error`, `user-dub` (the dub events), `bot-llm-started`, `bot-llm-text`, `bot-tts-*`, `bot-started-speaking` and `function-call-*` events, each switchable in `RaviObserverParams`. Dhara handlers can push arbitrary `server-message`s with `DharaContext::push_ravi_message`.
 
 ### Telephony: Twilio Media Streams
 
@@ -1008,7 +1048,7 @@ If you know Pipecat, you already know rustvani. The mapping is close to 1:1:
 | `BaseWorker` / agent bus | `BaseAgent` / `AgentBus` |
 | `@transport.event_handler("on_client_connected")` | `task.add_on_pipeline_started(...)` |
 | `isinstance(frame, VADUserStartedSpeakingFrame)` | `matches!(frame.inner, FrameInner::System(SystemFrame::VADUserStartedSpeaking { .. }))` |
-| *(no equivalent)* | STT core with `TurnGate`, `SentenceSegmenter`, `TranslationService`, `DubbingService`, the built-in denoisers |
+| *(no equivalent)* | STT core with `TurnGate`, `SentenceSegmenter`, `TranslationService`, `DubbingService`, `SentenceLedger`, the built-in denoisers |
 
 The frame flow, interrupt semantics, aggregator logic and pipeline nesting work identically. If you have debugged a Pipecat bot, you can debug a rustvani bot.
 
@@ -1023,10 +1063,10 @@ rustvani is in active development on the `0.4.0-dev` line. The pipeline core, th
 - Silero VAD, native Rust and ONNX, from any input rate or channel count; SmartTurn end-of-turn detection, pure Rust
 - Client and server VAD coordination
 - Speech enhancement chain (high-pass → RNNoise or hush-vani → AGC → soft limiter) and streaming resampling
-- STT core: turn gate, pre-roll, transcript-before-stop ordering, live partials, `max_turn_ms`, duration ledger, reconnect
-- Sarvam STT (streaming and realtime), Deepgram STT, 60db STT, Gnani STT
+- STT core: turn gate, pre-roll, transcript-before-stop ordering, live partials, `max_turn_ms` and the live `TurnLimit`, duration ledger, reconnect
+- Sarvam STT (streaming and realtime), Deepgram STT (live `nova-3` on the core, and the finals-only handler), 60db STT, Gnani STT
 - Sentence segmentation from partial transcripts
-- Translation stage with Sarvam Translate; dubbing stage with Sarvam Bulbul over REST and streaming WebSocket
+- Translation stage with Sarvam Translate: interim translations, retries, a fallback provider, a provider per language set; dubbing stage with Sarvam Bulbul over REST and streaming WebSocket, dub events, and a sentence ledger that accounts for every sentence
 - OpenAI-compatible LLM with function calling and a re-invocation loop; Sarvam LLM
 - Deepgram Aura-2, Sarvam Bulbul and local Piper TTS
 - RAVI protocol; WebSocket, peer-to-peer WebRTC and channel transports; Twilio Media Streams with G.711
@@ -1035,13 +1075,13 @@ rustvani is in active development on the `0.4.0-dev` line. The pipeline core, th
 - Published on [crates.io](https://crates.io/crates/rustvani)
 
 **Known limits:**
-- Deepgram, 60db and Gnani are not yet on the STT core: no front end, no turn gate, no partials
+- 60db, Gnani and the older Deepgram handler are not on the STT core: no front end, no turn gate, no partials (Deepgram has `DeepgramRealtimeSttHandler` for that)
 - `SileroVadNative` is 16 kHz only (use `SileroVadOrt` for an 8 kHz model); Piper ships US English voices
 - The Sarvam LLM handler streams text but does not run the tool loop; use the OpenAI-compatible handler for tools
 - The `metrics` module is a placeholder: TTFB and token metrics flow through billing and observers instead
 
 **Planned:**
-- Deepgram, 60db and Gnani onto the STT core
+- 60db and Gnani onto the STT core
 - Anthropic and Gemini LLM adapters (only the OpenAI wire format ships today)
 - Whisper STT; ElevenLabs and PlayHT TTS
 - A full-band (48 kHz) denoiser behind the WebRTC `Denoiser48k` hook
